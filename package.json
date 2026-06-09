@@ -1,0 +1,22 @@
+{
+  "name": "@tinycloudlabs/feed",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Exploration harness for the Listen data source via the TinyCloud SDK/CLI",
+  "bin": {
+    "feed": "./src/cli.ts"
+  },
+  "scripts": {
+    "feed": "bun src/cli.ts",
+    "check": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.4",
+    "prettier": "^3.8.3",
+    "typescript": "^5.9.3"
+  },
+  "packageManager": "bun@1.3.12"
+}
