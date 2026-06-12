@@ -10,15 +10,21 @@ This is **read-only**. It does not write to TinyCloud.
 
 ## The data source
 
-Listen stores everything in the owner's TinyCloud space under app id
-`xyz.tinycloud.listen` (see `repositories/listen-importer/src/{upload,config}.ts`):
+Listen is a **manifest app** (`app_id: xyz.tinycloud.listen`, `defaults: true`).
+The SDK manifest resolver routes its canonical data into the owner's
+**`applications`** space — NOT the profile's primary `default` space. This is the
+key gotcha: every read must target `--space applications`.
 
-| What         | Where                                          | Shape |
-| ------------ | ---------------------------------------------- | ----- |
-| Conversations| SQL `xyz.tinycloud.listen/conversations`       | `conversation`, `participant` tables |
-| Transcripts  | KV  `xyz.tinycloud.listen/transcript/<id>`     | `TranscriptSentence[]` |
+| What          | Space          | Path                                       | Shape |
+| ------------- | -------------- | ------------------------------------------ | ----- |
+| Conversations | `applications` | SQL `xyz.tinycloud.listen/conversations`   | `conversation`, `participant` tables |
+| Transcripts   | `applications` | KV  `xyz.tinycloud.listen/transcript/<id>` | `TranscriptSentence[]` |
+| Raw audio     | `default`      | KV  `xyz.tinycloud.listen/importer/media/…`| mp3 / m4a (listen-importer uploads) |
 
 A transcript sentence is `{ index, speaker_id, speaker_name, text, start_time, end_time, language }`.
+
+> Reading applications-space KV requires `tc kv --space` support, added via
+> `TinyCloudNode.kvForSpace()` in the js-sdk (mirrors the existing `sqlForSpace`).
 
 ## Setup
 
@@ -41,12 +47,14 @@ tc auth login --method openkey
 
 ### 2. Grant this session read access to the Listen data
 
-The session needs explicit capabilities for the Listen SQL db and transcript KV.
-Run these **as the owner** of the space (self-grant):
+The session needs explicit capabilities on the **`applications`** space for the
+Listen SQL db and transcript KV. Run these **as the owner** of the space
+(self-grant). Note the KV path needs a **trailing slash** for prefix semantics,
+and KV actions are `get`/`list`/`metadata` (not `read`):
 
 ```sh
-tc auth request --cap "tinycloud.sql:default:xyz.tinycloud.listen/conversations:read" --grant --yes
-tc auth request --cap "tinycloud.kv:default:xyz.tinycloud.listen:read" --grant --yes
+tc auth request --cap "tinycloud.sql:applications:xyz.tinycloud.listen/conversations:read" --grant --yes
+tc auth request --cap "tinycloud.kv:applications:xyz.tinycloud.listen/:get,list,metadata" --grant --yes
 ```
 
 ### 3. Verify

@@ -16,6 +16,18 @@ export const LISTEN_SQL_DB =
   process.env.FEED_LISTEN_SQL_DB ?? `${LISTEN_APP_ID}/conversations`;
 export const LISTEN_KV_PREFIX = process.env.FEED_LISTEN_KV_PREFIX ?? LISTEN_APP_ID;
 
+/**
+ * Listen is a manifest app with `defaults: true`, so the SDK manifest resolver
+ * routes its canonical SQL + KV into the owner's `applications` space (not the
+ * primary `default` space). Override with FEED_LISTEN_SPACE if needed.
+ */
+export const LISTEN_SPACE = process.env.FEED_LISTEN_SPACE ?? "applications";
+
+/** Apply the Listen space unless the caller explicitly set one. */
+function withSpace<T extends TcOptions>(options: T): T {
+  return options.space ? options : { ...options, space: LISTEN_SPACE };
+}
+
 /** A row from the Listen `conversation` table. */
 export interface Conversation {
   id: string;
@@ -68,7 +80,7 @@ export function listConversations(
     `SELECT id, title, source, source_id, source_url, started_at, ended_at, ` +
     `duration_secs, summary, metadata, created_at, updated_at ` +
     `FROM conversation ${where} ORDER BY started_at DESC ${limit}`.trim();
-  return sqlQuery(LISTEN_SQL_DB, sql, params, options) as unknown as Conversation[];
+  return sqlQuery(LISTEN_SQL_DB, sql, params, withSpace(options)) as unknown as Conversation[];
 }
 
 export function countConversations(options: TcOptions = {}): number {
@@ -76,7 +88,7 @@ export function countConversations(options: TcOptions = {}): number {
     LISTEN_SQL_DB,
     "SELECT count(*) AS n FROM conversation",
     [],
-    options,
+    withSpace(options),
   );
   const n = rows[0]?.n;
   return typeof n === "number" ? n : Number(n ?? 0);
@@ -90,7 +102,7 @@ export function getParticipants(
     LISTEN_SQL_DB,
     "SELECT id, conversation_id, name, email, speaker_label FROM participant WHERE conversation_id = ?",
     [conversationId],
-    options,
+    withSpace(options),
   ) as unknown as Participant[];
 }
 
@@ -99,7 +111,7 @@ export function getTranscript(
   conversationId: string,
   options: TcOptions = {},
 ): TranscriptSentence[] {
-  const raw = kvGet(`${LISTEN_KV_PREFIX}/transcript/${conversationId}`, options);
+  const raw = kvGet(`${LISTEN_KV_PREFIX}/transcript/${conversationId}`, withSpace(options));
   if (!raw) return [];
   let parsed: unknown;
   try {

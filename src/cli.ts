@@ -7,6 +7,7 @@ import {
   getParticipants,
   getTranscript,
   listConversations,
+  LISTEN_SPACE,
   LISTEN_SQL_DB,
   parseMetadata,
   transcriptToText,
@@ -26,6 +27,7 @@ Usage:
 Global options:
   --profile <name>    tc profile to use      (env FEED_TC_PROFILE)
   --host <url>        node URL override       (env FEED_TC_HOST)
+  --space <name>      space override         (env FEED_TC_SPACE, default ${LISTEN_SPACE})
   --json              machine-readable output
 
 Command options:
@@ -42,6 +44,7 @@ function tcOptions(values: Record<string, unknown>): TcOptions {
   return {
     profile: (values.profile as string) ?? process.env.FEED_TC_PROFILE,
     host: (values.host as string) ?? process.env.FEED_TC_HOST,
+    space: (values.space as string) ?? process.env.FEED_TC_SPACE,
   };
 }
 
@@ -72,6 +75,7 @@ async function main(): Promise<void> {
     options: {
       profile: { type: "string" },
       host: { type: "string" },
+      space: { type: "string" },
       json: { type: "boolean", default: false },
       limit: { type: "string" },
       source: { type: "string" },
@@ -99,13 +103,16 @@ async function main(): Promise<void> {
       console.log(`  authed:    ${status!.authenticated}`);
       try {
         const n = countConversations(opts);
-        console.log(`\nListen access: OK — ${n} conversation(s) readable in ${LISTEN_SQL_DB}`);
+        console.log(
+          `\nListen access: OK — ${n} conversation(s) readable in ${LISTEN_SPACE}/sql/${LISTEN_SQL_DB}`,
+        );
       } catch (err) {
         console.log(`\nListen access: NOT YET — ${(err as Error).message}`);
         console.log(
-          `\nGrant read caps to this session (run as the owner of the Listen space):\n` +
-            `  tc auth request --cap "tinycloud.sql:default:xyz.tinycloud.listen/conversations:read" --grant --yes\n` +
-            `  tc auth request --cap "tinycloud.kv:default:xyz.tinycloud.listen:read" --grant --yes`,
+          `\nListen is a manifest app: its data lives in the "${LISTEN_SPACE}" space.\n` +
+            `Grant read caps to this session (run as the owner of the Listen space):\n` +
+            `  tc auth request --cap "tinycloud.sql:${LISTEN_SPACE}:xyz.tinycloud.listen/conversations:read" --grant --yes\n` +
+            `  tc auth request --cap "tinycloud.kv:${LISTEN_SPACE}:xyz.tinycloud.listen:read" --grant --yes`,
         );
       }
       return;

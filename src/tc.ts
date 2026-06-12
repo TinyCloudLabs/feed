@@ -14,6 +14,12 @@ export interface TcOptions {
   profile?: string;
   /** Override the node URL (`tc --host <url>`). */
   host?: string;
+  /**
+   * Target space for `sql`/`kv` ops (short name like "applications" or a full
+   * space URI). Listen is a manifest app: its canonical data lives in the
+   * `applications` space, not the profile's primary `default` space.
+   */
+  space?: string;
 }
 
 export interface TcRunResult {
@@ -74,9 +80,11 @@ export function authStatus(options: TcOptions = {}): Record<string, unknown> {
   return parseJson(stdout, "auth status");
 }
 
+/** The `tc sql query --json` response shape: columns + array-of-arrays rows. */
 export interface SqlQueryResult {
-  rows?: Array<Record<string, unknown>>;
-  [key: string]: unknown;
+  columns?: string[];
+  rows?: unknown[][];
+  rowCount?: number;
 }
 
 /** Run a read-only SELECT against a space SQL database. */
@@ -87,18 +95,26 @@ export function sqlQuery(
   options: TcOptions = {},
 ): Array<Record<string, unknown>> {
   const args = ["--json", "sql", "query", sql, "--db", db];
+  if (options.space) args.push("--space", options.space);
   if (params.length > 0) args.push("--params", JSON.stringify(params));
   const { stdout } = runTc(args, options);
   const parsed = parseJson<SqlQueryResult | Array<Record<string, unknown>>>(
     stdout,
     `sql query (${db})`,
   );
+  // Already array-of-objects (older shape): pass through.
   if (Array.isArray(parsed)) return parsed;
-  if (Array.isArray(parsed.rows)) return parsed.rows;
-  // Some CLI versions nest under { result: { rows } } or similar; be permissive.
-  const nested = (parsed as Record<string, unknown>).result;
-  if (nested && typeof nested === "object" && Array.isArray((nested as SqlQueryResult).rows)) {
-    return (nested as SqlQueryResult).rows!;
+  // Current shape: { columns, rows: [[...]] } — zip into objects.
+  const columns = parsed.columns;
+  const rows = parsed.rows;
+  if (Array.isArray(columns) && Array.isArray(rows)) {
+    return rows.map((row) => {
+      const obj: Record<string, unknown> = {};
+      columns.forEach((col, i) => {
+        obj[col] = row[i];
+      });
+      return obj;
+    });
   }
   return [];
 }
@@ -113,6 +129,8 @@ export function kvGet(key: string, options: TcOptions = {}): string | null {
       "kv",
       "get",
       key,
+      "--raw",
+      ...(options.space ? ["--space", options.space] : []),
     ],
     { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 },
   );
@@ -124,7 +142,9 @@ export function kvGet(key: string, options: TcOptions = {}): string | null {
 
 /** List KV keys under a prefix. */
 export function kvList(prefix: string, options: TcOptions = {}): string[] {
-  const { stdout } = runTc(["--json", "kv", "list", "--prefix", prefix], options);
+  const args = ["--json", "kv", "list", "--prefix", prefix];
+  if (options.space) args.push("--space", options.space);
+  const { stdout } = runTc(args, options);
   const parsed = parseJson<unknown>(stdout, `kv list (${prefix})`);
   if (Array.isArray(parsed)) {
     return parsed.map((entry) =>
