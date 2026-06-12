@@ -9,6 +9,7 @@
   },
   "scripts": {
     "feed": "bun src/cli.ts",
+    "tc": "tc",
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
