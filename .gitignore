@@ -1,6 +1,7 @@
 node_modules/
-dist/
-.feed/
+listen.db
+conversations.json
+transcripts/
 *.local
 .env
 .DS_Store
