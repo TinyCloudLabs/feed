@@ -23,8 +23,10 @@ key gotcha: every read must target `--space applications`.
 
 A transcript sentence is `{ index, speaker_id, speaker_name, text, start_time, end_time, language }`.
 
-> Reading applications-space KV requires `tc kv --space` support, added via
-> `TinyCloudNode.kvForSpace()` in the js-sdk (mirrors the existing `sqlForSpace`).
+> Reading applications-space KV requires `tc kv --space`, shipped in
+> `@tinycloud/cli` >= 0.6.0-beta.11 (`TinyCloudNode.kvForSpace()`, mirrors the
+> existing `sqlForSpace`). Feed pins that CLI as a devDependency, so `bun install`
+> provides a `tc` with `--space` — no global install or source build needed.
 
 ## Setup
 
@@ -90,7 +92,7 @@ FEED_LISTEN_APP_ID=xyz.tinycloud.listen bun src/cli.ts conversations
 
 | Var                   | Default                            | Purpose |
 | --------------------- | ---------------------------------- | ------- |
-| `FEED_TC_BIN`         | `tc`                               | tc binary (e.g. a `tc-local` shim) |
+| `FEED_TC_BIN`         | bundled `node_modules/.bin/tc`     | tc binary (override for a local source build / shim) |
 | `FEED_TC_PROFILE`     | active profile                     | tc profile |
 | `FEED_TC_HOST`        | profile host                       | node URL override |
 | `FEED_LISTEN_APP_ID`  | `xyz.tinycloud.listen`             | Listen app id |

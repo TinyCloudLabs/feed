@@ -1,4 +1,6 @@
 import { spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 /**
  * Thin wrapper around the TinyCloud `tc` CLI.
@@ -7,7 +9,23 @@ import { spawnSync } from "node:child_process";
  * listen-importer's src/tc.ts does for writes, but only uses the read paths
  * (`sql query`, `kv get`, `kv list`). The active `tc` profile / session decides
  * which space and identity we read from.
+ *
+ * The CLI ships as the `@tinycloud/cli` devDependency (>= 0.6.0-beta.11, which
+ * added `tc kv --space`, required to read transcripts from the applications
+ * space). We resolve that local bin by default so the tool is self-contained.
  */
+
+/** Resolve the `tc` binary: FEED_TC_BIN > local node_modules/.bin/tc > PATH. */
+function resolveTcBin(): string {
+  if (process.env.FEED_TC_BIN) return process.env.FEED_TC_BIN;
+  try {
+    const local = fileURLToPath(new URL("../node_modules/.bin/tc", import.meta.url));
+    if (existsSync(local)) return local;
+  } catch {
+    // fall through to PATH lookup
+  }
+  return "tc";
+}
 
 export interface TcOptions {
   /** tc profile name (`tc --profile <name>`). Falls back to the active profile. */
@@ -28,7 +46,7 @@ export interface TcRunResult {
 }
 
 /** The `tc` binary to invoke. Override with FEED_TC_BIN (e.g. a tc-local shim). */
-const TC_BIN = process.env.FEED_TC_BIN || "tc";
+const TC_BIN = resolveTcBin();
 
 export function runTc(args: string[], options: TcOptions = {}): TcRunResult {
   const fullArgs = [
