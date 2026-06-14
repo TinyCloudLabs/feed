@@ -9,7 +9,7 @@
 import { TinyCloudWeb, type Config, type Manifest } from "@tinycloud/web-sdk";
 import { connectWallet } from "./openkey.ts";
 
-const HOST = "https://node.tinycloud.xyz";
+const HOST = import.meta.env.VITE_TINYCLOUD_HOST || "https://node.tinycloud.xyz";
 
 /** The artifacts app namespace (contract: xyz.tinycloud.artifacts). */
 export const ARTIFACTS_APP_ID = "xyz.tinycloud.artifacts";
@@ -48,7 +48,7 @@ const MANIFEST: Manifest = {
     {
       service: "tinycloud.kv",
       space: "applications",
-      path: "xyz.tinycloud.artifacts/",
+      path: MEDIA_PREFIX,
       actions: ["get", "list", "metadata"],
       description: "Read artifact media (hero images, audio).",
     },

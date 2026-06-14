@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FeedCard } from "./types.ts";
 import { Card, FullCard, Glyph } from "./Card.tsx";
 import { loadFeed } from "./feedClient.ts";
-import { seedTestRows } from "./seed.ts";
 import { signIn, signOut } from "./tinycloud.ts";
 
 const PAGE_SIZE = 50;
@@ -189,7 +188,6 @@ function Feed({
   const [cards, setCards] = useState<FeedCard[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [seeding, setSeeding] = useState(false);
   const [activeTag, setActiveTag] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -203,19 +201,6 @@ function Feed({
       setLoading(false);
     }
   }, [session.appsSpaceUri]);
-
-  const seed = useCallback(async () => {
-    setSeeding(true);
-    setError(null);
-    try {
-      await seedTestRows(session.appsSpaceUri);
-      await refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSeeding(false);
-    }
-  }, [session.appsSpaceUri, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -249,9 +234,6 @@ function Feed({
           <button type="button" className="quiet-link" disabled={loading} onClick={() => void refresh()}>
             {loading ? "Loading…" : "Refresh"}
           </button>
-          <button type="button" className="quiet-link" disabled={seeding} onClick={() => void seed()}>
-            {seeding ? "Seeding…" : "Seed test rows"}
-          </button>
           <button type="button" className="quiet-link" onClick={onSignOut}>
             Sign out
           </button>
@@ -270,13 +252,8 @@ function Feed({
           <div className="feed-status">
             <p className="feed-status-line">Nothing here yet.</p>
             <p className="feed-status-sub">
-              {activeTag ? "No artifacts for this tag" : "Publish artifacts, or seed test rows"}
+              {activeTag ? "No artifacts for this tag" : "Publish artifacts to populate the feed"}
             </p>
-            {!activeTag && (
-              <button type="button" className="quiet-link" disabled={seeding} onClick={() => void seed()}>
-                {seeding ? "Seeding…" : "Seed test rows"}
-              </button>
-            )}
           </div>
         ) : (
           visible.map((c) => (
