@@ -1223,3 +1223,114 @@ button.tag::after {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* ---- "Get updates" transient pill (spec §2) ----
+   Bottom-center, unobtrusive, fades in on appear and out when React unmounts it
+   after the 5s window. Shares the undo-toast's fixed-pill skin but with the
+   accent-leaning quiet-link treatment so it reads as an action. */
+.get-updates-pill {
+  position: fixed;
+  left: 50%;
+  bottom: calc(20px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 11;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 20px;
+  background: var(--bg);
+  border: 1px solid var(--hairline);
+  border-radius: 999px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.5);
+  animation: get-updates-in 220ms ease-out;
+  transition: color 180ms ease-out, border-color 180ms ease-out;
+}
+.get-updates-pill:hover,
+.get-updates-pill:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+@keyframes get-updates-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+/* ---- in-progress build indicator (spec §4) ----
+   A quiet hairline strip with the gen-spinner + a mono status line. Shown on the
+   feed whenever a build is live (including one resumed from another tab/session).*/
+.build-indicator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 2px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+.build-indicator-text {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--ink-2);
+}
+
+/* ---- Agents: primary "Generate the feed" + Details disclosure (spec §3) ---- */
+.generate-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  margin: 22px 0 8px;
+  padding: 13px 22px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  color: var(--bg);
+  font-family: var(--sans);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: opacity 180ms ease-out;
+}
+.generate-primary:hover,
+.generate-primary:focus-visible {
+  opacity: 0.88;
+}
+.generate-primary[disabled] {
+  cursor: progress;
+  opacity: 0.7;
+}
+/* the spinner sits on the accent fill → invert its hairline so it's visible */
+.generate-primary .gen-spinner {
+  border-color: rgba(13, 13, 14, 0.4);
+  border-top-color: var(--bg);
+}
+
+.agents-details {
+  margin-top: 14px;
+  border-top: 1px solid var(--hairline);
+}
+.agents-details > summary {
+  padding: 14px 0 6px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  cursor: pointer;
+  list-style: revert;
+}
+.agents-details > summary:hover {
+  color: var(--ink-2);
+}

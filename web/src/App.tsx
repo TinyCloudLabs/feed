@@ -6,7 +6,7 @@ import {
   ensureDelegation,
 } from "./agentClient.ts";
 import { bootstrapSchema } from "./feedClient.ts";
-import { navigate, useRoute } from "./router.tsx";
+import { navigate, parseRoute, useRoute } from "./router.tsx";
 import type { Session } from "./session.ts";
 import type { DelegationInfo, RunRecord } from "./pages/types.ts";
 import { ConnectPage } from "./pages/Connect.tsx";
@@ -38,6 +38,9 @@ export function App() {
   const [runs, setRuns] = useState<RunRecord[]>([]);
   // Bumped after a successful agent run so the feed re-reads the user's space.
   const [feedRefreshKey, setFeedRefreshKey] = useState(0);
+  // Stable refresh callback so the build controller's poll effect (which depends
+  // on it) isn't re-created on every App render.
+  const bumpFeedRefresh = useCallback(() => setFeedRefreshKey((k) => k + 1), []);
 
   // Cards dismissed via "less" — hidden immediately, session-only (the
   // distill-preferences loop handles durable effects).
@@ -136,12 +139,18 @@ export function App() {
     setDelegation(null);
   }, []);
 
-  // Called by Connect after a FRESH sign-in: adopt the session, then auto-connect
-  // the agent so the user lands ready-to-generate with zero agent clicks.
+  // Called by Connect after a FRESH sign-in: adopt the session, land the user on
+  // the feed, and auto-connect the agent IN THE BACKGROUND so they see their feed
+  // immediately rather than the delegate screen.
   const onSession = useCallback(
     (s: Session) => {
       sessionRef.current = s;
       setSession(s);
+      // Sign-in lands on the feed (spec §1). Navigate up front; the agent
+      // delegation below proceeds in the BACKGROUND — the feed must NOT block on
+      // it. The feed reads the user's space directly; a missing delegation only
+      // affects Generate, which auto-ensures one when clicked.
+      navigate({ kind: "feed" });
       // Fire-and-forget: the error (if any) lands in agentError; the rejection
       // here is already captured, so ignore it at the call site. Pass the space
       // explicitly so the delegation binds to THIS session.
@@ -166,6 +175,15 @@ export function App() {
           if (cancelled) return;
           sessionRef.current = restored;
           setSession(restored);
+          // A restored session should also land on the feed (spec §1) — but
+          // ONLY when there's no deeper intent: if the user deep-linked to a
+          // specific route (/agents, /a/:slug, …) we honor it. We read the live
+          // pathname here (one-shot, at restore time) rather than the routed
+          // state so this can't re-run on later navigation. Only the DEFAULT
+          // connect route ("/") is redirected to the feed.
+          if (parseRoute(location.pathname).kind === "connect") {
+            navigate({ kind: "feed" });
+          }
           ensureAgentDelegation(restored.appsSpaceUri).catch(() => {});
         }
       } catch (e) {
@@ -231,6 +249,8 @@ export function App() {
           onHide={hideCard}
           onSignOut={onSignOut}
           refreshKey={feedRefreshKey}
+          ensureDelegation={ensureAgentDelegation}
+          onFeedRefresh={bumpFeedRefresh}
         />
       )}
       {route.kind === "article" && session && (
@@ -246,7 +266,7 @@ export function App() {
           agentConnecting={agentConnecting}
           agentError={agentError}
           onRunsChange={setRuns}
-          onFeedRefresh={() => setFeedRefreshKey((k) => k + 1)}
+          onFeedRefresh={bumpFeedRefresh}
         />
       )}
       {route.kind === "preferences" && session && (

@@ -90,6 +90,20 @@ export interface RunState {
   error?: string;
 }
 
+/** One entry in GET /agent/run (the run-list endpoint), newest-first. Carries the
+ *  same status vocabulary as {@link RunState} plus run timing, so a page that
+ *  mounts cold can detect a build started in ANOTHER tab/session and resume it. */
+export interface RunSummary {
+  run_id: string;
+  status: RunStatus;
+  /** Epoch ms the run was enqueued. */
+  startedAt: number;
+  /** Epoch ms the run reached a terminal state (absent while queued|running). */
+  finishedAt?: number;
+  published?: PublishedArtifact[];
+  error?: string;
+}
+
 // ── transport ────────────────────────────────────────────────────────────────
 
 /** A fetch that fails LOUDLY (no silent fallback) and surfaces the backend's
@@ -337,6 +351,66 @@ export async function startRun(): Promise<{ run_id: string; status: RunStatus }>
 /** GET /agent/run/:run_id — current status of a run. */
 export async function getRun(runId: string, signal?: AbortSignal): Promise<RunState> {
   return agentFetch<RunState>(`/agent/run/${encodeURIComponent(runId)}`, { signal });
+}
+
+/** GET /agent/runs — the run list (newest-first), used to detect a build that's
+ *  already in flight (this tab, another tab, or another session) so a cold page
+ *  load can resume it instead of starting a duplicate.
+ *
+ *  FORWARD-COMPAT DEGRADATION: this endpoint is newer than the rest of the
+ *  contract, so an agent that hasn't been redeployed yet will 404 it. A 404 (or a
+ *  network failure reaching the host) is treated as "this agent can't tell us its
+ *  runs" → we return `[]` (no active build) rather than throwing, so the feature
+ *  no-ops cleanly against an older backend. This is the ONE sanctioned soft
+ *  failure: it's not hiding a misconfig (the host is the same one every other call
+ *  uses), it's tolerating a not-yet-deployed route. A NON-404 HTTP error from the
+ *  configured host (401/403/5xx) is a real fault and STILL throws — we don't
+ *  swallow auth/transport problems. Returns `null` for the degraded case so callers
+ *  can distinguish "endpoint unavailable" from "available, zero runs". */
+export async function listRuns(signal?: AbortSignal): Promise<RunSummary[] | null> {
+  // We can't use agentFetch here (it throws on every non-OK), because we must
+  // branch on the 404 to degrade gracefully. Mirror its config-await + host gate.
+  const { host } = await loadAgentConfig();
+  if (host === "") {
+    throw new Error("agent backend not configured (no host in /agent-config.json)");
+  }
+  let res: Response;
+  try {
+    res = await fetch(`${host}/agent/runs`, {
+      headers: { "Content-Type": "application/json" },
+      signal,
+    });
+  } catch (e) {
+    // A genuine abort propagates (the caller cancelled). Any other network error
+    // means the endpoint is unreachable — treat as "older backend, no list" so a
+    // not-yet-redeployed agent doesn't break the page.
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    return null;
+  }
+  // 404 → endpoint not deployed on this (older) agent: degrade to "unknown/none".
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    // A real fault on the configured host (auth/transport/5xx) must surface, not
+    // hide — same loud-failure rule as agentFetch.
+    const body = await res.text().catch(() => "");
+    throw new Error(
+      `agent GET /agent/runs failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ""}`,
+    );
+  }
+  const data = (await res.json()) as { runs?: RunSummary[] };
+  return Array.isArray(data.runs) ? data.runs : [];
+}
+
+/** The newest run that is still in flight (status queued|running), or undefined
+ *  when there's none / the list endpoint is unavailable (older backend). Used on
+ *  page mount to resume an in-progress build without starting a duplicate. The
+ *  list is newest-first per the contract, so the first active entry IS the newest.
+ *  Passes through `listRuns`'s soft-404 behavior: an unavailable endpoint yields
+ *  undefined ("none active"), while a real fault still throws. */
+export async function getActiveRun(signal?: AbortSignal): Promise<RunSummary | undefined> {
+  const runs = await listRuns(signal);
+  if (!runs) return undefined; // endpoint unavailable → treat as none active.
+  return runs.find((r) => r.status === "queued" || r.status === "running");
 }
 
 /** Sleep that rejects promptly when `signal` aborts (so a cancelled poll doesn't
