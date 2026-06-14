@@ -2,12 +2,29 @@
   "name": "@tinycloudlabs/feed",
   "version": "0.0.1",
   "private": true,
-  "description": "Starter for exploring the Listen data source with the TinyCloud (tc) CLI",
+  "description": "Pure-client viewer for the xyz.tinycloud.artifacts feed, plus tc recipes for exploring the Listen data source",
+  "type": "module",
   "scripts": {
-    "tc": "tc"
+    "tc": "tc",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tinycloud/web-sdk": "2.4.0-beta.2",
+    "dompurify": "^3.2.0",
+    "marked": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@tinycloud/cli": "0.6.0-beta.11"
+    "@tinycloud/cli": "0.6.0-beta.11",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
   },
   "packageManager": "bun@1.3.12"
 }

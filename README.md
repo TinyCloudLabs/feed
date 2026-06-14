@@ -1,9 +1,76 @@
 # feed
 
-A starting point for projects built on the **Listen** data source. Feed is
-(eventually) a destination app; this repo is the sandbox where we explore the
-underlying data — conversations and transcripts that `listen-importer` wrote into
-a TinyCloud space — before designing how a feed renders it.
+A pure-client viewer for the **`xyz.tinycloud.artifacts`** feed, plus the `tc`
+recipes for exploring the **Listen** data source it is built on.
+
+## The viewer (pure-client web app)
+
+A Vite + React app (`web/`) that talks to TinyCloud **directly from the browser**
+via the [`@tinycloud/web-sdk`](https://www.npmjs.com/package/@tinycloud/web-sdk) —
+no server, no `/api`, no sessions database. It signs in as the space **owner**
+(v1; scoped reader delegation comes later), reads published artifacts from the
+`feed` SQL DB in the owner's `applications` space, renders **tweet** and
+**article** cards, hydrates hero images from KV, and writes reader
+**interaction** events (nonce-protected) back to the `interactions` SQL DB.
+
+```sh
+bun install
+bun run dev        # local dev server (http://localhost:5173)
+bun run build      # static bundle -> dist/
+bun run typecheck
+```
+
+### How it reads / writes
+
+| What | Where | How |
+| --- | --- | --- |
+| Artifact feed | SQL `xyz.tinycloud.artifacts/feed` (applications space) | `tcw.sqlForSpace(appsUri).db(feed).query(...)` |
+| Interactions | SQL `xyz.tinycloud.artifacts/interactions` | `tcw.sqlForSpace(appsUri).db(interactions).execute(INSERT ...)` |
+| Media (hero) | KV `xyz.tinycloud.artifacts/media/<id>/...` | `tcw.kvForSpace(appsUri).get(key)` → base64 → blob URL |
+
+Space-scoped storage goes through `tcw.sqlForSpace(uri)` / `tcw.kvForSpace(uri)`
+(`@tinycloud/web-sdk` >= 2.4.0-beta.2); the codebase reaches them through the two
+`spaceSql` / `spaceKv` helpers in `web/src/feedClient.ts`. Render shape is driven
+by the row's `render_type` (`tweet` \| `article` in v1); richer fields come from
+the lossless `raw_artifact` JSON.
+
+> **Seeded data.** If the feed is empty (the producer hasn't published yet), use
+> the **Seed test rows** control in the masthead to insert one tweet + one
+> article (flagged `seeded`) so the UI can be demoed. Seeding also creates the
+> `artifact` / `interaction` tables if absent.
+
+### Manual browser verification (owner sign-in)
+
+The one step that can't be automated headlessly is the passkey/wallet sign-in.
+To verify the rendered feed against the live `applications` space:
+
+```sh
+bun install
+bun run dev          # http://localhost:5173
+```
+
+1. Open `http://localhost:5173` and click **Sign in**.
+2. Complete OpenKey/passkey sign-in **as the owner of the `applications` space**
+   (the wallet that owns `xyz.tinycloud.artifacts`). The manifest requests
+   `applications`-space `tinycloud.sql` + `tinycloud.kv` caps.
+3. The feed loads published artifacts newest-first. With the current live data
+   you should see **1 article** ("Why seat-based pricing punishes the customers
+   you most want to keep" — with a hydrated hero image) and **1 tweet** ("Seat
+   pricing taxes your power users").
+4. **More / Less / Save** on a card writes an `interaction` row (nonce-protected)
+   to `xyz.tinycloud.artifacts/interactions`; **Less** hides the card with an
+   undo toast. Open an article via "Continue reading" to see the full view.
+
+The non-interactive data path (feed query, `raw_artifact` shape, KV hero decode)
+is verified against the live rows via the `tc` CLI owner session.
+
+---
+
+## Exploring the Listen data source (`tc` recipes)
+
+The viewer is built on the **Listen** data source; this repo is also the sandbox
+where we explore the underlying data — conversations and transcripts that
+`listen-importer` wrote into a TinyCloud space.
 
 **Feed has no CLI of its own.** It uses the **TinyCloud `tc` CLI** directly. Any
 project built on this one should do the same: talk to Listen through `tc`. This
