@@ -1,6 +1,11 @@
 // Agents.tsx — the `/agents` page. Delegation status + re-grant/revoke, the
 // Generate button (POST /agent/run → poll GET /agent/run/:id), and run history.
 //
+// The agent connects AUTOMATICALLY on sign-in (App.ensureAgentDelegation), so
+// this page shows the resulting delegation rather than gating behind manual
+// "look up"/"delegate" clicks. Generate just works: if the delegation is somehow
+// missing when clicked, it auto-ensures one first, then starts the run.
+//
 // "Revoke" here is client-side only (drops the local delegation + tells the user
 // to re-grant); the contract has no revoke endpoint in the MVP, so we don't fake
 // a server revoke — we surface what we can actually do.
@@ -9,28 +14,38 @@ import { useEffect, useRef, useState } from "react";
 import {
   agentConfigured,
   AGENT_HOST,
-  delegateToAgent,
-  getAgentInfo,
   pollRun,
   startRun,
-  type AgentInfo,
   type RunState,
 } from "../agentClient.ts";
 import { Shell } from "../Nav.tsx";
 import { Link } from "../router.tsx";
-import { AgentDescriptor, DelegationCard } from "./Connect.tsx";
+import { DelegationCard } from "./Connect.tsx";
 import type { DelegationInfo, RunRecord } from "./types.ts";
 
 export function AgentsPage({
   delegation,
   runs,
-  onDelegation,
+  ensureDelegation,
+  onReGrant,
+  onForget,
+  agentConnecting,
+  agentError,
   onRunsChange,
   onFeedRefresh,
 }: {
   delegation: DelegationInfo | null;
   runs: RunRecord[];
-  onDelegation: (d: DelegationInfo | null) => void;
+  /** Auto-connect helper from App: reuse a stored delegation or mint one. */
+  ensureDelegation: () => Promise<void>;
+  /** Recovery: drop the stored delegation and mint a fresh one. */
+  onReGrant: () => Promise<void>;
+  /** Local revoke: forget the delegation without re-minting. */
+  onForget: () => void;
+  /** True while the automatic agent connect is in flight. */
+  agentConnecting: boolean;
+  /** An auto-delegate failure surfaced from App (not swallowed). */
+  agentError?: string | null;
   onRunsChange: (runs: RunRecord[]) => void;
   /** Bump the feed refresh key after a successful run. */
   onFeedRefresh: () => void;
@@ -49,9 +64,16 @@ export function AgentsPage({
   return (
     <Shell title="Agents" sub={AGENT_HOST}>
       <div className="agents">
-        <DelegationSection delegation={delegation} onDelegation={onDelegation} />
+        <DelegationSection
+          delegation={delegation}
+          onReGrant={onReGrant}
+          onForget={onForget}
+          agentConnecting={agentConnecting}
+          agentError={agentError}
+        />
         <GenerateSection
           delegation={delegation}
+          ensureDelegation={ensureDelegation}
           runs={runs}
           onRunsChange={onRunsChange}
           onFeedRefresh={onFeedRefresh}
@@ -64,47 +86,25 @@ export function AgentsPage({
 
 function DelegationSection({
   delegation,
-  onDelegation,
+  onReGrant,
+  onForget,
+  agentConnecting,
+  agentError,
 }: {
   delegation: DelegationInfo | null;
-  onDelegation: (d: DelegationInfo | null) => void;
+  onReGrant: () => Promise<void>;
+  onForget: () => void;
+  agentConnecting: boolean;
+  agentError?: string | null;
 }) {
-  const [info, setInfo] = useState<AgentInfo | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const grant = async () => {
-    setBusy(true);
-    setError(null);
+  const [reGranting, setReGranting] = useState(false);
+  const reGrant = async () => {
+    setReGranting(true);
     try {
-      // ALWAYS fetch /agent/info fresh on every (re-)grant — never reuse a cached
-      // DID — so a swapped backend agent DID is caught. delegateToAgent verifies
-      // the ack's agentDid matches what we delegated to (+ VITE_AGENT_DID if set).
-      const fresh = await getAgentInfo();
-      setInfo(fresh);
-      const { ack } = await delegateToAgent(fresh.did);
-      onDelegation({
-        agentDid: ack.agentDid,
-        delegationCid: ack.delegationCid,
-        spaceId: ack.spaceId,
-        expiresAt: ack.expiresAt,
-      });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // Errors land in agentError (App captures them); ignore the rejection here.
+      await onReGrant().catch(() => {});
     } finally {
-      setBusy(false);
-    }
-  };
-
-  const lookup = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      setInfo(await getAgentInfo());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+      setReGranting(false);
     }
   };
 
@@ -113,53 +113,69 @@ function DelegationSection({
       <section>
         <DelegationCard delegation={delegation} />
         <div className="prefs-actions">
-          <button type="button" className="quiet-link" disabled={busy} onClick={() => void grant()}>
-            {busy ? "Re-granting…" : "Re-grant"}
+          <button
+            type="button"
+            className="quiet-link"
+            disabled={reGranting || agentConnecting}
+            onClick={() => void reGrant()}
+          >
+            {reGranting ? "Re-granting…" : "Re-grant"}
           </button>
           <button
             type="button"
             className="quiet-link"
-            onClick={() => onDelegation(null)}
+            onClick={onForget}
             aria-label="Revoke delegation locally"
           >
             Revoke
           </button>
         </div>
-        {error && <div className="feed-error" style={{ marginTop: 14 }}>{error}</div>}
+        {agentError && <div className="feed-error" style={{ marginTop: 14 }}>{agentError}</div>}
       </section>
     );
   }
 
+  // No delegation: it auto-connects on sign-in. Show the connecting state, or a
+  // retry when the auto-connect failed.
   return (
     <section>
       <div className="feed-status" style={{ padding: "26px 0" }}>
-        <p className="feed-status-line">No delegation yet.</p>
-        <p className="feed-status-sub">Delegate your scopes to the agent to generate</p>
+        <p className="feed-status-line">
+          {agentConnecting ? "Connecting agent…" : "Agent not connected."}
+        </p>
+        <p className="feed-status-sub">
+          {agentConnecting
+            ? "Delegating your scopes to the agent"
+            : "Retry to delegate your scopes to the agent"}
+        </p>
       </div>
-      {info && <AgentDescriptor info={info} />}
-      <div className="prefs-actions">
-        {!info ? (
-          <button type="button" className="quiet-link" disabled={busy} onClick={() => void lookup()}>
-            {busy ? "Loading agent…" : "Look up agent"}
+      {!agentConnecting && (
+        <div className="prefs-actions">
+          <button
+            type="button"
+            className="quiet-link"
+            disabled={reGranting}
+            onClick={() => void reGrant()}
+          >
+            {reGranting ? "Connecting…" : "Connect agent"}
           </button>
-        ) : (
-          <button type="button" className="quiet-link" disabled={busy} onClick={() => void grant()}>
-            {busy ? "Granting…" : "Delegate to agent"}
-          </button>
-        )}
-      </div>
-      {error && <div className="feed-error" style={{ marginTop: 14 }}>{error}</div>}
+        </div>
+      )}
+      {agentError && <div className="feed-error" style={{ marginTop: 14 }}>{agentError}</div>}
     </section>
   );
 }
 
 function GenerateSection({
   delegation,
+  ensureDelegation,
   runs,
   onRunsChange,
   onFeedRefresh,
 }: {
   delegation: DelegationInfo | null;
+  /** Auto-connect helper: ensure a delegation exists before the run. */
+  ensureDelegation: () => Promise<void>;
   runs: RunRecord[];
   onRunsChange: (runs: RunRecord[]) => void;
   onFeedRefresh: () => void;
@@ -183,6 +199,9 @@ function GenerateSection({
     pollAbort.current?.abort();
     pollAbort.current = controller;
     try {
+      // Generate is just a button: if the delegation is somehow missing (auto-
+      // connect failed or was revoked), ensure one first, then start the run.
+      if (!delegation) await ensureDelegation();
       const { run_id, status } = await startRun();
       const record: RunRecord = {
         runId: run_id,
@@ -224,19 +243,14 @@ function GenerateSection({
     }
   };
 
-  const disabled = running || !delegation;
-
   return (
     <section className="generate">
       <h3 className="prefs-section-title">Generate</h3>
-      {!delegation && (
-        <p className="prefs-note">Delegate to the agent above before generating.</p>
-      )}
       <div className="prefs-actions">
         <button
           type="button"
           className={`quiet-link gen-control${running ? " gen-busy" : ""}`}
-          disabled={disabled}
+          disabled={running}
           onClick={() => void generate()}
         >
           {running ? <span className="gen-spinner" aria-hidden="true" /> : null}

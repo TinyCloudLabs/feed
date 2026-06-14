@@ -8,10 +8,30 @@
 // against the signed recap's PERMISSIONS, independent of the agent DID (which
 // is discovered at runtime via GET /agent/info).
 
-import { TinyCloudWeb, type Config, type Manifest, type PermissionEntry } from "@tinycloud/web-sdk";
+import {
+  TinyCloudWeb,
+  BrowserSessionStorage,
+  type Config,
+  type Manifest,
+  type PermissionEntry,
+} from "@tinycloud/web-sdk";
+import type { providers } from "ethers";
 import { connectWallet } from "./openkey.ts";
 
 const HOST = import.meta.env.VITE_TINYCLOUD_HOST || "https://node.tinycloud.xyz";
+
+/** Session TTL for the persisted browser session. The SDK default is 1 HOUR,
+ *  which forces a re-sign-in mid-session; 7 days lets the local session
+ *  genuinely persist across reloads / new tabs / "continue reading". This MUST
+ *  be identical on sign-in and restore so the restored session honors the same
+ *  lifetime the recap was minted with. */
+const SESSION_EXPIRATION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** localStorage key holding the last signed-in wallet address. A later reload
+ *  reads this to know WHICH persisted session key to restore (the SDK keys its
+ *  BrowserSessionStorage by `address.toLowerCase()`), so restore needs no wallet
+ *  prompt to discover the address. */
+const LAST_ADDRESS_KEY = "feed:lastAddress";
 
 /** The artifacts app namespace (contract: xyz.tinycloud.artifacts). */
 export const ARTIFACTS_APP_ID = "xyz.tinycloud.artifacts";
@@ -146,6 +166,38 @@ export function tcw(): TinyCloudWeb {
   return instance;
 }
 
+/** The composed sign-in manifest: the app's own caps + the optional agent
+ *  delegation target, so the single SIWE recap covers everything `delegateTo`
+ *  later derives. This MUST be identical on sign-in and restore — a manifest
+ *  mismatch makes the persisted recap unrecognizable and restore fails. */
+const COMPOSED_MANIFEST: Manifest | Manifest[] = AGENT_MANIFEST
+  ? [MANIFEST, AGENT_MANIFEST]
+  : MANIFEST;
+
+/** Build the TinyCloudWeb config shared by sign-in and restore. Pass the OpenKey
+ *  web3 provider on sign-in (so the real SIWE/OpenKey delegation runs); omit it
+ *  on restore (so the SDK rehydrates the persisted session key WITHOUT a passkey
+ *  prompt). Everything else — manifest, hosts, session storage, TTL — is held
+ *  IDENTICAL across both paths so the restored session matches what was signed. */
+function buildConfig(web3Provider?: providers.Web3Provider): Config {
+  return {
+    ...(web3Provider ? { providers: { web3: { driver: web3Provider } } } : {}),
+    tinycloudHosts: [HOST],
+    manifest: COMPOSED_MANIFEST,
+    sessionStorage: new BrowserSessionStorage(),
+    sessionExpirationMs: SESSION_EXPIRATION_MS,
+  };
+}
+
+/** Read the last signed-in address from localStorage, or null if none/cleared. */
+function lastSignedInAddress(): string | null {
+  try {
+    return localStorage.getItem(LAST_ADDRESS_KEY);
+  } catch {
+    return null;
+  }
+}
+
 /** Sign in via OpenKey passkey, delegating the manifest's `applications`-space
  *  caps to this session, and return the owner's applications-space URI (which
  *  scopes all feed/interactions/media access).
@@ -153,22 +205,19 @@ export function tcw(): TinyCloudWeb {
  *  Constructing TinyCloudWeb WITH the OpenKey wallet provider is what makes
  *  `signIn()` run the real SIWE/OpenKey delegation over `MANIFEST` — without a
  *  provider the SDK has no signer and falls into session-only mode (can't reach
- *  the applications space). */
+ *  the applications space). The wallet address is persisted so a later reload
+ *  can restore this session headlessly via {@link restoreSession}. */
 export async function signIn(): Promise<{ appsSpaceUri: string; readerDid: string }> {
-  const { web3Provider } = await connectWallet();
-  // Compose the app manifest with the optional agent delegation target so the
-  // single SIWE recap covers the app's own caps + the agent's scopes.
-  const manifest: Manifest | Manifest[] = AGENT_MANIFEST
-    ? [MANIFEST, AGENT_MANIFEST]
-    : MANIFEST;
-  const config: Config = {
-    providers: { web3: { driver: web3Provider } },
-    tinycloudHosts: [HOST],
-    manifest,
-  };
-  const t = new TinyCloudWeb(config);
+  const { web3Provider, address } = await connectWallet();
+  const t = new TinyCloudWeb(buildConfig(web3Provider));
   await t.signIn();
   instance = t;
+  // Persist the address so restore-on-mount knows which session key to rehydrate.
+  try {
+    localStorage.setItem(LAST_ADDRESS_KEY, address);
+  } catch {
+    // localStorage unavailable — restore won't work, but sign-in still does.
+  }
   const appsSpaceUri = t.space("applications").id;
   // Reader DID = the active session principal (contract §1.2: advisory in v1;
   // a trusted writer principal is a server-side upgrade).
@@ -176,10 +225,49 @@ export async function signIn(): Promise<{ appsSpaceUri: string; readerDid: strin
   return { appsSpaceUri, readerDid };
 }
 
+/** Restore a persisted session WITHOUT a wallet/passkey prompt.
+ *
+ *  Constructs TinyCloudWeb with the SAME manifest/hosts/storage/TTL as sign-in
+ *  but NO web3 provider, then asks the SDK to rehydrate the session key the
+ *  prior sign-in persisted (BrowserSessionStorage, keyed by the stored address).
+ *  Returns the same shape as `signIn()` when restored, or null when there is
+ *  nothing to restore (missing/expired). A CORRUPT or unexpected-failure status
+ *  throws — we don't paper over a real restore failure (standing rule), we
+ *  surface it and let the caller fall back to sign-in. */
+export async function restoreSession(): Promise<{ appsSpaceUri: string; readerDid: string } | null> {
+  const address = lastSignedInAddress();
+  if (!address) return null;
+  const t = new TinyCloudWeb(buildConfig());
+  const result = await t.restoreSession(address);
+  if (result.status === "restored") {
+    instance = t;
+    const appsSpaceUri = t.space("applications").id;
+    const readerDid = t.did;
+    return { appsSpaceUri, readerDid };
+  }
+  // Nothing to restore: clear the stale address pointer so we don't keep trying.
+  if (result.status === "missing" || result.status === "expired") {
+    try {
+      localStorage.removeItem(LAST_ADDRESS_KEY);
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+  // corrupt / restore-failed / storage-unavailable / disabled: a real problem —
+  // surface it rather than silently falling back.
+  throw result.error ?? new Error(`session restore failed: ${result.status}`);
+}
+
 export async function signOut(): Promise<void> {
   if (instance) {
     await instance.signOut();
     instance = null;
+  }
+  try {
+    localStorage.removeItem(LAST_ADDRESS_KEY);
+  } catch {
+    // ignore
   }
 }
 

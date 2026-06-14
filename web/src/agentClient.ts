@@ -151,6 +151,78 @@ export async function getAgentInfo(): Promise<AgentInfo> {
   return agentFetch<AgentInfo>("/agent/info");
 }
 
+// ── delegation persistence ─────────────────────────────────────────────────
+//
+// The acked delegation is durable: the user delegated AGENT_SCOPES to the agent
+// for DELEGATION_EXPIRY_MS, and the backend stored it. Persisting the ack lets a
+// later reload reuse it (no re-delegate, no extra round-trip) as long as it isn't
+// expired and still targets the configured agent. We persist ONLY the ack
+// metadata (CIDs/DIDs/expiry) — never the session key, which BrowserSessionStorage
+// already owns.
+
+/** localStorage key holding the last acked agent delegation. */
+const DELEGATION_KEY = "feed:agentDelegation";
+
+/** Load a previously persisted delegation ack, or null when absent, malformed,
+ *  expired, or targeting a DIFFERENT agent than the configured VITE_AGENT_DID.
+ *  A stale/mismatched entry is cleared so we don't keep reconsidering it. */
+export function loadStoredDelegation(): DelegationAck | null {
+  let raw: string | null;
+  try {
+    raw = localStorage.getItem(DELEGATION_KEY);
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  let ack: DelegationAck;
+  try {
+    ack = JSON.parse(raw) as DelegationAck;
+  } catch {
+    clearStoredDelegation();
+    return null;
+  }
+  // Expired, or pinned to a different agent than this build trusts → drop it.
+  const expired = !ack.expiresAt || new Date(ack.expiresAt).getTime() <= Date.now();
+  const wrongAgent = AGENT_DID !== "" && ack.agentDid !== AGENT_DID;
+  if (expired || wrongAgent) {
+    clearStoredDelegation();
+    return null;
+  }
+  return ack;
+}
+
+/** Persist the acked delegation for reuse across reloads. */
+export function storeDelegation(ack: DelegationAck): void {
+  try {
+    localStorage.setItem(DELEGATION_KEY, JSON.stringify(ack));
+  } catch {
+    // localStorage unavailable — the delegation still works this session.
+  }
+}
+
+/** Drop the persisted delegation (sign-out, local revoke, or staleness). */
+export function clearStoredDelegation(): void {
+  try {
+    localStorage.removeItem(DELEGATION_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+/** Ensure a usable delegation exists, reusing the stored one when valid and
+ *  otherwise minting a fresh one automatically: GET /agent/info (fresh, so a
+ *  swapped backend DID is caught) → delegateToAgent → persist the ack. Returns
+ *  the ack the caller turns into DelegationInfo. The happy path needs no manual
+ *  "look up"/"delegate" clicks — this IS that flow, run on demand. */
+export async function ensureDelegation(): Promise<DelegationAck> {
+  const stored = loadStoredDelegation();
+  if (stored) return stored;
+  const info = await getAgentInfo();
+  const { ack } = await delegateToAgent(info.did);
+  storeDelegation(ack);
+  return ack;
+}
+
 /** Mint a delegation of AGENT_SCOPES to `expectedDid` with the session key and
  *  POST it to the backend. `expectedDid` MUST come from a FRESH GET /agent/info
  *  on every (re-)grant — never a cached value — so a swapped backend DID is

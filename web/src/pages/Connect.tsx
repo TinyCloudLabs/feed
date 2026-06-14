@@ -1,9 +1,11 @@
 // Connect.tsx — the `/` landing + onboarding flow.
 //
 // 1. OpenKey sign-in (broadened manifest → SIWE recap covers the agent scopes).
-// 2. GET /agent/info → show the agent DID + the permissions it requests.
-// 3. delegateTo(agentDid, AGENT_SCOPES) → serialize → POST /agent/delegation.
-// 4. Show delegation status/expiry + a re-grant button, and a link to the feed.
+// 2. The agent connects AUTOMATICALLY: App's onSession runs ensureDelegation
+//    (GET /agent/info → delegateTo → POST /agent/delegation), reusing a stored
+//    delegation when valid. No manual "look up agent" / "delegate" clicks.
+// 3. This page reflects that state: connecting → delegation active + go-to-feed,
+//    with a small "Re-grant" affordance for recovery.
 //
 // Gated behind agentConfigured(): with no VITE_AGENT_HOST, sign-in still works
 // (the feed is readable) but the delegate step shows a clear "agent backend not
@@ -12,13 +14,7 @@
 import { useState } from "react";
 import { signIn } from "../tinycloud.ts";
 import { bootstrapSchema } from "../feedClient.ts";
-import {
-  agentConfigured,
-  AGENT_HOST,
-  delegateToAgent,
-  getAgentInfo,
-  type AgentInfo,
-} from "../agentClient.ts";
+import { agentConfigured, AGENT_HOST } from "../agentClient.ts";
 import { Link } from "../router.tsx";
 import type { Session } from "../session.ts";
 import type { DelegationInfo } from "./types.ts";
@@ -27,12 +23,23 @@ export function ConnectPage({
   session,
   delegation,
   onSession,
-  onDelegation,
+  onReGrant,
+  agentConnecting,
+  agentError,
+  restoreError,
 }: {
   session: Session | null;
   delegation: DelegationInfo | null;
   onSession: (s: Session) => void;
-  onDelegation: (d: DelegationInfo | null) => void;
+  /** Recovery: drop the stored delegation and mint a fresh one. */
+  onReGrant: () => Promise<void>;
+  /** True while the automatic agent connect is in flight. */
+  agentConnecting: boolean;
+  /** An auto-delegate failure surfaced from App (not swallowed). */
+  agentError?: string | null;
+  /** A restore-on-mount failure surfaced from App (corrupt/unexpected), shown
+   *  alongside the sign-in button so the user understands why they're here. */
+  restoreError?: string | null;
 }) {
   return (
     <>
@@ -43,18 +50,26 @@ export function ConnectPage({
         </div>
       </header>
       {!session ? (
-        <SignInStep onSession={onSession} />
+        <SignInStep onSession={onSession} restoreError={restoreError} />
       ) : (
         <DelegateStep
           delegation={delegation}
-          onDelegation={onDelegation}
+          onReGrant={onReGrant}
+          agentConnecting={agentConnecting}
+          agentError={agentError}
         />
       )}
     </>
   );
 }
 
-function SignInStep({ onSession }: { onSession: (s: Session) => void }) {
+function SignInStep({
+  onSession,
+  restoreError,
+}: {
+  onSession: (s: Session) => void;
+  restoreError?: string | null;
+}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -67,6 +82,7 @@ function SignInStep({ onSession }: { onSession: (s: Session) => void }) {
       // tables in the user's own space so the agent can publish, interaction
       // writes land, and the feed read doesn't hit a missing table.
       await bootstrapSchema(session.appsSpaceUri);
+      // App.onSession adopts the session AND auto-connects the agent.
       onSession(session);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -81,55 +97,33 @@ function SignInStep({ onSession }: { onSession: (s: Session) => void }) {
       <button type="button" className="quiet-link" disabled={busy} onClick={() => void go()}>
         {busy ? "Connecting…" : "Sign in with OpenKey"}
       </button>
-      {error && <div className="feed-error" style={{ marginTop: 14 }}>{error}</div>}
+      {(error || restoreError) && (
+        <div className="feed-error" style={{ marginTop: 14 }}>{error ?? restoreError}</div>
+      )}
     </div>
   );
 }
 
 function DelegateStep({
   delegation,
-  onDelegation,
+  onReGrant,
+  agentConnecting,
+  agentError,
 }: {
   delegation: DelegationInfo | null;
-  onDelegation: (d: DelegationInfo | null) => void;
+  onReGrant: () => Promise<void>;
+  agentConnecting: boolean;
+  agentError?: string | null;
 }) {
-  const [info, setInfo] = useState<AgentInfo | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [loadingInfo, setLoadingInfo] = useState(false);
-
-  const loadInfo = async () => {
-    setLoadingInfo(true);
-    setError(null);
+  // Re-grant is a recovery affordance; the happy-path delegation is automatic.
+  const [reGranting, setReGranting] = useState(false);
+  const reGrant = async () => {
+    setReGranting(true);
     try {
-      setInfo(await getAgentInfo());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // Errors land in agentError (App captures them); ignore the rejection here.
+      await onReGrant().catch(() => {});
     } finally {
-      setLoadingInfo(false);
-    }
-  };
-
-  const grant = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      // Fetch /agent/info FRESH on every grant/re-grant — never reuse a cached
-      // DID — so a swapped backend agent DID is caught. delegateToAgent verifies
-      // the ack's agentDid matches what we delegated to (+ VITE_AGENT_DID if set).
-      const fresh = await getAgentInfo();
-      setInfo(fresh);
-      const { ack } = await delegateToAgent(fresh.did);
-      onDelegation({
-        agentDid: ack.agentDid,
-        delegationCid: ack.delegationCid,
-        spaceId: ack.spaceId,
-        expiresAt: ack.expiresAt,
-      });
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
+      setReGranting(false);
     }
   };
 
@@ -149,6 +143,7 @@ function DelegateStep({
     );
   }
 
+  // Delegation in place (fresh or reused) → ready to read + generate.
   if (delegation) {
     return (
       <div className="connect-panel">
@@ -163,67 +158,41 @@ function DelegateStep({
           <button
             type="button"
             className="quiet-link"
-            disabled={busy}
-            onClick={() => void grant()}
+            disabled={reGranting || agentConnecting}
+            onClick={() => void reGrant()}
           >
-            {busy ? "Re-granting…" : "Re-grant"}
+            {reGranting ? "Re-granting…" : "Re-grant"}
           </button>
         </div>
-        {error && <div className="feed-error" style={{ marginTop: 14 }}>{error}</div>}
+        {agentError && <div className="feed-error" style={{ marginTop: 14 }}>{agentError}</div>}
       </div>
     );
   }
 
+  // No delegation yet: the agent auto-connects on sign-in. While that's in
+  // flight show a connecting state; if it FAILED, surface the error + a retry.
   return (
     <div className="connect-panel">
-      <p className="feed-status-line connect-heading">Connect an agent.</p>
+      <p className="feed-status-line connect-heading">
+        {agentConnecting ? "Connecting agent…" : "Agent not connected."}
+      </p>
       <p className="feed-status-sub">{AGENT_HOST}</p>
-      {!info ? (
+      {!agentConnecting && (
         <div className="prefs-actions">
+          <Link to={{ kind: "feed" }} className="quiet-link" aria-label="Go to feed">
+            Go to feed
+          </Link>
           <button
             type="button"
             className="quiet-link"
-            disabled={loadingInfo}
-            onClick={() => void loadInfo()}
+            disabled={reGranting}
+            onClick={() => void reGrant()}
           >
-            {loadingInfo ? "Loading agent…" : "Look up agent"}
+            {reGranting ? "Connecting…" : "Connect agent"}
           </button>
         </div>
-      ) : (
-        <>
-          <AgentDescriptor info={info} />
-          <div className="prefs-actions">
-            <button
-              type="button"
-              className="quiet-link"
-              disabled={busy}
-              onClick={() => void grant()}
-            >
-              {busy ? "Granting…" : "Delegate to agent"}
-            </button>
-          </div>
-        </>
       )}
-      {error && <div className="feed-error" style={{ marginTop: 14 }}>{error}</div>}
-    </div>
-  );
-}
-
-export function AgentDescriptor({ info }: { info: AgentInfo }) {
-  return (
-    <div className="prefs-section">
-      <h3>{info.name}</h3>
-      <p className="agent-did">{info.did}</p>
-      <ul>
-        {info.permissions.map((p, i) => (
-          <li key={i} className="learned">
-            <span className="prefs-text">
-              {p.service} · {p.space ?? "applications"} · {p.path}
-            </span>
-            <span className="prefs-evidence">{p.actions.join(", ")}</span>
-          </li>
-        ))}
-      </ul>
+      {agentError && <div className="feed-error" style={{ marginTop: 14 }}>{agentError}</div>}
     </div>
   );
 }
