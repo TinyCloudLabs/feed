@@ -16,9 +16,46 @@ no server, no `/api`, no sessions database. It signs in as the space **owner**
 ```sh
 bun install
 bun run dev        # local dev server (http://localhost:5173)
-bun run build      # static bundle -> dist/
+bun run build      # static bundle -> web/dist/
 bun run typecheck
 ```
+
+### 5 pages + the agent flow
+
+The app is a small path-routed SPA (`web/src/router.tsx`) with five routes:
+
+| Route | Page | What it does |
+| --- | --- | --- |
+| `/` | **Connect** | OpenKey sign-in, then `GET /agent/info`, `delegateTo(agentDid, scopes)`, `POST /agent/delegation`. Shows delegation status/expiry + re-grant. |
+| `/feed` | **Feed** | Artifact cards + More/Less/Save. Empty state links to `/agents`. |
+| `/a/:slug` | **Artifact** | Full article detail. |
+| `/agents` | **Agents** | Delegation status, re-grant/revoke, **Generate** (`POST /agent/run` → poll `GET /agent/run/:id`), run history. |
+| `/preferences` | **Preferences** | Interaction history (the signal feeding server-side learned preferences). |
+
+The user delegates **Listen-read + artifacts-read/write** to a stable agent
+`did:pkh` (`web/src/tinycloud.ts` `AGENT_SCOPES`). The broadened sign-in manifest
+unions those scopes into the SIWE recap, so `delegateTo(agentDid, AGENT_SCOPES)`
+derives from the session key with **no extra wallet prompt**. The agent runs the
+artifact pipeline under that delegation, publishing to the user's **own**
+`applications` space; the feed refreshes after a run. The agent endpoints
+(`web/src/agentClient.ts`) are gated behind `VITE_AGENT_HOST` — unset, the UI
+shows a clear "agent backend not configured" state rather than faking success.
+
+### Environment + Cloudflare Pages
+
+Vite only exposes `VITE_`-prefixed vars to the client. Copy `.env.example` to
+`.env` for local dev, or set these in the CF Pages project:
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `VITE_AGENT_HOST` | _(unset)_ | The distillery agent backend (info/delegation/run). Unset → agent UI shows "not configured". |
+| `VITE_AGENT_DID` | _(unset)_ | Optional: the agent's stable `did:pkh`, declared as a manifest delegation target. Not required for the flow. |
+| `VITE_OPENKEY_HOST` | `https://openkey.so` | OpenKey passkey host. |
+| `VITE_TINYCLOUD_HOST` | `https://node.tinycloud.xyz` | TinyCloud node (storage). |
+
+**Cloudflare Pages build:** build command `bun run build`, output directory
+`web/dist`. `web/public/_redirects` (`/* /index.html 200`) is copied into the
+build so deep links and refreshes resolve to the SPA.
 
 ### How it reads / writes
 

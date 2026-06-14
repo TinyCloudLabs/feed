@@ -8,7 +8,7 @@ import { hydrateMedia, releaseMedia, recordInteraction } from "./feedClient.ts";
 marked.setOptions({ gfm: true, breaks: false });
 
 export function cardHref(card: FeedCard): string {
-  return `#/a/${encodeURIComponent(card.slug)}`;
+  return `/a/${encodeURIComponent(card.slug)}`;
 }
 
 function fmtDate(iso: string): string {

@@ -89,6 +89,12 @@ button {
   flex: none;
 }
 
+/* active nav route: accent rule, no hover needed */
+.quiet-link.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 /* quiet text affordance: hairline underline, accent on hover/focus */
 .quiet-link {
   display: inline-flex;
@@ -1042,6 +1048,52 @@ button.tag::after {
 
 .prefs-editor-meta.over {
   color: var(--accent);
+}
+
+/* ---- connect / agents pages ---- */
+.connect-panel,
+.agents {
+  padding: 26px 0;
+}
+
+/* monospace DID, wraps on narrow viewports without breaking the layout */
+.agent-did,
+.run-published {
+  display: block;
+  margin: 6px 0 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+
+.run-published {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 6px;
+}
+
+.connect-heading {
+  margin-top: 26px;
+  text-align: left;
+}
+
+.generate {
+  margin-top: 26px;
+}
+
+.prefs-section-title {
+  margin: 22px 0 6px;
+  font-family: var(--mono);
+  font-weight: 500;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--hairline);
 }
 
 /* visually hidden (a11y announcements) */

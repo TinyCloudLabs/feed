@@ -247,3 +247,24 @@ export async function recordInteraction(
   if (!res.ok) throw new Error(`interaction write failed: ${res.error.message}`);
   return row;
 }
+
+// ── interaction reads (Preferences page) ─────────────────────────────────────
+
+/** Read the reader's recent interactions, newest first. Used by the Preferences
+ *  page to show the interaction history that feeds the (server-side) preference
+ *  loop. There is no client-side preferences store yet, so this is the durable
+ *  signal the user can see. */
+export async function loadInteractions(
+  appsSpaceUri: string,
+  limit = 100,
+): Promise<InteractionRow[]> {
+  const db = spaceSql(appsSpaceUri).db(INTERACTIONS_DB);
+  const res = await db.query<unknown>(
+    `SELECT id, artifact_id, artifact_type, action, note, reader_did, nonce, ` +
+      `created_at, recorded_at FROM interaction ` +
+      `ORDER BY recorded_at DESC LIMIT ?`,
+    [limit],
+  );
+  if (!res.ok) throw new Error(`interactions read failed: ${res.error.message}`);
+  return zipRows<InteractionRow>(res.data.columns, res.data.rows);
+}
