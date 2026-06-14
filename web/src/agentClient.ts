@@ -218,41 +218,56 @@ export function clearStoredDelegation(): void {
   }
 }
 
-/** Single-flight guard for {@link ensureDelegation}: concurrent callers (App's
- *  auto-connect + the Generate button) await the SAME in-flight mint instead of
- *  each POSTing /agent/delegation. Cleared when the mint settles. */
-let inflightEnsure: Promise<DelegationAck> | null = null;
+/** Per-space single-flight guard for {@link ensureDelegation}: concurrent callers
+ *  for the SAME space (App's auto-connect + the Generate button) await one shared
+ *  in-flight mint instead of each POSTing /agent/delegation. Keyed by space so a
+ *  mint for space A is NEVER returned to a caller for space B — a global promise
+ *  would re-open the cross-session hole. The entry is deleted when its mint
+ *  settles. */
+const inflightEnsure = new Map<string, Promise<DelegationAck>>();
 
 /** Ensure a usable delegation exists for `currentSpaceId`, reusing the stored
  *  one when it's valid for THIS space and otherwise minting a fresh one: GET
  *  /agent/info (fresh, so a swapped backend DID is caught) → delegateToAgent →
- *  persist the ack. Concurrent calls share one in-flight mint (single-flight) so
- *  the auto-connect + Generate can't double-POST. Returns the ack the caller
- *  turns into DelegationInfo. The happy path needs no manual "look up"/"delegate"
- *  clicks — this IS that flow, run on demand. */
+ *  persist the ack. Concurrent calls for the same space share one in-flight mint
+ *  (single-flight, keyed by space) so the auto-connect + Generate can't double-
+ *  POST. Returns the ack the caller turns into DelegationInfo. The happy path
+ *  needs no manual "look up"/"delegate" clicks — this IS that flow, run on
+ *  demand. */
 export async function ensureDelegation(currentSpaceId: string): Promise<DelegationAck> {
   const stored = loadStoredDelegation(currentSpaceId);
   if (stored) return stored;
-  // Coalesce concurrent mints into one POST.
-  if (inflightEnsure) return inflightEnsure;
-  inflightEnsure = (async () => {
-    const info = await getAgentInfo();
-    const { ack } = await delegateToAgent(info.did);
-    // The minted delegation must target the active session's space — otherwise
-    // we'd persist (and later reuse) a delegation bound to the wrong space.
-    if (ack.spaceId !== currentSpaceId) {
-      throw new Error(
-        `delegation space mismatch: signed in to ${currentSpaceId}, backend acked ${ack.spaceId}`,
-      );
-    }
-    storeDelegation(ack);
-    return ack;
-  })();
-  try {
-    return await inflightEnsure;
-  } finally {
-    inflightEnsure = null;
+  // Coalesce concurrent mints for THIS space into one POST. The get→set below is
+  // synchronous (no await between) so two concurrent callers can't both insert.
+  let pending = inflightEnsure.get(currentSpaceId);
+  if (!pending) {
+    pending = (async () => {
+      const info = await getAgentInfo();
+      const { ack } = await delegateToAgent(info.did);
+      // The minted delegation must target the requested space BEFORE we persist
+      // it — otherwise we'd store (and later reuse) a wrong-space delegation.
+      if (ack.spaceId !== currentSpaceId) {
+        throw new Error(
+          `delegation space mismatch: signed in to ${currentSpaceId}, backend acked ${ack.spaceId}`,
+        );
+      }
+      storeDelegation(ack);
+      return ack;
+    })();
+    inflightEnsure.set(currentSpaceId, pending);
+    void pending.finally(() => inflightEnsure.delete(currentSpaceId));
   }
+  const ack = await pending;
+  // Defense-in-depth: re-assert the resolved ack targets THIS space before the
+  // caller uses it — so even a shared in-flight promise can't yield a wrong-space
+  // delegation. The per-space keying + mint-time assert above already guarantee
+  // this; the redundant check is a belt-and-suspenders trust boundary.
+  if (ack.spaceId !== currentSpaceId) {
+    throw new Error(
+      `delegation space mismatch: signed in to ${currentSpaceId}, backend acked ${ack.spaceId}`,
+    );
+  }
+  return ack;
 }
 
 /** Mint a delegation of AGENT_SCOPES to `expectedDid` with the session key and
