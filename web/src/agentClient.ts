@@ -56,6 +56,13 @@ function resolveAgentHost(raw: string): string {
 
 const AGENT_HOST = resolveAgentHost(import.meta.env.VITE_AGENT_HOST || "");
 
+/** The per-install bearer token the backend requires on its mutating endpoints
+ *  (POST /agent/delegation, POST /agent/run). Read from VITE_AGENT_TOKEN at build
+ *  time. When unset, those POSTs carry no auth header and the backend answers 401
+ *  — the correct loud behavior (a misconfigured token must fail visibly, not
+ *  silently succeed). GET /agent/info and GET /agent/run/:id stay unauthenticated. */
+const AGENT_TOKEN = (import.meta.env.VITE_AGENT_TOKEN || "").trim();
+
 /** True when a valid agent backend host is configured. */
 export function agentConfigured(): boolean {
   return AGENT_HOST.length > 0;
@@ -108,10 +115,12 @@ export interface RunState {
 
 /** A fetch that fails LOUDLY (no silent fallback) and surfaces the backend's
  *  error body when present. Throws if the agent host is unconfigured — callers
- *  must gate on `agentConfigured()` first. Honors an optional AbortSignal. */
+ *  must gate on `agentConfigured()` first. Honors an optional AbortSignal. Pass
+ *  `auth: true` on the mutating endpoints (delegation/run) to send the per-install
+ *  bearer token (VITE_AGENT_TOKEN); GET endpoints leave it off. */
 async function agentFetch<T>(
   path: string,
-  init?: RequestInit & { signal?: AbortSignal },
+  init?: RequestInit & { signal?: AbortSignal; auth?: boolean },
 ): Promise<T> {
   if (!agentConfigured()) {
     throw new Error("agent backend not configured (VITE_AGENT_HOST is unset)");
@@ -120,6 +129,7 @@ async function agentFetch<T>(
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(init?.auth && AGENT_TOKEN ? { Authorization: `Bearer ${AGENT_TOKEN}` } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -161,6 +171,7 @@ export async function delegateToAgent(
   const serialized = serializeDelegation(delegation);
   const ack = await agentFetch<DelegationAck>("/agent/delegation", {
     method: "POST",
+    auth: true,
     body: JSON.stringify({ serialized }),
   });
   if (ack.agentDid !== expectedDid) {
@@ -173,6 +184,7 @@ export async function delegateToAgent(
 export async function startRun(): Promise<{ run_id: string; status: RunStatus }> {
   return agentFetch<{ run_id: string; status: RunStatus }>("/agent/run", {
     method: "POST",
+    auth: true,
     body: JSON.stringify({}),
   });
 }
