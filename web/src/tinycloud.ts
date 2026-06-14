@@ -1,12 +1,14 @@
 // tinycloud.ts — browser web-SDK session for the viewer.
 //
-// V1 signs in as the space OWNER (full access to its own `applications` space;
-// the scoped-reader delegation of contract §3.5 is a later iteration). The
-// manifest requests `applications`-space SQL + KV caps so the owner session
-// actually carries capabilities reaching `xyz.tinycloud.artifacts/feed`,
-// `/interactions`, and `/media/`.
+// The user signs in as the space OWNER over a BROADENED `applications`-space
+// manifest: the artifacts feed/interactions/media the viewer reads + writes,
+// PLUS the Listen-read caps the user delegates to the agent. The wider recap is
+// what lets `delegateTo(agentDid, scopes)` derive the agent's grant from the
+// session key with no extra wallet prompt — `delegateTo`'s subset check is
+// against the signed recap's PERMISSIONS, independent of the agent DID (which
+// is discovered at runtime via GET /agent/info).
 
-import { TinyCloudWeb, type Config, type Manifest } from "@tinycloud/web-sdk";
+import { TinyCloudWeb, type Config, type Manifest, type PermissionEntry } from "@tinycloud/web-sdk";
 import { connectWallet } from "./openkey.ts";
 
 const HOST = import.meta.env.VITE_TINYCLOUD_HOST || "https://node.tinycloud.xyz";
@@ -20,13 +22,73 @@ export const INTERACTIONS_DB = "xyz.tinycloud.artifacts/interactions";
 /** Contract §2 media KV prefix (trailing slash = prefix semantics). */
 export const MEDIA_PREFIX = "xyz.tinycloud.artifacts/media/";
 
+/** Listen data source the agent reads under delegation (lives in the SAME
+ *  `applications` space as the artifacts). Conversations are SQL; transcripts
+ *  are KV under the `xyz.tinycloud.listen/` prefix (trailing slash = prefix). */
+export const LISTEN_CONVERSATIONS_DB = "xyz.tinycloud.listen/conversations";
+export const LISTEN_KV_PREFIX = "xyz.tinycloud.listen/";
+
+/** The exact scopes the user delegates to the agent (Listen-read +
+ *  artifacts-read/write). The agent runs the artifact pipeline under these,
+ *  publishing to the user's OWN `applications` space. Exported so the Connect/
+ *  Agents pages mint the delegation with the same set the manifest broadened
+ *  the recap to cover. */
+export const AGENT_SCOPES: PermissionEntry[] = [
+  {
+    service: "tinycloud.sql",
+    space: "applications",
+    path: LISTEN_CONVERSATIONS_DB,
+    actions: ["read"],
+    description: "Read Listen conversations to generate artifacts.",
+  },
+  {
+    service: "tinycloud.kv",
+    space: "applications",
+    path: LISTEN_KV_PREFIX,
+    actions: ["get", "list", "metadata"],
+    description: "Read Listen transcripts to generate artifacts.",
+  },
+  {
+    service: "tinycloud.sql",
+    space: "applications",
+    path: FEED_DB,
+    actions: ["read", "write"],
+    description: "Publish generated artifacts to the feed.",
+  },
+  {
+    service: "tinycloud.sql",
+    space: "applications",
+    path: INTERACTIONS_DB,
+    actions: ["read"],
+    description: "Read interactions to shape generated artifacts.",
+  },
+  {
+    service: "tinycloud.kv",
+    space: "applications",
+    path: MEDIA_PREFIX,
+    // Minimal: the agent reads/writes hero blobs BY KEY (the SQL pointer carries
+    // the exact key) — it never enumerates the user's media, so no list/metadata.
+    actions: ["get", "put"],
+    description: "Read/write artifact media (hero images) by key.",
+  },
+];
+
 // Manifest: declare exactly the caps the viewer needs on the applications
-// space. `prefix: ""` disables the auto app-id prefix so our full contract
+// space (artifacts read/interactions + media) PLUS the agent's delegated scopes,
+// so the signed recap covers everything `delegateTo(agentDid, AGENT_SCOPES)`
+// derives. `prefix: ""` disables the auto app-id prefix so our full contract
 // paths are used verbatim (otherwise the SDK would prepend `xyz.tinycloud.artifacts`).
+//
+// An optional agent delegation TARGET is declared (manifest `did`) when
+// VITE_AGENT_DID is configured at build time — the agent's stable did:pkh. This
+// is advisory: the derivation does not need it, but declaring it surfaces the
+// delegate in the SDK's composed request for tooling that inspects targets.
+const AGENT_DID = import.meta.env.VITE_AGENT_DID || "";
+
 const MANIFEST: Manifest = {
   app_id: ARTIFACTS_APP_ID,
   name: "Feed",
-  description: "Reads the artifact feed and records reader interactions.",
+  description: "Reads the artifact feed, records reader interactions, and delegates generation to an agent.",
   space: "applications",
   prefix: "",
   defaults: false,
@@ -52,8 +114,27 @@ const MANIFEST: Manifest = {
       actions: ["get", "list", "metadata"],
       description: "Read artifact media (hero images, audio).",
     },
+    // Agent-delegated scopes, unioned into the recap so delegateTo derives.
+    ...AGENT_SCOPES,
   ],
 };
+
+/** Optional agent delegation-target manifest. Carries the SAME permission set
+ *  as AGENT_SCOPES under the agent's `did`, so the composed request lists the
+ *  delegate explicitly when the DID is known at build time. Omitted when
+ *  VITE_AGENT_DID is unset (the runtime delegateTo path is unaffected). */
+const AGENT_MANIFEST: Manifest | null = AGENT_DID
+  ? {
+      app_id: ARTIFACTS_APP_ID,
+      name: "Feed Agent",
+      description: "The distillery agent that generates artifacts under the user's delegation.",
+      did: AGENT_DID,
+      space: "applications",
+      prefix: "",
+      defaults: false,
+      permissions: AGENT_SCOPES,
+    }
+  : null;
 
 let instance: TinyCloudWeb | null = null;
 
@@ -75,10 +156,15 @@ export function tcw(): TinyCloudWeb {
  *  the applications space). */
 export async function signIn(): Promise<{ appsSpaceUri: string; readerDid: string }> {
   const { web3Provider } = await connectWallet();
+  // Compose the app manifest with the optional agent delegation target so the
+  // single SIWE recap covers the app's own caps + the agent's scopes.
+  const manifest: Manifest | Manifest[] = AGENT_MANIFEST
+    ? [MANIFEST, AGENT_MANIFEST]
+    : MANIFEST;
   const config: Config = {
     providers: { web3: { driver: web3Provider } },
     tinycloudHosts: [HOST],
-    manifest: MANIFEST,
+    manifest,
   };
   const t = new TinyCloudWeb(config);
   await t.signIn();
@@ -97,4 +183,4 @@ export async function signOut(): Promise<void> {
   }
 }
 
-export { HOST };
+export { HOST, AGENT_DID };
