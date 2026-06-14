@@ -96,14 +96,20 @@ function optString(value: unknown, field: string): string {
   return value.trim();
 }
 
-/** Resolve the runtime config from a fetched-or-null raw config, applying
- *  precedence (runtime config wins; VITE_* is dev-only fallback) and validating
- *  the host. `raw === null` means the fetch failed / file was absent.
+/** Resolve the runtime config from a fetched-or-null raw config, validating the
+ *  host. `raw === null` means the fetch failed / file was absent.
  *
- *  PROD: a null raw (missing config) THROWS — no silent fallback to a blank/stale
- *  agent. A malformed field also throws (via optString / resolveAgentHost).
- *  DEV: a null raw falls back to the VITE_AGENT_* env so `vite dev` works with a
- *  `.env.local` and no static file. */
+ *  Precedence for HOST and guard DID:
+ *    PROD — runtime config is the ONLY source. A missing/blank/invalid host THROWS
+ *      (loud error screen). An omitted `did` stays "" so the live /agent/info DID
+ *      governs (DID auto-discovery survives a repoint). NO VITE_* fallback — it
+ *      would silently boot the stale build-time host/DID.
+ *    DEV — runtime config wins, else falls back to VITE_AGENT_* so `vite dev`
+ *      works with a `.env.local` and a partial/absent static file.
+ *  TOKEN sources from VITE_AGENT_TOKEN in both modes (choice (a)).
+ *
+ *  PROD + null raw (missing config) THROWS — no silent fallback to a blank/stale
+ *  agent. A malformed field also throws (via optString / resolveAgentHost). */
 function resolveConfig(raw: RawAgentConfig | null): ResolvedAgentConfig {
   if (raw === null) {
     if (IS_PROD) {
@@ -119,23 +125,33 @@ function resolveConfig(raw: RawAgentConfig | null): ResolvedAgentConfig {
       token: ENV_TOKEN,
     };
   }
-  // Runtime config present → it WINS. Each field falls back to its VITE_* env
-  // ONLY when the JSON omits it (dev convenience); the host is always validated.
+  // Runtime config present → it WINS, and in PROD it is the ONLY source for host
+  // and guard DID — a VITE_* fallback there would silently boot the STALE build-
+  // time host/DID when the deployed JSON omits a field, defeating the whole point
+  // (and blocking DID auto-discovery after a repoint). The VITE_* fallback for
+  // host/DID is allowed ONLY under DEV (so `vite dev` works with a `.env.local`
+  // and a partial/empty static file). Token still sources from VITE_AGENT_TOKEN by
+  // design (choice (a) — the committed file carries no token).
   const rawHost = optString(raw.host, "host");
   const rawDid = optString(raw.did, "did");
   const rawToken = optString(raw.token, "token");
-  const host = resolveAgentHost(rawHost || ENV_HOST);
+  // HOST: prod = runtime only; dev = runtime, else VITE fallback. Always validated.
+  const host = resolveAgentHost(IS_PROD ? rawHost : rawHost || ENV_HOST);
   // A present config with no usable host is a misconfig in prod — fail loudly
-  // rather than render a silently-unconfigured agent.
+  // rather than render a silently-unconfigured (or stale build-time) agent.
   if (IS_PROD && host === "") {
     throw new Error(
       `agent runtime config malformed: ${CONFIG_URL} has no "host". ` +
         `Add a valid https:// host.`,
     );
   }
+  // GUARD DID: prod = config.did ONLY (absent → "" so the live /agent/info DID
+  // governs and a repoint auto-discovers the new agent); dev = config.did, else
+  // VITE fallback.
+  const did = IS_PROD ? rawDid : rawDid || ENV_DID;
   return {
     host,
-    did: rawDid || ENV_DID,
+    did,
     token: rawToken || ENV_TOKEN,
   };
 }

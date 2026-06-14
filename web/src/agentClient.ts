@@ -149,13 +149,16 @@ export async function getAgentInfo(): Promise<AgentInfo> {
 const DELEGATION_KEY = "feed:agentDelegation";
 
 /** Load the persisted delegation ack for `currentSpaceId`, or null when absent,
- *  malformed, expired, targeting a DIFFERENT agent than the runtime config's guard
- *  DID, or bound to a DIFFERENT space than the active session. A stale/mismatched
- *  entry is cleared so we don't keep reconsidering it (and so the next
- *  ensureDelegation mints a fresh one for the current space). When the runtime
- *  config has no `did` (auto-discover mode), the agent-match check is skipped here
- *  — the swapped-backend guard then runs advisory against the live /agent/info DID
- *  during the re-grant (see delegateToAgent). */
+ *  malformed, expired, targeting a DIFFERENT agent than a STATIC config.did, or
+ *  bound to a DIFFERENT space than the active session. A stale/mismatched entry is
+ *  cleared so we don't keep reconsidering it.
+ *
+ *  Agent-match here is only the STATIC-config.did case (sync). When config.did is
+ *  ABSENT (auto-discover mode), the agent identity isn't known synchronously, so
+ *  this returns a space-matched candidate WITHOUT proving its agent is current —
+ *  `ensureDelegation` then fetches /agent/info and requires
+ *  `ack.agentDid === info.did` before reusing it (the repoint guard). So a
+ *  candidate from here is reused only after BOTH space and agent checks pass. */
 export function loadStoredDelegation(currentSpaceId: string): DelegationAck | null {
   let raw: string | null;
   try {
@@ -216,23 +219,43 @@ export function clearStoredDelegation(): void {
 const inflightEnsure = new Map<string, Promise<DelegationAck>>();
 
 /** Ensure a usable delegation exists for `currentSpaceId`, reusing the stored
- *  one when it's valid for THIS space and otherwise minting a fresh one: GET
- *  /agent/info (fresh, so a swapped backend DID is caught) → delegateToAgent →
- *  persist the ack. Concurrent calls for the same space share one in-flight mint
- *  (single-flight, keyed by space) so the auto-connect + Generate can't double-
- *  POST. Returns the ack the caller turns into DelegationInfo. The happy path
- *  needs no manual "look up"/"delegate" clicks — this IS that flow, run on
- *  demand. */
+ *  one ONLY when it matches BOTH the current space AND the current agent, and
+ *  otherwise minting a fresh one: GET /agent/info (fresh, so a swapped/repointed
+ *  backend DID is caught) → delegateToAgent → persist the ack. Concurrent calls
+ *  for the same space share one in-flight operation (single-flight, keyed by
+ *  space) so the auto-connect + Generate can't double-POST.
+ *
+ *  Agent-match on reuse (repoint guard): `loadStoredDelegation` binds the stored
+ *  ack to the space and — when a STATIC config.did is set — to that DID too, so a
+ *  static-config candidate is already agent-matched and reused directly. When
+ *  config.did is ABSENT (auto-discover mode), the stored ack's agent is NOT yet
+ *  proven current, so we fetch /agent/info HERE and require
+ *  `stored.agentDid === info.did` before reusing — a repoint to a new agent (new
+ *  /agent/info DID) drops the previous agent's stale ack and forces a fresh mint
+ *  rather than treating it active. Returns the ack the caller turns into
+ *  DelegationInfo; the happy path needs no manual "look up"/"delegate" clicks. */
 export async function ensureDelegation(currentSpaceId: string): Promise<DelegationAck> {
   const stored = loadStoredDelegation(currentSpaceId);
-  if (stored) return stored;
-  // Coalesce concurrent mints for THIS space into one POST. The get→set below is
+  // A static config.did means loadStoredDelegation already enforced the stored
+  // ack's agentDid === config.did (the current agent by configuration), so a
+  // surviving candidate is space- AND agent-matched: reuse without a round-trip.
+  if (stored && getAgentConfig().did !== "") return stored;
+  // Coalesce concurrent operations for THIS space into one. The get→set below is
   // synchronous (no await between) so two concurrent callers can't both insert.
   let pending = inflightEnsure.get(currentSpaceId);
   if (!pending) {
     pending = (async () => {
       try {
+        // Auto-discover mode (no static config.did): fetch the CURRENT agent DID
+        // once. Reuse the stored ack ONLY if it was minted for THIS same agent —
+        // a repoint changes info.did and forces a fresh mint below.
         const info = await getAgentInfo();
+        if (stored) {
+          if (stored.agentDid === info.did) return stored;
+          // Stored ack belongs to a DIFFERENT (previous) agent → drop it so it's
+          // not reconsidered, and fall through to mint for the current agent.
+          clearStoredDelegation();
+        }
         const { ack } = await delegateToAgent(info.did);
         // The minted delegation must target the requested space BEFORE we persist
         // it — otherwise we'd store (and later reuse) a wrong-space delegation.
