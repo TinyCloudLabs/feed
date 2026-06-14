@@ -2,15 +2,12 @@
 // hydrates media (KV), and appends interaction events (SQL) — all scoped to the
 // owner's `applications` space.
 //
-// SPACE-SCOPED SQL SEAM
-// ─────────────────────
-// The browser `TinyCloudWeb` class does not yet expose space-scoped SQL.
-// `sqlForSpace` / `kvForSpace` live on the underlying `TinyCloudNode`. Until the
-// web-SDK passthrough lands (js-sdk task: add `sqlForSpace`/`kvForSpace` getters
-// to `TinyCloudWeb`), this file reaches the node through ONE quarantined access
-// point below. When the passthrough publishes, delete the `as any` reach in
-// `spaceSql()` / `spaceKv()` and call `t.sqlForSpace(uri)` / `t.kvForSpace(uri)`
-// directly — nothing else changes.
+// SPACE-SCOPED SQL/KV
+// ───────────────────
+// `TinyCloudWeb.sqlForSpace(uri)` / `kvForSpace(uri)` (web-sdk >= 2.4.0-beta.2)
+// return services scoped to a non-primary space. The whole codebase reaches
+// space-scoped storage through the two helpers below (this file AND seed.ts) —
+// keep it that way so there's a single place to evolve.
 
 import type { IDatabaseHandle, IKVService } from "@tinycloud/sdk-services";
 import { tcw, FEED_DB, INTERACTIONS_DB } from "./tinycloud.ts";
@@ -22,28 +19,16 @@ import type {
   RenderType,
 } from "./types.ts";
 
-// ── the quarantined seam (see header) ──────────────────────────────────────
-//
-// THE single place the codebase reaches space-scoped SQL/KV. Everything that
-// needs it (this file AND seed.ts) routes through `spaceSql` / `spaceKv` — there
-// is exactly one `(tcw as any).node` access point, here. Do not duplicate it.
+// ── space-scoped storage accessors ──────────────────────────────────────────
 
-/** Space-scoped SQL service for `uri`. TODO(web-sdk-passthrough): replace the
- *  private-node reach with `t.sqlForSpace(uri)` once TinyCloudWeb exposes it. */
+/** Space-scoped SQL service for `uri` (full space URI). */
 export function spaceSql(uri: string): { db(name: string): IDatabaseHandle } {
-  const t = tcw();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const node = (t as any).node as {
-    sqlForSpace(uri: string): { db(name: string): IDatabaseHandle };
-  };
-  return node.sqlForSpace(uri);
+  return tcw().sqlForSpace(uri);
 }
 
-/** Space-scoped KV service for `uri`. TODO(web-sdk-passthrough): replace with
- *  `t.kvForSpace(uri)`. Until then we use the SUPPORTED public path —
- *  `t.spaces.get(uri).kv` — which already scopes KV to the space. */
+/** Space-scoped KV service for `uri` (full space URI). */
 export function spaceKv(uri: string): IKVService {
-  return tcw().space(uri).kv;
+  return tcw().kvForSpace(uri);
 }
 
 // ── reads ──────────────────────────────────────────────────────────────────

@@ -6,8 +6,8 @@
 
 import type { SqlValue } from "@tinycloud/sdk-services";
 import { tcw, FEED_DB, INTERACTIONS_DB, MEDIA_PREFIX } from "./tinycloud.ts";
-// Space-scoped SQL goes through the SINGLE quarantined seam in feedClient.ts —
-// seed.ts must not reach the private node itself (one access point only).
+// Space-scoped SQL/KV goes through the shared feedClient accessors — keep the
+// one access path so storage scoping evolves in a single place.
 import { spaceSql, spaceKv } from "./feedClient.ts";
 
 const CREATE_ARTIFACT = `
