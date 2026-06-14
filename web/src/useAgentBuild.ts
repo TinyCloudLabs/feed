@@ -85,6 +85,15 @@ export function useAgentBuild({
   // hold its id here so a second start() attaches instead of POSTing again. (The
   // server endpoint guards the cross-tab case; this guards the same tab.)
   const activeRunId = useRef<string | null>(null);
+  // SYNCHRONOUS in-tab single-flight: flipped true at the very top of start()
+  // BEFORE any await, so a second start() in the same tick (double-click, both
+  // pages mounted) can't slip past the guard while the first is still awaiting
+  // getActiveRun/ensureDelegation/startRun. Reset when start() settles. This is
+  // stricter than the async `building` state (which only updates next render).
+  const starting = useRef(false);
+  // True while mounted; flipped false on unmount so an aborted/late poll doesn't
+  // setState after teardown. Checked before every setState in the poll path.
+  const mounted = useRef(true);
 
   // Drive the poll for a known run id to terminal, wiring state + the refresh /
   // error side-effects. Shared by both "resume an existing run" (mount) and
@@ -92,30 +101,36 @@ export function useAgentBuild({
   const drivePoll = useCallback(
     async (runId: string, controller: AbortController) => {
       activeRunId.current = runId;
-      setBuilding(true);
+      if (mounted.current) setBuilding(true);
       try {
         const terminal = await pollRun(
           runId,
           (state) => {
-            setLive(state);
-            onRunUpdateRef.current?.(state);
+            // Skip updates once unmounted/aborted — pollRun's last onUpdate can
+            // land after the abort that ended the loop.
+            if (mounted.current && !controller.signal.aborted) {
+              setLive(state);
+              onRunUpdateRef.current?.(state);
+            }
           },
           { signal: controller.signal },
         );
         if (terminal.status === "done") {
           onFeedRefreshRef.current();
-        } else if (terminal.status === "error") {
+        } else if (terminal.status === "error" && mounted.current) {
           setError(terminal.error ?? "run failed");
         }
       } catch (e) {
         // A deliberate abort (unmount) is not a user-facing error.
-        if (!(e instanceof DOMException && e.name === "AbortError")) {
+        if (mounted.current && !(e instanceof DOMException && e.name === "AbortError")) {
           setError(e instanceof Error ? e.message : String(e));
         }
       } finally {
         if (pollAbort.current === controller) pollAbort.current = null;
         if (activeRunId.current === runId) activeRunId.current = null;
-        setBuilding(false);
+        // Guard the building reset too: an unmounted/aborted poll must not
+        // setState after teardown (React warns + it's a no-op leak).
+        if (mounted.current) setBuilding(false);
       }
     },
     [],
@@ -149,46 +164,79 @@ export function useAgentBuild({
 
   const start = useCallback(async () => {
     // Already building (local or resumed) — attach, don't POST a second run.
-    if (building || activeRunId.current) return;
+    // `starting` (synchronous ref) is the authoritative in-tab guard: it's set
+    // BELOW before any await, so two start() calls in the same tick (double-click,
+    // or both pages mounting) can't both pass — the async `building` state and
+    // `activeRunId` (set only inside drivePoll, after awaits) update too late to
+    // block a same-tick second caller on their own.
+    if (starting.current || building || activeRunId.current) return;
+    starting.current = true;
     setError(null);
     const controller = new AbortController();
     pollAbort.current?.abort();
     pollAbort.current = controller;
     setBuilding(true);
     try {
-      // Re-check the server right before POSTing: a build may have started in
-      // another tab between mount and this click. If so, attach to it.
+      // Re-check the server before POSTing: a build may have started in another
+      // tab between mount and this click. If so, attach to it.
       const active = await getActiveRun(controller.signal);
       if (active && !controller.signal.aborted) {
         setLive({ run_id: active.run_id, status: active.status, published: active.published });
         await drivePoll(active.run_id, controller);
         return;
       }
-      // Ensure a delegation exists (auto-connect may have failed/been revoked),
-      // then POST a fresh run. ensureDelegation is the single-flight App helper.
+      // Ensure a delegation exists (auto-connect may have failed/been revoked).
+      // ensureDelegation is the single-flight App helper, and preserves the
+      // swapped-agent / space-binding guards (loadStoredDelegation + /agent/info).
       await ensureDelegation();
+      // FINAL pre-POST re-check, immediately before startRun(): ensureDelegation
+      // above awaits, widening the check-then-create window — re-poll so a run
+      // that appeared during it is attached to instead of duplicated. This
+      // minimizes (but cannot fully close) the cross-TAB simultaneous-click race:
+      // two tabs can still both see "none active" here and both POST, because
+      // there's no backend run lock. A true guarantee needs server-side run
+      // idempotency (a fast-follow we may add); client-side this is best-effort.
+      const stillActive = await getActiveRun(controller.signal);
+      if (stillActive && !controller.signal.aborted) {
+        setLive({
+          run_id: stillActive.run_id,
+          status: stillActive.status,
+          published: stillActive.published,
+        });
+        await drivePoll(stillActive.run_id, controller);
+        return;
+      }
       const { run_id, status } = await startRun();
       const state: RunState = { run_id, status };
       setLive(state);
       onRunStartedRef.current?.(state);
       await drivePoll(run_id, controller);
     } catch (e) {
-      if (!(e instanceof DOMException && e.name === "AbortError")) {
+      if (mounted.current && !(e instanceof DOMException && e.name === "AbortError")) {
         setError(e instanceof Error ? e.message : String(e));
       }
       // drivePoll owns clearing `building` once it runs; if we threw BEFORE it
       // (ensure/startRun/getActiveRun failed), clear it here.
       if (pollAbort.current === controller) {
         pollAbort.current = null;
-        setBuilding(false);
+        if (mounted.current) setBuilding(false);
       }
+    } finally {
+      starting.current = false;
     }
   }, [building, drivePoll, ensureDelegation]);
 
-  // Belt-and-suspenders: abort any live poll on final unmount (the mount effect's
-  // cleanup already aborts its own controller; this also covers a start()-spawned
-  // controller that outlives that effect).
-  useEffect(() => () => pollAbort.current?.abort(), []);
+  // On final unmount: mark unmounted (so the poll path stops setState'ing) and
+  // abort any live poll. The mount effect's cleanup already aborts its own
+  // controller; this also covers a start()-spawned controller that outlives that
+  // effect, and is the single place that flips `mounted` false.
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      pollAbort.current?.abort();
+    },
+    [],
+  );
 
   return { building, live, error, start };
 }

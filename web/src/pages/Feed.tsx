@@ -60,6 +60,7 @@ export function FeedPage({
   refreshKey,
   ensureDelegation,
   onFeedRefresh,
+  agentError,
 }: {
   session: Session;
   hidden: ReadonlySet<string>;
@@ -71,6 +72,10 @@ export function FeedPage({
   ensureDelegation: () => Promise<void>;
   /** Bump the feed refresh key once a build finishes (drives `refreshKey`). */
   onFeedRefresh: () => void;
+  /** A background auto-delegation failure surfaced from App. Sign-in now lands
+   *  here directly, so without this a silent failure would be invisible until the
+   *  user opened Agents / clicked Generate. Rendered as a non-blocking notice. */
+  agentError?: string | null;
 }) {
   const [cards, setCards] = useState<FeedCard[]>([]);
   const [loading, setLoading] = useState(true);
@@ -160,6 +165,18 @@ export function FeedPage({
 
       {error && <div className="feed-error">{error}</div>}
       {build.error && <div className="feed-error">{build.error}</div>}
+      {/* Background auto-delegation failure (spec audit §4): non-blocking — the
+          feed still reads fine; only Generate needs the delegation. Surface it
+          here so a silent failure isn't invisible after sign-in lands on /feed,
+          and point the user at Agents to retry (Re-grant). */}
+      {agentError && (
+        <div className="feed-notice" role="status">
+          Agent didn’t connect: {agentError}{" "}
+          <Link to={{ kind: "agents" }} className="quiet-link" aria-label="Retry on agents page">
+            Retry on Agents
+          </Link>
+        </div>
+      )}
 
       {/* In-progress build indicator (spec §4): shown whenever a build is live —
           including one started in another tab/session (detected on mount). */}

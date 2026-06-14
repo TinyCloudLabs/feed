@@ -146,11 +146,16 @@ export function App() {
     (s: Session) => {
       sessionRef.current = s;
       setSession(s);
-      // Sign-in lands on the feed (spec §1). Navigate up front; the agent
-      // delegation below proceeds in the BACKGROUND — the feed must NOT block on
-      // it. The feed reads the user's space directly; a missing delegation only
-      // affects Generate, which auto-ensures one when clicked.
-      navigate({ kind: "feed" });
+      // Sign-in lands on the feed (spec §1) — but HONOR a deep link: an
+      // unauthenticated /agents or /a/:slug renders ConnectPage as a fallback, so
+      // after sign-in the user should return to where they were headed. Mirror the
+      // restore-on-mount guard: read the live pathname once and only redirect when
+      // it's the DEFAULT connect route ("/"). The feed must NOT block on the agent
+      // delegation below (it reads the user's space directly; a missing delegation
+      // only affects Generate, which auto-ensures one when clicked).
+      if (parseRoute(location.pathname).kind === "connect") {
+        navigate({ kind: "feed" });
+      }
       // Fire-and-forget: the error (if any) lands in agentError; the rejection
       // here is already captured, so ignore it at the call site. Pass the space
       // explicitly so the delegation binds to THIS session.
@@ -251,6 +256,7 @@ export function App() {
           refreshKey={feedRefreshKey}
           ensureDelegation={ensureAgentDelegation}
           onFeedRefresh={bumpFeedRefresh}
+          agentError={agentError}
         />
       )}
       {route.kind === "article" && session && (

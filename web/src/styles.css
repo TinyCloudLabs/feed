@@ -452,6 +452,28 @@ button.mono-chip::after {
   color: var(--accent);
 }
 
+/* non-blocking notice (e.g. a background auto-delegation failure) — same hairline
+   strip as feed-error but muted ink, since the feed itself still works. Hosts a
+   small inline retry link. */
+.feed-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+}
+.feed-notice .quiet-link {
+  min-height: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
 /* skeleton: hairline-separated blocks, text bars at content proportions */
 .skel-card {
   padding: 26px 0;
