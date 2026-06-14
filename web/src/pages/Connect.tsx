@@ -38,7 +38,7 @@ export function ConnectPage({
     <>
       <header className="masthead">
         <div>
-          <h1 className="masthead-title">Feed</h1>
+          <h1 className="masthead-title">TinyFeed</h1>
           <p className="masthead-sub">xyz.tinycloud.artifacts</p>
         </div>
       </header>

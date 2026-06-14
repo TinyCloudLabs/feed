@@ -1,4 +1,4 @@
-# feed
+# TinyFeed
 
 A pure-client viewer for the **`xyz.tinycloud.artifacts`** feed, plus the `tc`
 recipes for exploring the **Listen** data source it is built on.
@@ -104,7 +104,7 @@ The viewer is built on the **Listen** data source; this repo is also the sandbox
 where we explore the underlying data — conversations and transcripts that
 `listen-importer` wrote into a TinyCloud space.
 
-**Feed has no CLI of its own.** It uses the **TinyCloud `tc` CLI** directly. Any
+**TinyFeed has no CLI of its own.** It uses the **TinyCloud `tc` CLI** directly. Any
 project built on this one should do the same: talk to Listen through `tc`. This
 README is the guide to those commands.
 

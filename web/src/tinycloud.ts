@@ -87,7 +87,7 @@ const AGENT_DID = import.meta.env.VITE_AGENT_DID || "";
 
 const MANIFEST: Manifest = {
   app_id: ARTIFACTS_APP_ID,
-  name: "Feed",
+  name: "TinyFeed",
   description: "Reads the artifact feed, records reader interactions, and delegates generation to an agent.",
   space: "applications",
   prefix: "",
