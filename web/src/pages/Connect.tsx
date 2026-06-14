@@ -11,6 +11,7 @@
 
 import { useState } from "react";
 import { signIn } from "../tinycloud.ts";
+import { bootstrapSchema } from "../feedClient.ts";
 import {
   agentConfigured,
   AGENT_HOST,
@@ -61,7 +62,12 @@ function SignInStep({ onSession }: { onSession: (s: Session) => void }) {
     setBusy(true);
     setError(null);
     try {
-      onSession(await signIn());
+      const session = await signIn();
+      // Owner-session bootstrap: idempotently create the feed + interactions
+      // tables in the user's own space so the agent can publish, interaction
+      // writes land, and the feed read doesn't hit a missing table.
+      await bootstrapSchema(session.appsSpaceUri);
+      onSession(session);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);

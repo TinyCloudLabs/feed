@@ -111,7 +111,16 @@ const COLUMNS =
   "platform, generation_model, critic_pass, quotes_verified, raw_artifact, " +
   "generated_at, published_at, publisher_did, schema_version";
 
-/** Read the published feed, newest first. V1 only renders tweet/article rows. */
+/** True when a SQL error is a "the table doesn't exist yet" error — the feed is
+ *  read pre-bootstrap (someone hit /feed before connecting, or before the first
+ *  run created any artifact rows). Treated as an empty feed, not a hard error. */
+function isMissingTable(message: string): boolean {
+  return /no such table/i.test(message);
+}
+
+/** Read the published feed, newest first. V1 only renders tweet/article rows.
+ *  A not-yet-existing `artifact` table reads as an EMPTY feed (the empty state
+ *  prompts the user to connect + Generate); any other read failure throws. */
 export async function loadFeed(
   appsSpaceUri: string,
   limit = 50,
@@ -124,7 +133,10 @@ export async function loadFeed(
       `ORDER BY published_at DESC LIMIT ? OFFSET ?`,
     [limit, offset],
   );
-  if (!res.ok) throw new Error(`feed read failed: ${res.error.message}`);
+  if (!res.ok) {
+    if (isMissingTable(res.error.message)) return [];
+    throw new Error(`feed read failed: ${res.error.message}`);
+  }
   const rows = zipRows<ArtifactRow>(res.data.columns, res.data.rows);
   return rows.map(toCard);
 }
@@ -265,6 +277,130 @@ export async function loadInteractions(
       `ORDER BY recorded_at DESC LIMIT ?`,
     [limit],
   );
-  if (!res.ok) throw new Error(`interactions read failed: ${res.error.message}`);
+  if (!res.ok) {
+    if (isMissingTable(res.error.message)) return [];
+    throw new Error(`interactions read failed: ${res.error.message}`);
+  }
   return zipRows<InteractionRow>(res.data.columns, res.data.rows);
+}
+
+// ── schema bootstrap (owner session, on connect) ─────────────────────────────
+//
+// The FRONT END owns table bootstrap, not the agent (the agent's delegation is
+// minimal — feed-write — so the owner session, which holds read/write on its own
+// `feed` + `interactions` via the broadened manifest, is the right authority).
+// On connect we run the EXACT §1 DDL idempotently so: (a) the agent can INSERT
+// feed rows on its first run, (b) reader interaction writes work, (c) the feed
+// read doesn't error on a missing table before the first run.
+//
+// DDL copied verbatim from the producer's artifact-schema.ts (greenfield
+// contract §1.1/§1.2). The front end bootstraps only the two tables the owner +
+// reader touch — `feed` and `interactions`; the agent-only `control` DB
+// (distill_cursor) is the agent's responsibility, not ours.
+
+const FEED_DDL = `CREATE TABLE IF NOT EXISTS artifact (
+  id                 TEXT PRIMARY KEY,
+  type               TEXT NOT NULL,
+  render_type        TEXT NOT NULL,
+  slug               TEXT NOT NULL,
+  headline           TEXT NOT NULL,
+  body_md            TEXT,
+  quote              TEXT,
+  attribution        TEXT,
+  tags               TEXT NOT NULL DEFAULT '[]',
+  source_transcripts TEXT NOT NULL DEFAULT '[]',
+
+  hero_image_key     TEXT,
+  hero_image_sha256  TEXT,
+  hero_image_mime    TEXT,
+  audio_key          TEXT,
+  audio_sha256       TEXT,
+  audio_mime         TEXT,
+  video_url          TEXT,
+
+  audience           TEXT,
+  approval_status    TEXT NOT NULL,
+  platform           TEXT,
+
+  generation_model   TEXT,
+  critic_pass        INTEGER NOT NULL DEFAULT 0,
+  quotes_verified    INTEGER NOT NULL DEFAULT 0,
+
+  raw_artifact       TEXT NOT NULL,
+  generated_at       TEXT NOT NULL,
+  published_at       TEXT NOT NULL,
+  publisher_did      TEXT NOT NULL,
+  schema_version     INTEGER NOT NULL DEFAULT 1
+)`;
+
+const INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS interaction (
+  id            TEXT PRIMARY KEY,
+  artifact_id   TEXT NOT NULL,
+  artifact_type TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  note          TEXT,
+  reader_did    TEXT NOT NULL,
+  nonce         TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  recorded_at   TEXT NOT NULL
+)`;
+
+/** Indexes are BEST-EFFORT: the node's SQLite authorizer rejects CREATE INDEX
+ *  ("not authorized" — a server-side constraint, not a cap gap). We attempt them
+ *  and swallow ONLY that rejection (loud about any other failure). They are query
+ *  accelerators; correctness doesn't depend on them. uq_interaction_nonce's
+ *  replay-protection role lives in the per-row `nonce` written by
+ *  `recordInteraction` (dedup moves to the distill layer until the node permits
+ *  the UNIQUE index). */
+const FEED_INDEXES = [
+  `CREATE INDEX IF NOT EXISTS idx_artifact_published_at ON artifact(published_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_artifact_render_type  ON artifact(render_type, published_at DESC)`,
+  `CREATE INDEX IF NOT EXISTS idx_artifact_audience     ON artifact(audience, approval_status)`,
+];
+const INTERACTION_INDEXES = [
+  `CREATE INDEX IF NOT EXISTS idx_interaction_artifact ON interaction(artifact_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_interaction_distill  ON interaction(recorded_at, id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_interaction_nonce ON interaction(reader_did, nonce)`,
+];
+
+/** The node rejects CREATE INDEX regardless of cap — the message carries it. */
+function isIndexNotAuthorized(message: string): boolean {
+  return /not authorized/i.test(message);
+}
+
+/** Run one CREATE TABLE/INDEX. Tables hard-fail; an index "not authorized"
+ *  rejection is recorded and swallowed (every OTHER error throws). */
+async function execDdl(
+  db: IDatabaseHandle,
+  statement: string,
+  isIndex: boolean,
+  skipped: string[],
+): Promise<void> {
+  const res = await db.execute(statement);
+  if (res.ok) return;
+  if (isIndex && isIndexNotAuthorized(res.error.message)) {
+    skipped.push(statement.match(/INDEX IF NOT EXISTS (\w+)/)?.[1] ?? statement);
+    return;
+  }
+  throw new Error(`schema bootstrap failed: ${res.error.message}`);
+}
+
+/** Idempotently create the `feed` + `interactions` tables in the owner's space.
+ *  Safe to run on every connect. Returns the node-rejected index names (for
+ *  diagnostics only — they are accelerators, not correctness). */
+export async function bootstrapSchema(
+  appsSpaceUri: string,
+): Promise<{ skippedIndexes: string[] }> {
+  const sql = spaceSql(appsSpaceUri);
+  const skipped: string[] = [];
+
+  const feed = sql.db(FEED_DB);
+  await execDdl(feed, FEED_DDL, false, skipped);
+  for (const idx of FEED_INDEXES) await execDdl(feed, idx, true, skipped);
+
+  const interactions = sql.db(INTERACTIONS_DB);
+  await execDdl(interactions, INTERACTION_DDL, false, skipped);
+  for (const idx of INTERACTION_INDEXES) await execDdl(interactions, idx, true, skipped);
+
+  return { skippedIndexes: skipped };
 }
