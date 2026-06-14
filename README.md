@@ -1,9 +1,55 @@
 # feed
 
-A starting point for projects built on the **Listen** data source. Feed is
-(eventually) a destination app; this repo is the sandbox where we explore the
-underlying data — conversations and transcripts that `listen-importer` wrote into
-a TinyCloud space — before designing how a feed renders it.
+A pure-client viewer for the **`xyz.tinycloud.artifacts`** feed, plus the `tc`
+recipes for exploring the **Listen** data source it is built on.
+
+## The viewer (pure-client web app)
+
+A Vite + React app (`web/`) that talks to TinyCloud **directly from the browser**
+via the [`@tinycloud/web-sdk`](https://www.npmjs.com/package/@tinycloud/web-sdk) —
+no server, no `/api`, no sessions database. It signs in as the space **owner**
+(v1; scoped reader delegation comes later), reads published artifacts from the
+`feed` SQL DB in the owner's `applications` space, renders **tweet** and
+**article** cards, hydrates hero images from KV, and writes reader
+**interaction** events (nonce-protected) back to the `interactions` SQL DB.
+
+```sh
+bun install
+bun run dev        # local dev server (http://localhost:5173)
+bun run build      # static bundle -> dist/
+bun run typecheck
+```
+
+### How it reads / writes
+
+| What | Where | How |
+| --- | --- | --- |
+| Artifact feed | SQL `xyz.tinycloud.artifacts/feed` (applications space) | `sqlForSpace(appsUri).db(feed).query(...)` |
+| Interactions | SQL `xyz.tinycloud.artifacts/interactions` | `sqlForSpace(appsUri).db(interactions).execute(INSERT ...)` |
+| Media (hero) | KV `xyz.tinycloud.artifacts/media/<id>/...` | `space(appsUri).kv.get(key)` → base64 → blob URL |
+
+Render shape is driven by the row's `render_type` (`tweet` \| `article` in v1);
+richer fields come from the lossless `raw_artifact` JSON.
+
+> **Seeded data.** Until the producer (`tc-publish` / the Smithers workflow)
+> publishes real rows, use the **Seed test rows** control in the masthead to
+> insert one tweet + one article (flagged `seeded`) so the UI can be built and
+> demoed. Seeding also creates the `artifact` / `interaction` tables if absent.
+
+> **Space-scoped SQL seam.** The browser `TinyCloudWeb` does not yet expose
+> `sqlForSpace` / `kvForSpace` (they live on the underlying `TinyCloudNode`).
+> `web/src/feedClient.ts` reaches them through ONE quarantined access point
+> marked `TODO(web-sdk-passthrough)`. When the web-SDK passthrough publishes,
+> delete the `as any` reach and call `tcw.sqlForSpace(...)` directly — nothing
+> else changes.
+
+---
+
+## Exploring the Listen data source (`tc` recipes)
+
+The viewer is built on the **Listen** data source; this repo is also the sandbox
+where we explore the underlying data — conversations and transcripts that
+`listen-importer` wrote into a TinyCloud space.
 
 **Feed has no CLI of its own.** It uses the **TinyCloud `tc` CLI** directly. Any
 project built on this one should do the same: talk to Listen through `tc`. This

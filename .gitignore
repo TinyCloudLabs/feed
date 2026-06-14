@@ -1,4 +1,5 @@
 node_modules/
+dist/
 listen.db
 conversations.json
 transcripts/
