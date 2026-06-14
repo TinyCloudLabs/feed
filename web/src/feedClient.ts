@@ -79,14 +79,25 @@ function toRenderType(rt: string): RenderType {
  *  A malformed `raw_artifact` is a corrupt row, not a recoverable state — throw
  *  loudly (no silent `{}` fallback that would hide vanished richer fields). */
 function toCard(row: ArtifactRow): FeedCard {
-  let raw: Record<string, unknown>;
+  let parsed: unknown;
   try {
-    raw = JSON.parse(row.raw_artifact) as Record<string, unknown>;
+    parsed = JSON.parse(row.raw_artifact);
   } catch (e) {
     throw new Error(
       `artifact ${row.id}: malformed raw_artifact JSON (${e instanceof Error ? e.message : String(e)})`,
     );
   }
+  // Valid JSON that is null/array/string/number parses without throwing but is
+  // the wrong SHAPE — `card.raw.<field>` access would crash the render. Treat
+  // wrong-shape the same as unparseable: fail loudly, per-row.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(
+      `artifact ${row.id}: malformed raw_artifact JSON (expected an object, got ${
+        Array.isArray(parsed) ? "array" : parsed === null ? "null" : typeof parsed
+      })`,
+    );
+  }
+  const raw = parsed as Record<string, unknown>;
   return {
     id: row.id,
     type: row.type,
