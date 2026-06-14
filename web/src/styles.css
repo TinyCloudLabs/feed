@@ -57,6 +57,26 @@ button {
   border-bottom: 1px solid var(--hairline);
 }
 
+/* persistent product wordmark — sits above the per-page section title so the
+   brand reads on every signed-in page while the title stays the section name */
+.masthead-brand {
+  display: inline-block;
+  margin: 0 0 6px;
+  font-family: var(--serif);
+  font-weight: 600;
+  font-size: 14px;
+  letter-spacing: 0.01em;
+  color: var(--ink-2);
+  text-decoration: none;
+  transition: color 180ms ease-out;
+}
+
+.masthead-brand:hover,
+.masthead-brand:focus-visible {
+  color: var(--accent);
+  outline: none;
+}
+
 .masthead-title {
   margin: 0;
   font-family: var(--serif);
