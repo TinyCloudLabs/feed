@@ -242,20 +242,28 @@ export async function ensureDelegation(currentSpaceId: string): Promise<Delegati
   let pending = inflightEnsure.get(currentSpaceId);
   if (!pending) {
     pending = (async () => {
-      const info = await getAgentInfo();
-      const { ack } = await delegateToAgent(info.did);
-      // The minted delegation must target the requested space BEFORE we persist
-      // it — otherwise we'd store (and later reuse) a wrong-space delegation.
-      if (ack.spaceId !== currentSpaceId) {
-        throw new Error(
-          `delegation space mismatch: signed in to ${currentSpaceId}, backend acked ${ack.spaceId}`,
-        );
+      try {
+        const info = await getAgentInfo();
+        const { ack } = await delegateToAgent(info.did);
+        // The minted delegation must target the requested space BEFORE we persist
+        // it — otherwise we'd store (and later reuse) a wrong-space delegation.
+        if (ack.spaceId !== currentSpaceId) {
+          throw new Error(
+            `delegation space mismatch: signed in to ${currentSpaceId}, backend acked ${ack.spaceId}`,
+          );
+        }
+        storeDelegation(ack);
+        return ack;
+      } finally {
+        // Clear our own single-flight entry on settle (success OR failure), from
+        // inside the awaited promise — no extra floating .finally() whose
+        // rejection would go unhandled. Guard against clobbering a newer entry.
+        if (inflightEnsure.get(currentSpaceId) === pending) {
+          inflightEnsure.delete(currentSpaceId);
+        }
       }
-      storeDelegation(ack);
-      return ack;
     })();
     inflightEnsure.set(currentSpaceId, pending);
-    void pending.finally(() => inflightEnsure.delete(currentSpaceId));
   }
   const ack = await pending;
   // Defense-in-depth: re-assert the resolved ack targets THIS space before the
