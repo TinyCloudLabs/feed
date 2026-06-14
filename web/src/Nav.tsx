@@ -27,6 +27,9 @@ export function Shell({
     <>
       <header className="masthead">
         <div>
+          <Link to={{ kind: "feed" }} className="masthead-brand">
+            TinyFeed
+          </Link>
           <h1 className="masthead-title">
             <Link to={{ kind: "feed" }}>{title}</Link>
           </h1>
