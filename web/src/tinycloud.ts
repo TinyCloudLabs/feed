@@ -7,6 +7,7 @@
 // `/interactions`, and `/media/`.
 
 import { TinyCloudWeb, type Config, type Manifest } from "@tinycloud/web-sdk";
+import { connectWallet } from "./openkey.ts";
 
 const HOST = "https://node.tinycloud.xyz";
 
@@ -56,20 +57,32 @@ const MANIFEST: Manifest = {
 
 let instance: TinyCloudWeb | null = null;
 
-/** Lazily construct the singleton TinyCloudWeb with the artifacts manifest. */
+/** The signed-in singleton. Throws before `signIn()` — every read/write path
+ *  runs inside an active session, so an absent instance is a bug, not a state
+ *  to paper over. */
 export function tcw(): TinyCloudWeb {
-  if (!instance) {
-    const config: Config = { manifest: MANIFEST };
-    instance = new TinyCloudWeb(config);
-  }
+  if (!instance) throw new Error("TinyCloud is not signed in");
   return instance;
 }
 
-/** Sign in (OpenKey/passkey via the configured provider) and return the owner's
- *  applications-space URI, which scopes all feed/interactions/media access. */
+/** Sign in via OpenKey passkey, delegating the manifest's `applications`-space
+ *  caps to this session, and return the owner's applications-space URI (which
+ *  scopes all feed/interactions/media access).
+ *
+ *  Constructing TinyCloudWeb WITH the OpenKey wallet provider is what makes
+ *  `signIn()` run the real SIWE/OpenKey delegation over `MANIFEST` — without a
+ *  provider the SDK has no signer and falls into session-only mode (can't reach
+ *  the applications space). */
 export async function signIn(): Promise<{ appsSpaceUri: string; readerDid: string }> {
-  const t = tcw();
+  const { web3Provider } = await connectWallet();
+  const config: Config = {
+    providers: { web3: { driver: web3Provider } },
+    tinycloudHosts: [HOST],
+    manifest: MANIFEST,
+  };
+  const t = new TinyCloudWeb(config);
   await t.signIn();
+  instance = t;
   const appsSpaceUri = t.space("applications").id;
   // Reader DID = the active session principal (contract §1.2: advisory in v1;
   // a trusted writer principal is a server-side upgrade).
