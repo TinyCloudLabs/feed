@@ -1,8 +1,9 @@
 import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { useEffect, useState, type ReactNode } from "react";
 import type { FeedCard, InteractionAction } from "./types.ts";
 import { typeLabel } from "./formats.ts";
-import { hydrateMedia, recordInteraction } from "./feedClient.ts";
+import { hydrateMedia, releaseMedia, recordInteraction } from "./feedClient.ts";
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -16,8 +17,14 @@ function fmtDate(iso: string): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
 }
 
+/** Render markdown to HTML, then sanitize with a strict allowlist before it can
+ *  reach dangerouslySetInnerHTML. `body_md` / `raw_artifact` are
+ *  attacker-influenceable (an interaction or a compromised producer could embed
+ *  <script>/<img onerror>), so marked's unsanitized output must never be
+ *  injected raw — DOMPurify strips scripts, event handlers, and unsafe URIs. */
 function md(text: string): string {
-  return marked.parse(text, { async: false });
+  const html = marked.parse(text, { async: false });
+  return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
 }
 
 /** First markdown paragraph, for article excerpts on the card face. */
@@ -93,24 +100,36 @@ function Body({ text }: { text: string }) {
 
 function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) {
   const [url, setUrl] = useState<string | null>(null);
+  const key = card.hero_image_key;
   useEffect(() => {
-    if (!card.hero_image_key) return;
+    if (!key) return;
     let alive = true;
-    hydrateMedia(appsSpaceUri, card.hero_image_key)
+    let acquired = false;
+    hydrateMedia(appsSpaceUri, key)
       .then((u) => {
-        if (alive) setUrl(u);
+        if (!alive) {
+          // Unmounted before resolve — release the reference we just took so the
+          // blob URL is revoked (no leak).
+          if (u) releaseMedia(key);
+          return;
+        }
+        if (u) acquired = true;
+        setUrl(u);
       })
-      .catch(() => {
-        // A failed hydrate hides the figure; the error surfaces in the console
-        // (no silent broken-image frame).
+      .catch((e) => {
+        // Hide the figure (no silent broken-image frame), but SURFACE the error —
+        // a non-404 hydrate failure is a real problem, not a missing hero.
+        console.error(`hero hydrate failed (${key}):`, e);
         if (alive) setUrl(null);
       });
     return () => {
       alive = false;
+      // Drop this mount's reference; revokes the blob URL when no card holds it.
+      if (acquired) releaseMedia(key);
     };
-  }, [card.hero_image_key, appsSpaceUri]);
+  }, [key, appsSpaceUri]);
 
-  if (!card.hero_image_key || !url) return null;
+  if (!key || !url) return null;
   return (
     <figure className="hero">
       <img src={url} alt="" loading="lazy" decoding="async" />

@@ -4,15 +4,11 @@
 // via tags + a `seeded: true` marker in raw_artifact). Triggered only by the
 // "Seed test rows" control; never runs automatically.
 
-import type { TinyCloudWeb } from "@tinycloud/web-sdk";
-import type { IDatabaseHandle, SqlValue } from "@tinycloud/sdk-services";
+import type { SqlValue } from "@tinycloud/sdk-services";
 import { tcw, FEED_DB, INTERACTIONS_DB, MEDIA_PREFIX } from "./tinycloud.ts";
-
-// TODO(web-sdk-passthrough): same seam as feedClient.ts — swap to t.sqlForSpace.
-function sql(t: TinyCloudWeb, uri: string): { db(name: string): IDatabaseHandle } {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (t as any).node.sqlForSpace(uri);
-}
+// Space-scoped SQL goes through the SINGLE quarantined seam in feedClient.ts —
+// seed.ts must not reach the private node itself (one access point only).
+import { spaceSql, spaceKv } from "./feedClient.ts";
 
 const CREATE_ARTIFACT = `
 CREATE TABLE IF NOT EXISTS artifact (
@@ -53,9 +49,8 @@ function isoDaysAgo(days: number): string {
 }
 
 export async function seedTestRows(appsSpaceUri: string): Promise<void> {
-  const t = tcw();
-  const feed = sql(t, appsSpaceUri).db(FEED_DB);
-  const inter = sql(t, appsSpaceUri).db(INTERACTIONS_DB);
+  const feed = spaceSql(appsSpaceUri).db(FEED_DB);
+  const inter = spaceSql(appsSpaceUri).db(INTERACTIONS_DB);
 
   // Ensure tables exist (idempotent).
   for (const s of [CREATE_ARTIFACT]) {
@@ -68,11 +63,10 @@ export async function seedTestRows(appsSpaceUri: string): Promise<void> {
   }
 
   // Hero bytes → KV first (media-before-pointer, contract §2).
-  const kv = t.space(appsSpaceUri).kv;
-  const putHero = await kv.put(HERO_KEY, TINY_JPEG_B64);
+  const putHero = await spaceKv(appsSpaceUri).put(HERO_KEY, TINY_JPEG_B64);
   if (!putHero.ok) throw new Error(`seed: hero KV put failed: ${putHero.error.message}`);
 
-  const publisher = t.did;
+  const publisher = tcw().did;
   const tweet = makeTweetRow(publisher);
   const article = makeArticleRow(publisher);
 

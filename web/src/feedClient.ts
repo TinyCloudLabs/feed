@@ -12,7 +12,6 @@
 // `spaceSql()` / `spaceKv()` and call `t.sqlForSpace(uri)` / `t.kvForSpace(uri)`
 // directly — nothing else changes.
 
-import type { TinyCloudWeb } from "@tinycloud/web-sdk";
 import type { IDatabaseHandle, IKVService } from "@tinycloud/sdk-services";
 import { tcw, FEED_DB, INTERACTIONS_DB } from "./tinycloud.ts";
 import type {
@@ -24,10 +23,15 @@ import type {
 } from "./types.ts";
 
 // ── the quarantined seam (see header) ──────────────────────────────────────
+//
+// THE single place the codebase reaches space-scoped SQL/KV. Everything that
+// needs it (this file AND seed.ts) routes through `spaceSql` / `spaceKv` — there
+// is exactly one `(tcw as any).node` access point, here. Do not duplicate it.
 
 /** Space-scoped SQL service for `uri`. TODO(web-sdk-passthrough): replace the
  *  private-node reach with `t.sqlForSpace(uri)` once TinyCloudWeb exposes it. */
-function spaceSql(t: TinyCloudWeb, uri: string): { db(name: string): IDatabaseHandle } {
+export function spaceSql(uri: string): { db(name: string): IDatabaseHandle } {
+  const t = tcw();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const node = (t as any).node as {
     sqlForSpace(uri: string): { db(name: string): IDatabaseHandle };
@@ -38,8 +42,8 @@ function spaceSql(t: TinyCloudWeb, uri: string): { db(name: string): IDatabaseHa
 /** Space-scoped KV service for `uri`. TODO(web-sdk-passthrough): replace with
  *  `t.kvForSpace(uri)`. Until then we use the SUPPORTED public path —
  *  `t.spaces.get(uri).kv` — which already scopes KV to the space. */
-function spaceKv(t: TinyCloudWeb, uri: string): IKVService {
-  return t.space(uri).kv;
+export function spaceKv(uri: string): IKVService {
+  return tcw().space(uri).kv;
 }
 
 // ── reads ──────────────────────────────────────────────────────────────────
@@ -71,13 +75,17 @@ function toRenderType(rt: string): RenderType {
   throw new Error(`unknown render_type: ${rt}`);
 }
 
-/** Map a raw `artifact` SQL row to the render-ready card (sans hero blob). */
+/** Map a raw `artifact` SQL row to the render-ready card (sans hero blob).
+ *  A malformed `raw_artifact` is a corrupt row, not a recoverable state — throw
+ *  loudly (no silent `{}` fallback that would hide vanished richer fields). */
 function toCard(row: ArtifactRow): FeedCard {
-  let raw: Record<string, unknown> = {};
+  let raw: Record<string, unknown>;
   try {
     raw = JSON.parse(row.raw_artifact) as Record<string, unknown>;
-  } catch {
-    raw = {};
+  } catch (e) {
+    throw new Error(
+      `artifact ${row.id}: malformed raw_artifact JSON (${e instanceof Error ? e.message : String(e)})`,
+    );
   }
   return {
     id: row.id,
@@ -113,7 +121,7 @@ export async function loadFeed(
   limit = 50,
   offset = 0,
 ): Promise<FeedCard[]> {
-  const db = spaceSql(tcw(), appsSpaceUri).db(FEED_DB);
+  const db = spaceSql(appsSpaceUri).db(FEED_DB);
   const res = await db.query<unknown>(
     `SELECT ${COLUMNS} FROM artifact ` +
       `WHERE render_type IN ('tweet','article') ` +
@@ -126,20 +134,34 @@ export async function loadFeed(
 }
 
 // ── media hydration ──────────────────────────────────────────────────────────
+//
+// Blob URLs are ref-counted by key: each `hydrateMedia` adds a reference, each
+// `releaseMedia` drops one, and the object URL is revoked when the count hits
+// zero. This bounds memory — without it, every hydrated hero would leak a blob
+// URL for the page's lifetime (Codex finding).
 
-const blobUrlCache = new Map<string, string>();
+interface MediaEntry {
+  url: string;
+  refs: number;
+}
+const mediaCache = new Map<string, MediaEntry>();
 
 /** Resolve a KV media key (base64 string value, contract §2 `.b64` suffix) to a
- *  blob URL for an <img>. Cached per key. Returns null when the key is absent. */
+ *  blob URL for an <img>. Adds a reference; pair each successful call with
+ *  `releaseMedia(key)`. Returns null when the key is absent (404). Non-404 KV
+ *  failures throw (no silent swallow). */
 export async function hydrateMedia(
   appsSpaceUri: string,
   key: string,
   mime = "image/jpeg",
 ): Promise<string | null> {
-  const cached = blobUrlCache.get(key);
-  if (cached) return cached;
+  const cached = mediaCache.get(key);
+  if (cached) {
+    cached.refs += 1;
+    return cached.url;
+  }
 
-  const kv = spaceKv(tcw(), appsSpaceUri);
+  const kv = spaceKv(appsSpaceUri);
   const res = await kv.get<string>(key);
   if (!res.ok) {
     if (res.error.code === "KV_NOT_FOUND" || res.error.code === "NOT_FOUND") return null;
@@ -149,8 +171,27 @@ export async function hydrateMedia(
   if (typeof b64 !== "string") throw new Error(`media ${key} is not a base64 string`);
   const bytes = base64ToBytes(b64);
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
-  blobUrlCache.set(key, url);
+  // A concurrent hydrate of the same key may have populated the cache while this
+  // request was in flight; if so, drop our duplicate and reuse the shared entry.
+  const raced = mediaCache.get(key);
+  if (raced) {
+    URL.revokeObjectURL(url);
+    raced.refs += 1;
+    return raced.url;
+  }
+  mediaCache.set(key, { url, refs: 1 });
   return url;
+}
+
+/** Drop one reference to a hydrated media key; revoke the blob URL at zero. */
+export function releaseMedia(key: string): void {
+  const entry = mediaCache.get(key);
+  if (!entry) return;
+  entry.refs -= 1;
+  if (entry.refs <= 0) {
+    URL.revokeObjectURL(entry.url);
+    mediaCache.delete(key);
+  }
 }
 
 function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
@@ -190,7 +231,7 @@ export async function recordInteraction(
     recorded_at: now,
   };
 
-  const db = spaceSql(tcw(), appsSpaceUri).db(INTERACTIONS_DB);
+  const db = spaceSql(appsSpaceUri).db(INTERACTIONS_DB);
   const res = await db.execute(
     `INSERT INTO interaction ` +
       `(id, artifact_id, artifact_type, action, note, reader_did, nonce, created_at, recorded_at) ` +
