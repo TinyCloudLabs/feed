@@ -7,14 +7,15 @@
 // 3. This page reflects that state: connecting → delegation active + go-to-feed,
 //    with a small "Re-grant" affordance for recovery.
 //
-// Gated behind agentConfigured(): with no VITE_AGENT_HOST, sign-in still works
-// (the feed is readable) but the delegate step shows a clear "agent backend not
-// configured" state instead of faking success.
+// Gated behind agentConfigured(): with no agent host configured (runtime
+// /agent-config.json, or VITE_AGENT_HOST in dev), sign-in still works (the feed is
+// readable) but the delegate step shows a clear "agent backend not configured"
+// state instead of faking success.
 
 import { useState } from "react";
 import { signIn } from "../tinycloud.ts";
 import { bootstrapSchema } from "../feedClient.ts";
-import { agentConfigured, AGENT_HOST } from "../agentClient.ts";
+import { agentConfigured, agentHost } from "../agentClient.ts";
 import { Link } from "../router.tsx";
 import type { Session } from "../session.ts";
 import type { DelegationInfo } from "./types.ts";
@@ -131,7 +132,7 @@ function DelegateStep({
     return (
       <div className="feed-status">
         <p className="feed-status-line">Agent backend not configured.</p>
-        <p className="feed-status-sub">Set VITE_AGENT_HOST to enable generation</p>
+        <p className="feed-status-sub">Set a host in agent-config.json to enable generation</p>
         <p className="prefs-note">
           You're signed in. You can read the feed, but no agent is connected to
           generate new artifacts yet.
@@ -176,7 +177,7 @@ function DelegateStep({
       <p className="feed-status-line connect-heading">
         {agentConnecting ? "Connecting agent…" : "Agent not connected."}
       </p>
-      <p className="feed-status-sub">{AGENT_HOST}</p>
+      <p className="feed-status-sub">{agentHost()}</p>
       {!agentConnecting && (
         <div className="prefs-actions">
           <Link to={{ kind: "feed" }} className="quiet-link" aria-label="Go to feed">

@@ -1,0 +1,6 @@
+{
+  "//": "Runtime agent config served at /agent-config.json. Loaded ONCE at app startup; repointing the feed at a new agent is just an edit here + redeploy of this static file — no code change, no VITE rebuild. The committed agent-config.json carries host+did ONLY (both public-safe). The bearer token is sourced from VITE_AGENT_TOKEN at build time and is NEVER committed; the optional `token` field below is supported by the loader but left out of the committed file so no secret lands in git.",
+  "host": "https://your-agent-host.example",
+  "did": "did:pkh:eip155:1:0xYourAgentAddress",
+  "token": "OPTIONAL — leave unset to source the bearer from VITE_AGENT_TOKEN; if you inline it here, do NOT commit the real value"
+}

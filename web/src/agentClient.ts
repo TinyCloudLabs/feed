@@ -12,12 +12,21 @@
 // scopes, see tinycloud.ts) and POSTs the serialized delegation to the backend,
 // which runs the artifact pipeline under it, writing to the user's OWN space.
 //
-// All agent calls are gated behind VITE_AGENT_HOST. When it is unset, the agent
-// backend is "not configured": callers MUST check `agentConfigured()` and render
-// the not-connected state rather than fake success.
+// The agent host / DID / token now come from the RUNTIME config (agentConfig.ts:
+// `/agent-config.json`, with VITE_AGENT_* as a dev-only fallback), NOT from
+// build-time env directly. App bootstrap awaits `loadAgentConfig()` before the
+// first render, so `agentConfigured()` (sync) and every async call here see a
+// resolved config — and `agentFetch` additionally awaits the load, so an agent
+// call can never fire before the config resolves.
+//
+// All agent calls are gated behind the resolved host. When it is "" (unconfigured
+// in dev), the agent backend is "not configured": callers MUST check
+// `agentConfigured()` and render the not-connected state rather than fake success.
+// In prod a missing/malformed config fails loudly during the bootstrap load.
 
 import { serializeDelegation, type PermissionEntry } from "@tinycloud/web-sdk";
-import { tcw, AGENT_SCOPES, AGENT_DID } from "./tinycloud.ts";
+import { tcw, AGENT_SCOPES } from "./tinycloud.ts";
+import { loadAgentConfig, getAgentConfig } from "./agentConfig.ts";
 
 /** Default delegation lifetime when the backend doesn't dictate one (7 days). */
 const DELEGATION_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
@@ -26,52 +35,22 @@ const DELEGATION_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
  *  (the backend is unreachable / stuck), so the loop can't spin forever. */
 const POLL_MAX_ELAPSED_MS = 20 * 60 * 1000; // 20 min
 
-/** Validate VITE_AGENT_HOST as a trusted, well-formed origin before we ever POST
- *  a scoped delegation to it. HTTPS is required in general; plain HTTP is allowed
- *  ONLY for loopback dev hosts (localhost / 127.0.0.1 / [::1]). Returns the
- *  normalized origin (no trailing slash, no path) or "" when unset/invalid.
- *  An INVALID non-empty host throws at module load — a misconfigured deploy must
- *  fail loudly, not silently POST a delegation to an arbitrary string. */
-function resolveAgentHost(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed === "") return "";
-  let url: URL;
-  try {
-    url = new URL(trimmed);
-  } catch {
-    throw new Error(`VITE_AGENT_HOST is not a valid URL: ${JSON.stringify(raw)}`);
-  }
-  const isLoopback =
-    url.hostname === "localhost" ||
-    url.hostname === "127.0.0.1" ||
-    url.hostname === "[::1]" ||
-    url.hostname === "::1";
-  if (url.protocol === "https:" || (url.protocol === "http:" && isLoopback)) {
-    return url.origin;
-  }
-  throw new Error(
-    `VITE_AGENT_HOST must be https:// (http:// allowed only for localhost): got ${JSON.stringify(raw)}`,
-  );
-}
-
-const AGENT_HOST = resolveAgentHost(import.meta.env.VITE_AGENT_HOST || "");
-
-/** The per-install bearer token the backend requires on its mutating endpoints
- *  (POST /agent/delegation, POST /agent/run). Read from VITE_AGENT_TOKEN at build
- *  time. When unset, those POSTs carry no auth header and the backend answers 401
- *  — the correct loud behavior (a misconfigured token must fail visibly, not
- *  silently succeed). GET /agent/info and GET /agent/run/:id stay unauthenticated. */
-const AGENT_TOKEN = (import.meta.env.VITE_AGENT_TOKEN || "").trim();
-
-/** True when a valid agent backend host is configured. */
+/** True when a valid agent backend host is resolved. Reads the runtime config,
+ *  which app bootstrap awaits before render — so this sync read always sees a
+ *  settled config. The host-or-loopback validation already ran inside
+ *  resolveAgentHost during the load, so a non-empty host here is trusted. */
 export function agentConfigured(): boolean {
-  return AGENT_HOST.length > 0;
+  return getAgentConfig().host.length > 0;
 }
 
-export { AGENT_HOST };
+/** The resolved agent host origin, for display (Connect/Agents sub-lines). Reads
+ *  the settled runtime config. */
+export function agentHost(): string {
+  return getAgentConfig().host;
+}
 
 /** Thrown when the backend's acked agentDid doesn't match the DID we delegated
- *  to (or the configured VITE_AGENT_DID) — a swapped-agent guard. */
+ *  to (or the runtime config's guard DID, when present) — a swapped-agent guard. */
 export class AgentDidMismatchError extends Error {
   constructor(expected: string, got: string) {
     super(`agent DID mismatch: delegated to ${expected}, backend acked ${got}`);
@@ -114,22 +93,26 @@ export interface RunState {
 // ── transport ────────────────────────────────────────────────────────────────
 
 /** A fetch that fails LOUDLY (no silent fallback) and surfaces the backend's
- *  error body when present. Throws if the agent host is unconfigured — callers
- *  must gate on `agentConfigured()` first. Honors an optional AbortSignal. Pass
- *  `auth: true` on the mutating endpoints (delegation/run) to send the per-install
- *  bearer token (VITE_AGENT_TOKEN); GET endpoints leave it off. */
+ *  error body when present. AWAITS the runtime config load first — so an agent
+ *  call can never fire before `/agent-config.json` resolves (no race). Throws if
+ *  the resolved host is unconfigured — callers should still gate on
+ *  `agentConfigured()`. Honors an optional AbortSignal. Pass `auth: true` on the
+ *  mutating endpoints (delegation/run) to send the per-install bearer token (from
+ *  the runtime config / VITE_AGENT_TOKEN fallback); GET endpoints leave it off. */
 async function agentFetch<T>(
   path: string,
   init?: RequestInit & { signal?: AbortSignal; auth?: boolean },
 ): Promise<T> {
-  if (!agentConfigured()) {
-    throw new Error("agent backend not configured (VITE_AGENT_HOST is unset)");
+  // Await the single-flight config load — structurally prevents a pre-load call.
+  const { host, token } = await loadAgentConfig();
+  if (host === "") {
+    throw new Error("agent backend not configured (no host in /agent-config.json)");
   }
-  const res = await fetch(`${AGENT_HOST}${path}`, {
+  const res = await fetch(`${host}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
-      ...(init?.auth && AGENT_TOKEN ? { Authorization: `Bearer ${AGENT_TOKEN}` } : {}),
+      ...(init?.auth && token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -166,10 +149,13 @@ export async function getAgentInfo(): Promise<AgentInfo> {
 const DELEGATION_KEY = "feed:agentDelegation";
 
 /** Load the persisted delegation ack for `currentSpaceId`, or null when absent,
- *  malformed, expired, targeting a DIFFERENT agent than VITE_AGENT_DID, or bound
- *  to a DIFFERENT space than the active session. A stale/mismatched entry is
- *  cleared so we don't keep reconsidering it (and so the next ensureDelegation
- *  mints a fresh one for the current space). */
+ *  malformed, expired, targeting a DIFFERENT agent than the runtime config's guard
+ *  DID, or bound to a DIFFERENT space than the active session. A stale/mismatched
+ *  entry is cleared so we don't keep reconsidering it (and so the next
+ *  ensureDelegation mints a fresh one for the current space). When the runtime
+ *  config has no `did` (auto-discover mode), the agent-match check is skipped here
+ *  — the swapped-backend guard then runs advisory against the live /agent/info DID
+ *  during the re-grant (see delegateToAgent). */
 export function loadStoredDelegation(currentSpaceId: string): DelegationAck | null {
   let raw: string | null;
   try {
@@ -189,7 +175,10 @@ export function loadStoredDelegation(currentSpaceId: string): DelegationAck | nu
   // "never expires") so it's dropped + refreshed rather than reused forever.
   const expiryMs = ack.expiresAt ? new Date(ack.expiresAt).getTime() : NaN;
   const expired = Number.isNaN(expiryMs) || expiryMs <= Date.now();
-  const wrongAgent = AGENT_DID !== "" && ack.agentDid !== AGENT_DID;
+  // Guard DID from the RUNTIME config: enforce only when it's present. When absent
+  // (auto-discover mode) the guard is advisory and runs against /agent/info later.
+  const guardDid = getAgentConfig().did;
+  const wrongAgent = guardDid !== "" && ack.agentDid !== guardDid;
   // Bound to a different space than the active session → it belongs to another
   // wallet / re-keyed session and must not be reused.
   const wrongSpace = ack.spaceId !== currentSpaceId;
@@ -282,15 +271,21 @@ export async function ensureDelegation(currentSpaceId: string): Promise<Delegati
  *  POST it to the backend. `expectedDid` MUST come from a FRESH GET /agent/info
  *  on every (re-)grant — never a cached value — so a swapped backend DID is
  *  caught here. After the POST, the ack's `agentDid` is verified against
- *  `expectedDid` (and against the build-time VITE_AGENT_DID when configured);
+ *  `expectedDid` (and against the runtime config's guard DID when present);
  *  any mismatch throws `AgentDidMismatchError` (we delegated scoped caps to a
- *  different principal than the backend claims). Returns the ack + whether the
- *  wallet prompted (it shouldn't, given the broadened recap — diagnostic). */
+ *  different principal than the backend claims). When the config has no `did`
+ *  (auto-discover mode) the guard becomes advisory: we trust /agent/info's DID and
+ *  only assert the backend's ack matches it. Returns the ack + whether the wallet
+ *  prompted (it shouldn't, given the broadened recap — diagnostic). */
 export async function delegateToAgent(
   expectedDid: string,
 ): Promise<{ ack: DelegationAck; prompted: boolean }> {
-  if (AGENT_DID && expectedDid !== AGENT_DID) {
-    throw new AgentDidMismatchError(AGENT_DID, expectedDid);
+  // Guard DID from the RUNTIME config: when present, the /agent/info DID we're
+  // about to delegate to MUST match it (swapped-agent guard). When absent
+  // (auto-discover) this check is skipped and the guard is advisory.
+  const guardDid = getAgentConfig().did;
+  if (guardDid && expectedDid !== guardDid) {
+    throw new AgentDidMismatchError(guardDid, expectedDid);
   }
   const { delegation, prompted } = await tcw().delegateTo(expectedDid, AGENT_SCOPES, {
     expiry: DELEGATION_EXPIRY_MS,

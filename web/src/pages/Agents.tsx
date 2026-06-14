@@ -13,7 +13,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   agentConfigured,
-  AGENT_HOST,
+  agentHost,
   pollRun,
   startRun,
   type RunState,
@@ -55,14 +55,14 @@ export function AgentsPage({
       <Shell title="Agents" sub="agent backend">
         <div className="feed-status">
           <p className="feed-status-line">Agent backend not configured.</p>
-          <p className="feed-status-sub">Set VITE_AGENT_HOST to enable generation</p>
+          <p className="feed-status-sub">Set a host in agent-config.json to enable generation</p>
         </div>
       </Shell>
     );
   }
 
   return (
-    <Shell title="Agents" sub={AGENT_HOST}>
+    <Shell title="Agents" sub={agentHost()}>
       <div className="agents">
         <DelegationSection
           delegation={delegation}

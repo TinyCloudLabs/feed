@@ -38,8 +38,10 @@ unions those scopes into the SIWE recap, so `delegateTo(agentDid, AGENT_SCOPES)`
 derives from the session key with **no extra wallet prompt**. The agent runs the
 artifact pipeline under that delegation, publishing to the user's **own**
 `applications` space; the feed refreshes after a run. The agent endpoints
-(`web/src/agentClient.ts`) are gated behind `VITE_AGENT_HOST` — unset, the UI
-shows a clear "agent backend not configured" state rather than faking success.
+(`web/src/agentClient.ts`) are gated behind the resolved agent host — with no
+host configured, the UI shows a clear "agent backend not configured" state rather
+than faking success. That host/DID/token come from a **runtime** config loaded at
+startup (see "Repointing the agent" below), not from build-time env directly.
 
 ### Environment + Cloudflare Pages
 
@@ -48,14 +50,42 @@ Vite only exposes `VITE_`-prefixed vars to the client. Copy `.env.example` to
 
 | Var | Default | Purpose |
 | --- | --- | --- |
-| `VITE_AGENT_HOST` | _(unset)_ | The distillery agent backend (info/delegation/run). Unset → agent UI shows "not configured". |
-| `VITE_AGENT_DID` | _(unset)_ | Optional: the agent's stable `did:pkh`, declared as a manifest delegation target. Not required for the flow. |
+| `VITE_AGENT_HOST` | _(unset)_ | **Dev-only fallback** for the agent backend host. In prod the host comes from runtime `/agent-config.json` (below); this VITE var is used only under `vite dev` when no static config is present. |
+| `VITE_AGENT_DID` | _(unset)_ | Optional: the agent's stable `did:pkh`. Still feeds the **manifest** delegation target (advisory, build-time). The runtime **guard** DID comes from `/agent-config.json` (or `/agent/info` when absent). |
+| `VITE_AGENT_TOKEN` | _(unset)_ | The per-install bearer token for the mutating agent endpoints. **Never committed.** Set in the CF Pages project; the runtime config file deliberately omits it. |
 | `VITE_OPENKEY_HOST` | `https://openkey.so` | OpenKey passkey host. |
 | `VITE_TINYCLOUD_HOST` | `https://node.tinycloud.xyz` | TinyCloud node (storage). |
 
 **Cloudflare Pages build:** build command `bun run build`, output directory
 `web/dist`. `web/public/_redirects` (`/* /index.html 200`) is copied into the
 build so deep links and refreshes resolve to the SPA.
+
+### Repointing the agent (runtime config — no rebuild)
+
+The agent **host** and **DID** are loaded at app startup from a runtime
+`web/public/agent-config.json` (served at `/agent-config.json`), so **repointing
+the feed at a new agent is just an edit to that static file + a redeploy — no code
+change and no VITE rebuild.** The DID is also **auto-discovered** from
+`GET {host}/agent/info`, so a CVM DID change needs no config edit at all (the
+`did` field, when present, only tightens the swapped-agent guard).
+
+```jsonc
+// web/public/agent-config.json — committed; host + DID are both public-safe.
+{
+  "host": "https://<agent-host>",
+  "did": "did:pkh:eip155:1:0x…"   // optional; omit to fully auto-discover from /agent/info
+}
+```
+
+- **Precedence:** runtime `/agent-config.json` **wins**; `VITE_AGENT_*` is a
+  fallback for local `vite dev` only. In a **built/prod** context a missing or
+  malformed `/agent-config.json` **fails loudly** (the app renders an "Agent
+  configuration error" screen) — it never silently boots a blank or stale agent.
+- **Token:** the committed file carries **host + DID only**. The bearer token is
+  sourced from `VITE_AGENT_TOKEN` (never committed). The loader also supports an
+  optional `token` field in the JSON for operators who serve their own static file
+  out-of-band, but the in-repo file omits it so no secret lands in git. See
+  `web/public/agent-config.example.json`.
 
 ### How it reads / writes
 
