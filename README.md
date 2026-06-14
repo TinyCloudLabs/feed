@@ -34,11 +34,6 @@ Space-scoped storage goes through `tcw.sqlForSpace(uri)` / `tcw.kvForSpace(uri)`
 by the row's `render_type` (`tweet` \| `article` in v1); richer fields come from
 the lossless `raw_artifact` JSON.
 
-> **Seeded data.** If the feed is empty (the producer hasn't published yet), use
-> the **Seed test rows** control in the masthead to insert one tweet + one
-> article (flagged `seeded`) so the UI can be demoed. Seeding also creates the
-> `artifact` / `interaction` tables if absent.
-
 ### Manual browser verification (owner sign-in)
 
 The one step that can't be automated headlessly is the passkey/wallet sign-in.
