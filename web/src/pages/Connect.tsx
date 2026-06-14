@@ -110,11 +110,16 @@ function DelegateStep({
     }
   };
 
-  const grant = async (agentDid: string) => {
+  const grant = async () => {
     setBusy(true);
     setError(null);
     try {
-      const { ack } = await delegateToAgent(agentDid);
+      // Fetch /agent/info FRESH on every grant/re-grant — never reuse a cached
+      // DID — so a swapped backend agent DID is caught. delegateToAgent verifies
+      // the ack's agentDid matches what we delegated to (+ VITE_AGENT_DID if set).
+      const fresh = await getAgentInfo();
+      setInfo(fresh);
+      const { ack } = await delegateToAgent(fresh.did);
       onDelegation({
         agentDid: ack.agentDid,
         delegationCid: ack.delegationCid,
@@ -159,7 +164,7 @@ function DelegateStep({
             type="button"
             className="quiet-link"
             disabled={busy}
-            onClick={() => void grant(delegation.agentDid)}
+            onClick={() => void grant()}
           >
             {busy ? "Re-granting…" : "Re-grant"}
           </button>
@@ -192,7 +197,7 @@ function DelegateStep({
               type="button"
               className="quiet-link"
               disabled={busy}
-              onClick={() => void grant(info.did)}
+              onClick={() => void grant()}
             >
               {busy ? "Granting…" : "Delegate to agent"}
             </button>

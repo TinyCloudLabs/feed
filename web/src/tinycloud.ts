@@ -66,8 +66,10 @@ export const AGENT_SCOPES: PermissionEntry[] = [
     service: "tinycloud.kv",
     space: "applications",
     path: MEDIA_PREFIX,
-    actions: ["get", "put", "list", "metadata"],
-    description: "Write artifact media (hero images).",
+    // Minimal: the agent reads/writes hero blobs BY KEY (the SQL pointer carries
+    // the exact key) — it never enumerates the user's media, so no list/metadata.
+    actions: ["get", "put"],
+    description: "Read/write artifact media (hero images) by key.",
   },
 ];
 

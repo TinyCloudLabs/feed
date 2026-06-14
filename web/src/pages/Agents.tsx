@@ -5,7 +5,7 @@
 // to re-grant); the contract has no revoke endpoint in the MVP, so we don't fake
 // a server revoke — we surface what we can actually do.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   agentConfigured,
   AGENT_HOST,
@@ -77,9 +77,12 @@ function DelegationSection({
     setBusy(true);
     setError(null);
     try {
-      // Re-grant against the known agent DID if we have one, else look it up.
-      const agentDid = delegation?.agentDid ?? info?.did ?? (await getAgentInfo()).did;
-      const { ack } = await delegateToAgent(agentDid);
+      // ALWAYS fetch /agent/info fresh on every (re-)grant — never reuse a cached
+      // DID — so a swapped backend agent DID is caught. delegateToAgent verifies
+      // the ack's agentDid matches what we delegated to (+ VITE_AGENT_DID if set).
+      const fresh = await getAgentInfo();
+      setInfo(fresh);
+      const { ack } = await delegateToAgent(fresh.did);
       onDelegation({
         agentDid: ack.agentDid,
         delegationCid: ack.delegationCid,
@@ -164,11 +167,21 @@ function GenerateSection({
   const [running, setRunning] = useState(false);
   const [live, setLive] = useState<RunState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The in-flight poll's controller — aborted on unmount/sign-out so the loop
+  // (and its pending fetch + interval) stops and doesn't setState after unmount.
+  const pollAbort = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    return () => pollAbort.current?.abort();
+  }, []);
 
   const generate = async () => {
     setRunning(true);
     setError(null);
     setLive(null);
+    const controller = new AbortController();
+    pollAbort.current?.abort();
+    pollAbort.current = controller;
     try {
       const { run_id, status } = await startRun();
       const record: RunRecord = {
@@ -181,15 +194,19 @@ function GenerateSection({
       onRunsChange(history);
       setLive({ run_id, status });
 
-      const terminal = await pollRun(run_id, (state) => {
-        setLive(state);
-        history = history.map((r) =>
-          r.runId === state.run_id
-            ? { ...r, status: state.status, published: state.published, error: state.error }
-            : r,
-        );
-        onRunsChange(history);
-      });
+      const terminal = await pollRun(
+        run_id,
+        (state) => {
+          setLive(state);
+          history = history.map((r) =>
+            r.runId === state.run_id
+              ? { ...r, status: state.status, published: state.published, error: state.error }
+              : r,
+          );
+          onRunsChange(history);
+        },
+        { signal: controller.signal },
+      );
 
       if (terminal.status === "done") {
         onFeedRefresh();
@@ -197,8 +214,12 @@ function GenerateSection({
         setError(terminal.error ?? "run failed");
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // A deliberate abort (unmount/sign-out) is not a user-facing error.
+      if (!(e instanceof DOMException && e.name === "AbortError")) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
+      if (pollAbort.current === controller) pollAbort.current = null;
       setRunning(false);
     }
   };

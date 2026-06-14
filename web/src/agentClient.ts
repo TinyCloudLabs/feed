@@ -17,19 +17,60 @@
 // the not-connected state rather than fake success.
 
 import { serializeDelegation, type PermissionEntry } from "@tinycloud/web-sdk";
-import { tcw, AGENT_SCOPES } from "./tinycloud.ts";
-
-const AGENT_HOST = (import.meta.env.VITE_AGENT_HOST || "").replace(/\/$/, "");
+import { tcw, AGENT_SCOPES, AGENT_DID } from "./tinycloud.ts";
 
 /** Default delegation lifetime when the backend doesn't dictate one (7 days). */
 const DELEGATION_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** True when an agent backend host is configured at build time. */
+/** Default poll budget: stop after this long even if the run never terminates
+ *  (the backend is unreachable / stuck), so the loop can't spin forever. */
+const POLL_MAX_ELAPSED_MS = 20 * 60 * 1000; // 20 min
+
+/** Validate VITE_AGENT_HOST as a trusted, well-formed origin before we ever POST
+ *  a scoped delegation to it. HTTPS is required in general; plain HTTP is allowed
+ *  ONLY for loopback dev hosts (localhost / 127.0.0.1 / [::1]). Returns the
+ *  normalized origin (no trailing slash, no path) or "" when unset/invalid.
+ *  An INVALID non-empty host throws at module load — a misconfigured deploy must
+ *  fail loudly, not silently POST a delegation to an arbitrary string. */
+function resolveAgentHost(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === "") return "";
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new Error(`VITE_AGENT_HOST is not a valid URL: ${JSON.stringify(raw)}`);
+  }
+  const isLoopback =
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]" ||
+    url.hostname === "::1";
+  if (url.protocol === "https:" || (url.protocol === "http:" && isLoopback)) {
+    return url.origin;
+  }
+  throw new Error(
+    `VITE_AGENT_HOST must be https:// (http:// allowed only for localhost): got ${JSON.stringify(raw)}`,
+  );
+}
+
+const AGENT_HOST = resolveAgentHost(import.meta.env.VITE_AGENT_HOST || "");
+
+/** True when a valid agent backend host is configured. */
 export function agentConfigured(): boolean {
   return AGENT_HOST.length > 0;
 }
 
 export { AGENT_HOST };
+
+/** Thrown when the backend's acked agentDid doesn't match the DID we delegated
+ *  to (or the configured VITE_AGENT_DID) — a swapped-agent guard. */
+export class AgentDidMismatchError extends Error {
+  constructor(expected: string, got: string) {
+    super(`agent DID mismatch: delegated to ${expected}, backend acked ${got}`);
+    this.name = "AgentDidMismatchError";
+  }
+}
 
 // ── contract response shapes ─────────────────────────────────────────────────
 
@@ -67,8 +108,11 @@ export interface RunState {
 
 /** A fetch that fails LOUDLY (no silent fallback) and surfaces the backend's
  *  error body when present. Throws if the agent host is unconfigured — callers
- *  must gate on `agentConfigured()` first. */
-async function agentFetch<T>(path: string, init?: RequestInit): Promise<T> {
+ *  must gate on `agentConfigured()` first. Honors an optional AbortSignal. */
+async function agentFetch<T>(
+  path: string,
+  init?: RequestInit & { signal?: AbortSignal },
+): Promise<T> {
   if (!agentConfigured()) {
     throw new Error("agent backend not configured (VITE_AGENT_HOST is unset)");
   }
@@ -97,14 +141,21 @@ export async function getAgentInfo(): Promise<AgentInfo> {
   return agentFetch<AgentInfo>("/agent/info");
 }
 
-/** Mint a delegation of AGENT_SCOPES to `agentDid` with the session key and POST
- *  it to the backend. Returns the backend's ack (cid + expiry) plus whether the
- *  wallet prompted (it shouldn't, given the broadened recap — surfaced for
- *  diagnostics). */
+/** Mint a delegation of AGENT_SCOPES to `expectedDid` with the session key and
+ *  POST it to the backend. `expectedDid` MUST come from a FRESH GET /agent/info
+ *  on every (re-)grant — never a cached value — so a swapped backend DID is
+ *  caught here. After the POST, the ack's `agentDid` is verified against
+ *  `expectedDid` (and against the build-time VITE_AGENT_DID when configured);
+ *  any mismatch throws `AgentDidMismatchError` (we delegated scoped caps to a
+ *  different principal than the backend claims). Returns the ack + whether the
+ *  wallet prompted (it shouldn't, given the broadened recap — diagnostic). */
 export async function delegateToAgent(
-  agentDid: string,
+  expectedDid: string,
 ): Promise<{ ack: DelegationAck; prompted: boolean }> {
-  const { delegation, prompted } = await tcw().delegateTo(agentDid, AGENT_SCOPES, {
+  if (AGENT_DID && expectedDid !== AGENT_DID) {
+    throw new AgentDidMismatchError(AGENT_DID, expectedDid);
+  }
+  const { delegation, prompted } = await tcw().delegateTo(expectedDid, AGENT_SCOPES, {
     expiry: DELEGATION_EXPIRY_MS,
   });
   const serialized = serializeDelegation(delegation);
@@ -112,6 +163,9 @@ export async function delegateToAgent(
     method: "POST",
     body: JSON.stringify({ serialized }),
   });
+  if (ack.agentDid !== expectedDid) {
+    throw new AgentDidMismatchError(expectedDid, ack.agentDid);
+  }
   return { ack, prompted };
 }
 
@@ -124,22 +178,50 @@ export async function startRun(): Promise<{ run_id: string; status: RunStatus }>
 }
 
 /** GET /agent/run/:run_id — current status of a run. */
-export async function getRun(runId: string): Promise<RunState> {
-  return agentFetch<RunState>(`/agent/run/${encodeURIComponent(runId)}`);
+export async function getRun(runId: string, signal?: AbortSignal): Promise<RunState> {
+  return agentFetch<RunState>(`/agent/run/${encodeURIComponent(runId)}`, { signal });
 }
 
-/** Poll a run to a terminal state (done|error). Calls `onUpdate` on every poll.
- *  Returns the terminal RunState. Throws only on transport failure — an `error`
- *  status is a valid terminal result the caller renders. */
+/** Sleep that rejects promptly when `signal` aborts (so a cancelled poll doesn't
+ *  hang for the rest of its interval). */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("aborted", "AbortError"));
+    const id = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(id);
+      reject(new DOMException("aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Poll a run to a terminal state (done|error), calling `onUpdate` on each poll.
+ *  BOUNDED + ABORTABLE: stops after `maxElapsedMs` (default 20 min) so it can't
+ *  spin forever against a stuck/unreachable backend, and aborts immediately when
+ *  `signal` fires (caller passes an AbortController it cancels on unmount/sign-
+ *  out). Throws on transport failure or timeout; an `error` STATUS is a valid
+ *  terminal result the caller renders. */
 export async function pollRun(
   runId: string,
   onUpdate: (state: RunState) => void,
-  intervalMs = 2000,
+  options: { intervalMs?: number; maxElapsedMs?: number; signal?: AbortSignal } = {},
 ): Promise<RunState> {
+  const intervalMs = options.intervalMs ?? 2000;
+  const maxElapsedMs = options.maxElapsedMs ?? POLL_MAX_ELAPSED_MS;
+  const deadline = Date.now() + maxElapsedMs;
   for (;;) {
-    const state = await getRun(runId);
+    const state = await getRun(runId, options.signal);
     onUpdate(state);
     if (state.status === "done" || state.status === "error") return state;
-    await new Promise((r) => setTimeout(r, intervalMs));
+    if (Date.now() + intervalMs >= deadline) {
+      throw new Error(
+        `run ${runId} did not finish within ${Math.round(maxElapsedMs / 60000)} min (last status: ${state.status})`,
+      );
+    }
+    await abortableDelay(intervalMs, options.signal);
   }
 }
