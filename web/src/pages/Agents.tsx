@@ -1,23 +1,33 @@
-// Agents.tsx — the `/agents` page. Delegation status + re-grant/revoke, the
-// Generate button (POST /agent/run → poll GET /agent/run/:id), and run history.
+// Agents.tsx — the `/agents` page. The PRIMARY action is now a prominent
+// "Generate the feed" button (spec §3); everything else — the agent's DID +
+// requested permissions, the delegation card with re-grant/revoke, and the run
+// history — is collapsed under a native <details> disclosure (collapsed by
+// default) so the page leads with the one thing a user comes here to do.
 //
-// The agent connects AUTOMATICALLY on sign-in (App.ensureAgentDelegation), so
-// this page shows the resulting delegation rather than gating behind manual
-// "look up"/"delegate" clicks. Generate just works: if the delegation is somehow
-// missing when clicked, it auto-ensures one first, then starts the run.
+// The agent connects AUTOMATICALLY on sign-in (App.ensureAgentDelegation), so the
+// delegation details show the resulting state rather than gating behind manual
+// "look up"/"delegate" clicks. Generate just works: it ensures a delegation first
+// if one is somehow missing, then starts the run.
+//
+// In-progress detection (spec §4): the page uses the shared useAgentBuild
+// controller, which on mount calls getActiveRun() (GET /agent/runs) to catch a
+// build started in ANOTHER tab/session and resume polling it. While a build is in
+// flight the Generate button reflects "Building…" (disabled) rather than starting
+// a duplicate run.
 //
 // "Revoke" here is client-side only (drops the local delegation + tells the user
 // to re-grant); the contract has no revoke endpoint in the MVP, so we don't fake
 // a server revoke — we surface what we can actually do.
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   agentConfigured,
   agentHost,
-  pollRun,
-  startRun,
+  getAgentInfo,
+  type AgentInfo,
   type RunState,
 } from "../agentClient.ts";
+import { useAgentBuild } from "../useAgentBuild.ts";
 import { Shell } from "../Nav.tsx";
 import { Link } from "../router.tsx";
 import { DelegationCard } from "./Connect.tsx";
@@ -63,7 +73,95 @@ export function AgentsPage({
 
   return (
     <Shell title="Agents" sub={agentHost()}>
-      <div className="agents">
+      <AgentsBody
+        delegation={delegation}
+        runs={runs}
+        ensureDelegation={ensureDelegation}
+        onReGrant={onReGrant}
+        onForget={onForget}
+        agentConnecting={agentConnecting}
+        agentError={agentError}
+        onRunsChange={onRunsChange}
+        onFeedRefresh={onFeedRefresh}
+      />
+    </Shell>
+  );
+}
+
+/** Split out so the build controller hook only mounts once `agentConfigured()` is
+ *  true (the not-configured branch above returns before any hook runs). */
+function AgentsBody({
+  delegation,
+  runs,
+  ensureDelegation,
+  onReGrant,
+  onForget,
+  agentConnecting,
+  agentError,
+  onRunsChange,
+  onFeedRefresh,
+}: {
+  delegation: DelegationInfo | null;
+  runs: RunRecord[];
+  ensureDelegation: () => Promise<void>;
+  onReGrant: () => Promise<void>;
+  onForget: () => void;
+  agentConnecting: boolean;
+  agentError?: string | null;
+  onRunsChange: (runs: RunRecord[]) => void;
+  onFeedRefresh: () => void;
+}) {
+  // The Agents page keeps a run HISTORY, so it threads onRunStarted (prepend a new
+  // record) and onRunUpdate (update the live record) into the shared controller —
+  // the same history-maintenance the old GenerateSection did inline, now driven by
+  // the controller's poll so a resumed cross-tab run also lands in history.
+  const onRunStarted = useCallback(
+    (state: RunState) => {
+      onRunsChange([
+        { runId: state.run_id, status: state.status, startedAt: new Date().toISOString() },
+        ...runs,
+      ]);
+    },
+    [onRunsChange, runs],
+  );
+  const onRunUpdate = useCallback(
+    (state: RunState) => {
+      // Update an existing record, or insert one (a resumed cross-tab run we never
+      // saw start) so its status/published land in history too.
+      const existing = runs.some((r) => r.runId === state.run_id);
+      const next = existing
+        ? runs.map((r) =>
+            r.runId === state.run_id
+              ? { ...r, status: state.status, published: state.published, error: state.error }
+              : r,
+          )
+        : [
+            {
+              runId: state.run_id,
+              status: state.status,
+              startedAt: new Date().toISOString(),
+              published: state.published,
+              error: state.error,
+            },
+            ...runs,
+          ];
+      onRunsChange(next);
+    },
+    [onRunsChange, runs],
+  );
+
+  const build = useAgentBuild({ ensureDelegation, onFeedRefresh, onRunStarted, onRunUpdate });
+
+  return (
+    <div className="agents">
+      <GenerateSection build={build} />
+
+      {/* Everything secondary lives under Details, collapsed by default (spec §3):
+          the agent DID + requested permissions, the delegation card with the
+          re-grant/revoke affordances, and the run history. */}
+      <details className="agents-details">
+        <summary>Details</summary>
+        <AgentInfoSection />
         <DelegationSection
           delegation={delegation}
           onReGrant={onReGrant}
@@ -71,16 +169,99 @@ export function AgentsPage({
           agentConnecting={agentConnecting}
           agentError={agentError}
         />
-        <GenerateSection
-          delegation={delegation}
-          ensureDelegation={ensureDelegation}
-          runs={runs}
-          onRunsChange={onRunsChange}
-          onFeedRefresh={onFeedRefresh}
-        />
         <RunHistory runs={runs} />
-      </div>
-    </Shell>
+      </details>
+    </div>
+  );
+}
+
+/** The prominent primary action: "Generate the feed". Reflects the shared build
+ *  controller's state — disabled + "Building…" while a run is in flight (local OR
+ *  resumed from another tab/session) so it can't start a duplicate. */
+function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> }) {
+  return (
+    <section className="generate">
+      <button
+        type="button"
+        className={`generate-primary${build.building ? " gen-busy" : ""}`}
+        disabled={build.building}
+        onClick={() => void build.start()}
+      >
+        {build.building ? <span className="gen-spinner" aria-hidden="true" /> : null}
+        {build.building ? "Building…" : "Generate the feed"}
+      </button>
+      {build.building && (
+        <p className="gen-progress-meta" role="status">
+          🛠 Building your feed…
+          {build.live ? ` · ${build.live.run_id} · ${build.live.status}` : ""}
+        </p>
+      )}
+      {build.error && <div className="feed-error" style={{ marginTop: 14 }}>{build.error}</div>}
+    </section>
+  );
+}
+
+/** The agent's identity + the scopes it requests, fetched from GET /agent/info.
+ *  Lives under Details (spec §3). A fetch failure surfaces (not swallowed). */
+function AgentInfoSection() {
+  const [info, setInfo] = useState<AgentInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const i = await getAgentInfo();
+        if (!cancelled) setInfo(i);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (error) {
+    return (
+      <section className="prefs-section">
+        <h3>Agent</h3>
+        <div className="feed-error">{error}</div>
+      </section>
+    );
+  }
+  if (!info) {
+    return (
+      <section className="prefs-section">
+        <h3>Agent</h3>
+        <p className="prefs-note">Loading agent info…</p>
+      </section>
+    );
+  }
+  return (
+    <section className="prefs-section">
+      <h3>Agent</h3>
+      <ul>
+        <li className="learned">
+          <span className="prefs-text">{info.name || "Agent"}</span>
+          <span className="prefs-evidence">{info.did}</span>
+        </li>
+      </ul>
+      <h3>Requested permissions</h3>
+      <ul>
+        {info.permissions.map((p, i) => (
+          <li key={`${p.service}:${p.path}:${i}`} className="learned">
+            <span className="prefs-text">
+              {p.service} · {p.actions.join(", ")}
+            </span>
+            <span className="prefs-evidence">
+              {p.space}/{p.path}
+              {p.description ? ` — ${p.description}` : ""}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 
@@ -162,108 +343,6 @@ function DelegationSection({
         </div>
       )}
       {agentError && <div className="feed-error" style={{ marginTop: 14 }}>{agentError}</div>}
-    </section>
-  );
-}
-
-function GenerateSection({
-  delegation,
-  ensureDelegation,
-  runs,
-  onRunsChange,
-  onFeedRefresh,
-}: {
-  delegation: DelegationInfo | null;
-  /** Auto-connect helper: ensure a delegation exists before the run. */
-  ensureDelegation: () => Promise<void>;
-  runs: RunRecord[];
-  onRunsChange: (runs: RunRecord[]) => void;
-  onFeedRefresh: () => void;
-}) {
-  const [running, setRunning] = useState(false);
-  const [live, setLive] = useState<RunState | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  // The in-flight poll's controller — aborted on unmount/sign-out so the loop
-  // (and its pending fetch + interval) stops and doesn't setState after unmount.
-  const pollAbort = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    return () => pollAbort.current?.abort();
-  }, []);
-
-  const generate = async () => {
-    setRunning(true);
-    setError(null);
-    setLive(null);
-    const controller = new AbortController();
-    pollAbort.current?.abort();
-    pollAbort.current = controller;
-    try {
-      // Generate is just a button: if the delegation is somehow missing (auto-
-      // connect failed or was revoked), ensure one first, then start the run.
-      if (!delegation) await ensureDelegation();
-      const { run_id, status } = await startRun();
-      const record: RunRecord = {
-        runId: run_id,
-        status,
-        startedAt: new Date().toISOString(),
-      };
-      // Prepend the new run; keep the rest of the history.
-      let history = [record, ...runs];
-      onRunsChange(history);
-      setLive({ run_id, status });
-
-      const terminal = await pollRun(
-        run_id,
-        (state) => {
-          setLive(state);
-          history = history.map((r) =>
-            r.runId === state.run_id
-              ? { ...r, status: state.status, published: state.published, error: state.error }
-              : r,
-          );
-          onRunsChange(history);
-        },
-        { signal: controller.signal },
-      );
-
-      if (terminal.status === "done") {
-        onFeedRefresh();
-      } else if (terminal.status === "error") {
-        setError(terminal.error ?? "run failed");
-      }
-    } catch (e) {
-      // A deliberate abort (unmount/sign-out) is not a user-facing error.
-      if (!(e instanceof DOMException && e.name === "AbortError")) {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-    } finally {
-      if (pollAbort.current === controller) pollAbort.current = null;
-      setRunning(false);
-    }
-  };
-
-  return (
-    <section className="generate">
-      <h3 className="prefs-section-title">Generate</h3>
-      <div className="prefs-actions">
-        <button
-          type="button"
-          className={`quiet-link gen-control${running ? " gen-busy" : ""}`}
-          disabled={running}
-          onClick={() => void generate()}
-        >
-          {running ? <span className="gen-spinner" aria-hidden="true" /> : null}
-          {running ? "Generating…" : "Generate"}
-        </button>
-      </div>
-      {live && (
-        <p className="gen-progress-meta" role="status">
-          run {live.run_id} · {live.status}
-          {live.published?.length ? ` · ${live.published.length} published` : ""}
-        </p>
-      )}
-      {error && <div className="feed-error" style={{ marginTop: 14 }}>{error}</div>}
     </section>
   );
 }
