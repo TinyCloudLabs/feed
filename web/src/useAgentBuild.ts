@@ -141,7 +141,19 @@ export function useAgentBuild({
   // (older backend) degrades to "none active" inside getActiveRun — no throw, no
   // building state. A real auth/transport fault DOES throw and is surfaced.
   useEffect(() => {
-    if (!agentConfigured()) return;
+    // Mark mounted at the START of every (re)mount — NOT just once — so React
+    // StrictMode's mount→unmount→remount dev cycle (which runs this cleanup once)
+    // doesn't leave `mounted.current === false` on the live component and suppress
+    // every guarded setState. Standard mounted-ref pattern: set true on setup,
+    // false on cleanup. This is the SINGLE place that flips `mounted`, and it also
+    // aborts any in-flight poll on unmount.
+    mounted.current = true;
+    if (!agentConfigured()) {
+      return () => {
+        mounted.current = false;
+        pollAbort.current?.abort();
+      };
+    }
     const controller = new AbortController();
     pollAbort.current?.abort();
     pollAbort.current = controller;
@@ -154,12 +166,18 @@ export function useAgentBuild({
         setLive({ run_id: active.run_id, status: active.status, published: active.published });
         await drivePoll(active.run_id, controller);
       } catch (e) {
-        if (!(e instanceof DOMException && e.name === "AbortError")) {
+        if (mounted.current && !(e instanceof DOMException && e.name === "AbortError")) {
           setError(e instanceof Error ? e.message : String(e));
         }
       }
     })();
-    return () => controller.abort();
+    return () => {
+      mounted.current = false;
+      // Abort the LATEST controller (pollAbort.current), not just this effect's
+      // `controller`: a start() after mount replaces pollAbort.current with its
+      // own controller, and that start-spawned poll must also stop on unmount.
+      pollAbort.current?.abort();
+    };
   }, [drivePoll]);
 
   const start = useCallback(async () => {
@@ -207,6 +225,12 @@ export function useAgentBuild({
         return;
       }
       const { run_id, status } = await startRun();
+      // startRun() isn't abortable, so the POST can complete AFTER an unmount/
+      // sign-out. Guard before touching state or entering drivePoll, so we don't
+      // setLive / fire onRunStarted / start a poll on a torn-down component. (The
+      // run was created server-side; on the next mount getActiveRun() will pick it
+      // up and resume it.)
+      if (!mounted.current || controller.signal.aborted) return;
       const state: RunState = { run_id, status };
       setLive(state);
       onRunStartedRef.current?.(state);
@@ -225,18 +249,6 @@ export function useAgentBuild({
       starting.current = false;
     }
   }, [building, drivePoll, ensureDelegation]);
-
-  // On final unmount: mark unmounted (so the poll path stops setState'ing) and
-  // abort any live poll. The mount effect's cleanup already aborts its own
-  // controller; this also covers a start()-spawned controller that outlives that
-  // effect, and is the single place that flips `mounted` false.
-  useEffect(
-    () => () => {
-      mounted.current = false;
-      pollAbort.current?.abort();
-    },
-    [],
-  );
 
   return { building, live, error, start };
 }
