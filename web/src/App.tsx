@@ -20,6 +20,11 @@ const UNDO_MS = 8000;
 export function App() {
   const route = useRoute();
   const [session, setSession] = useState<Session | null>(null);
+  // Live mirror of `session` for the stable ensureAgentDelegation callback: the
+  // re-grant / Generate paths need the CURRENT session's space without depending
+  // on a stale closure. Sign-in / restore pass the space explicitly (no ref-
+  // timing gap right after they resolve).
+  const sessionRef = useRef<Session | null>(null);
   const [delegation, setDelegation] = useState<DelegationInfo | null>(null);
   // Restore-on-mount gate: until the persisted-session check finishes we render
   // a brief "Restoring…" state instead of flashing the sign-in screen on every
@@ -73,26 +78,35 @@ export function App() {
   }, []);
 
   const onSignOut = useCallback(() => {
-    void signOut();
+    // Clear local restore pointers up front so a signOut() rejection can't leave
+    // a restorable session; signOut() also clears them internally (defense in
+    // depth). Swallow only the signOut rejection here — the pointers are gone.
     clearStoredDelegation();
+    sessionRef.current = null;
+    signOut().catch(() => {});
     setSession(null);
     setDelegation(null);
     setRuns([]);
     navigate({ kind: "connect" });
   }, []);
 
-  // Auto-connect the agent: reuse a valid stored delegation or mint a fresh one,
-  // with NO manual "look up agent" / "delegate" clicks. Runs after sign-in
-  // (fresh OR restored) and on demand from Generate. A no-op when the agent
-  // backend isn't configured. Errors are CAPTURED into agentError (surfaced by
-  // Connect/Agents) rather than swallowed; the promise still rejects so callers
-  // that await it (Generate) can abort the run.
-  const ensureAgentDelegation = useCallback(async () => {
+  // Auto-connect the agent: reuse a valid stored delegation (bound to THIS
+  // session's space) or mint a fresh one, with NO manual "look up agent" /
+  // "delegate" clicks. Runs after sign-in (fresh OR restored) and on demand from
+  // Generate. `spaceUri` is the active session's applications-space URI — passed
+  // explicitly by sign-in/restore, else read from sessionRef for re-grant/
+  // Generate. A no-op when the agent backend isn't configured or there's no
+  // session. Errors are CAPTURED into agentError (surfaced by Connect/Agents)
+  // rather than swallowed; the promise still rejects so callers that await it
+  // (Generate) can abort the run.
+  const ensureAgentDelegation = useCallback(async (spaceUri?: string) => {
     if (!agentConfigured()) return;
+    const space = spaceUri ?? sessionRef.current?.appsSpaceUri;
+    if (!space) return;
     setAgentConnecting(true);
     setAgentError(null);
     try {
-      const ack = await ensureDelegation();
+      const ack = await ensureDelegation(space);
       setDelegation({
         agentDid: ack.agentDid,
         delegationCid: ack.delegationCid,
@@ -126,10 +140,12 @@ export function App() {
   // the agent so the user lands ready-to-generate with zero agent clicks.
   const onSession = useCallback(
     (s: Session) => {
+      sessionRef.current = s;
       setSession(s);
       // Fire-and-forget: the error (if any) lands in agentError; the rejection
-      // here is already captured, so ignore it at the call site.
-      ensureAgentDelegation().catch(() => {});
+      // here is already captured, so ignore it at the call site. Pass the space
+      // explicitly so the delegation binds to THIS session.
+      ensureAgentDelegation(s.appsSpaceUri).catch(() => {});
     },
     [ensureAgentDelegation],
   );
@@ -148,8 +164,9 @@ export function App() {
         if (restored) {
           await bootstrapSchema(restored.appsSpaceUri);
           if (cancelled) return;
+          sessionRef.current = restored;
           setSession(restored);
-          ensureAgentDelegation().catch(() => {});
+          ensureAgentDelegation(restored.appsSpaceUri).catch(() => {});
         }
       } catch (e) {
         if (!cancelled) setRestoreError(e instanceof Error ? e.message : String(e));

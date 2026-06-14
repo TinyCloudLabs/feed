@@ -155,18 +155,22 @@ export async function getAgentInfo(): Promise<AgentInfo> {
 //
 // The acked delegation is durable: the user delegated AGENT_SCOPES to the agent
 // for DELEGATION_EXPIRY_MS, and the backend stored it. Persisting the ack lets a
-// later reload reuse it (no re-delegate, no extra round-trip) as long as it isn't
-// expired and still targets the configured agent. We persist ONLY the ack
-// metadata (CIDs/DIDs/expiry) — never the session key, which BrowserSessionStorage
-// already owns.
+// later reload reuse it (no re-delegate, no extra round-trip) as long as it
+// isn't expired, still targets the configured agent, AND still belongs to the
+// CURRENT signed-in session's space — a delegation must NEVER be reused across
+// spaces/wallets (a different wallet, or a re-keyed session, has a different
+// `applications`-space URI). We persist ONLY the ack metadata (CIDs/DIDs/expiry/
+// spaceId) — never the session key, which BrowserSessionStorage already owns.
 
 /** localStorage key holding the last acked agent delegation. */
 const DELEGATION_KEY = "feed:agentDelegation";
 
-/** Load a previously persisted delegation ack, or null when absent, malformed,
- *  expired, or targeting a DIFFERENT agent than the configured VITE_AGENT_DID.
- *  A stale/mismatched entry is cleared so we don't keep reconsidering it. */
-export function loadStoredDelegation(): DelegationAck | null {
+/** Load the persisted delegation ack for `currentSpaceId`, or null when absent,
+ *  malformed, expired, targeting a DIFFERENT agent than VITE_AGENT_DID, or bound
+ *  to a DIFFERENT space than the active session. A stale/mismatched entry is
+ *  cleared so we don't keep reconsidering it (and so the next ensureDelegation
+ *  mints a fresh one for the current space). */
+export function loadStoredDelegation(currentSpaceId: string): DelegationAck | null {
   let raw: string | null;
   try {
     raw = localStorage.getItem(DELEGATION_KEY);
@@ -181,10 +185,15 @@ export function loadStoredDelegation(): DelegationAck | null {
     clearStoredDelegation();
     return null;
   }
-  // Expired, or pinned to a different agent than this build trusts → drop it.
-  const expired = !ack.expiresAt || new Date(ack.expiresAt).getTime() <= Date.now();
+  // A malformed/tampered expiry parses to NaN; treat that as expired (NOT as
+  // "never expires") so it's dropped + refreshed rather than reused forever.
+  const expiryMs = ack.expiresAt ? new Date(ack.expiresAt).getTime() : NaN;
+  const expired = Number.isNaN(expiryMs) || expiryMs <= Date.now();
   const wrongAgent = AGENT_DID !== "" && ack.agentDid !== AGENT_DID;
-  if (expired || wrongAgent) {
+  // Bound to a different space than the active session → it belongs to another
+  // wallet / re-keyed session and must not be reused.
+  const wrongSpace = ack.spaceId !== currentSpaceId;
+  if (expired || wrongAgent || wrongSpace) {
     clearStoredDelegation();
     return null;
   }
@@ -209,18 +218,41 @@ export function clearStoredDelegation(): void {
   }
 }
 
-/** Ensure a usable delegation exists, reusing the stored one when valid and
- *  otherwise minting a fresh one automatically: GET /agent/info (fresh, so a
- *  swapped backend DID is caught) → delegateToAgent → persist the ack. Returns
- *  the ack the caller turns into DelegationInfo. The happy path needs no manual
- *  "look up"/"delegate" clicks — this IS that flow, run on demand. */
-export async function ensureDelegation(): Promise<DelegationAck> {
-  const stored = loadStoredDelegation();
+/** Single-flight guard for {@link ensureDelegation}: concurrent callers (App's
+ *  auto-connect + the Generate button) await the SAME in-flight mint instead of
+ *  each POSTing /agent/delegation. Cleared when the mint settles. */
+let inflightEnsure: Promise<DelegationAck> | null = null;
+
+/** Ensure a usable delegation exists for `currentSpaceId`, reusing the stored
+ *  one when it's valid for THIS space and otherwise minting a fresh one: GET
+ *  /agent/info (fresh, so a swapped backend DID is caught) → delegateToAgent →
+ *  persist the ack. Concurrent calls share one in-flight mint (single-flight) so
+ *  the auto-connect + Generate can't double-POST. Returns the ack the caller
+ *  turns into DelegationInfo. The happy path needs no manual "look up"/"delegate"
+ *  clicks — this IS that flow, run on demand. */
+export async function ensureDelegation(currentSpaceId: string): Promise<DelegationAck> {
+  const stored = loadStoredDelegation(currentSpaceId);
   if (stored) return stored;
-  const info = await getAgentInfo();
-  const { ack } = await delegateToAgent(info.did);
-  storeDelegation(ack);
-  return ack;
+  // Coalesce concurrent mints into one POST.
+  if (inflightEnsure) return inflightEnsure;
+  inflightEnsure = (async () => {
+    const info = await getAgentInfo();
+    const { ack } = await delegateToAgent(info.did);
+    // The minted delegation must target the active session's space — otherwise
+    // we'd persist (and later reuse) a delegation bound to the wrong space.
+    if (ack.spaceId !== currentSpaceId) {
+      throw new Error(
+        `delegation space mismatch: signed in to ${currentSpaceId}, backend acked ${ack.spaceId}`,
+      );
+    }
+    storeDelegation(ack);
+    return ack;
+  })();
+  try {
+    return await inflightEnsure;
+  } finally {
+    inflightEnsure = null;
+  }
 }
 
 /** Mint a delegation of AGENT_SCOPES to `expectedDid` with the session key and

@@ -260,14 +260,20 @@ export async function restoreSession(): Promise<{ appsSpaceUri: string; readerDi
 }
 
 export async function signOut(): Promise<void> {
-  if (instance) {
-    await instance.signOut();
-    instance = null;
-  }
+  // Clear the restore pointers FIRST and unconditionally: if the SDK signOut
+  // below throws, the persisted session must NOT remain restorable. Drop the
+  // local address pointer and the SDK's persisted session (BrowserSessionStorage)
+  // before tearing down the instance.
   try {
     localStorage.removeItem(LAST_ADDRESS_KEY);
   } catch {
     // ignore
+  }
+  if (instance) {
+    const t = instance;
+    instance = null;
+    await t.clearPersistedSession();
+    await t.signOut();
   }
 }
 
