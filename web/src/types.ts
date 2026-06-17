@@ -38,6 +38,9 @@ export interface ArtifactRow {
   audio_key: string | null;
   audio_sha256: string | null;
   audio_mime: string | null;
+  video_key: string | null;
+  video_sha256: string | null;
+  video_mime: string | null;
   video_url: string | null;
   audience: string | null;
   approval_status: string;
@@ -68,6 +71,9 @@ export interface FeedCard {
   source_transcripts: string[];
   hero_image_key: string | null;
   hero_image_url?: string;
+  video_key: string | null;
+  video_mime: string | null;
+  video_url: string | null;
   generation_model: string | null;
   critic_pass: boolean;
   quotes_verified: boolean;

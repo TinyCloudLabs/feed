@@ -95,6 +95,9 @@ function toCard(row: ArtifactRow): FeedCard {
     tags: parseJsonArray(row.tags),
     source_transcripts: parseJsonArray(row.source_transcripts),
     hero_image_key: row.hero_image_key,
+    video_key: row.video_key,
+    video_mime: row.video_mime,
+    video_url: row.video_url,
     generation_model: row.generation_model,
     critic_pass: row.critic_pass === 1,
     quotes_verified: row.quotes_verified === 1,
@@ -107,7 +110,8 @@ function toCard(row: ArtifactRow): FeedCard {
 const COLUMNS =
   "id, type, render_type, slug, headline, body_md, quote, attribution, tags, " +
   "source_transcripts, hero_image_key, hero_image_sha256, hero_image_mime, " +
-  "audio_key, audio_sha256, audio_mime, video_url, audience, approval_status, " +
+  "audio_key, audio_sha256, audio_mime, video_key, video_sha256, video_mime, " +
+  "video_url, audience, approval_status, " +
   "platform, generation_model, critic_pass, quotes_verified, raw_artifact, " +
   "generated_at, published_at, publisher_did, schema_version";
 
@@ -118,7 +122,7 @@ function isMissingTable(message: string): boolean {
   return /no such table/i.test(message);
 }
 
-/** Read the published feed, newest first. V1 only renders tweet/article rows.
+/** Read the published feed, newest first. Supports tweet/article/video rows.
  *  A not-yet-existing `artifact` table reads as an EMPTY feed (the empty state
  *  prompts the user to connect + Generate); any other read failure throws. */
 export async function loadFeed(
@@ -129,7 +133,7 @@ export async function loadFeed(
   const db = spaceSql(appsSpaceUri).db(FEED_DB);
   const res = await db.query<unknown>(
     `SELECT ${COLUMNS} FROM artifact ` +
-      `WHERE render_type IN ('tweet','article') ` +
+      `WHERE render_type IN ('tweet','article','video') ` +
       `ORDER BY published_at DESC LIMIT ? OFFSET ?`,
     [limit, offset],
   );
@@ -316,6 +320,9 @@ const FEED_DDL = `CREATE TABLE IF NOT EXISTS artifact (
   audio_key          TEXT,
   audio_sha256       TEXT,
   audio_mime         TEXT,
+  video_key          TEXT,
+  video_sha256       TEXT,
+  video_mime         TEXT,
   video_url          TEXT,
 
   audience           TEXT,
@@ -332,6 +339,12 @@ const FEED_DDL = `CREATE TABLE IF NOT EXISTS artifact (
   publisher_did      TEXT NOT NULL,
   schema_version     INTEGER NOT NULL DEFAULT 1
 )`;
+
+const FEED_MIGRATIONS = [
+  `ALTER TABLE artifact ADD COLUMN video_key TEXT`,
+  `ALTER TABLE artifact ADD COLUMN video_sha256 TEXT`,
+  `ALTER TABLE artifact ADD COLUMN video_mime TEXT`,
+];
 
 const INTERACTION_DDL = `CREATE TABLE IF NOT EXISTS interaction (
   id            TEXT PRIMARY KEY,
@@ -368,6 +381,10 @@ function isIndexNotAuthorized(message: string): boolean {
   return /not authorized/i.test(message);
 }
 
+function isDuplicateColumn(message: string): boolean {
+  return /duplicate column name/i.test(message);
+}
+
 /** Run one CREATE TABLE/INDEX. Tables hard-fail; an index "not authorized"
  *  rejection is recorded and swallowed (every OTHER error throws). */
 async function execDdl(
@@ -385,6 +402,13 @@ async function execDdl(
   throw new Error(`schema bootstrap failed: ${res.error.message}`);
 }
 
+async function execMigration(db: IDatabaseHandle, statement: string): Promise<void> {
+  const res = await db.execute(statement);
+  if (res.ok) return;
+  if (isDuplicateColumn(res.error.message)) return;
+  throw new Error(`schema migration failed: ${res.error.message}`);
+}
+
 /** Idempotently create the `feed` + `interactions` tables in the owner's space.
  *  Safe to run on every connect. Returns the node-rejected index names (for
  *  diagnostics only — they are accelerators, not correctness). */
@@ -396,6 +420,7 @@ export async function bootstrapSchema(
 
   const feed = sql.db(FEED_DB);
   await execDdl(feed, FEED_DDL, false, skipped);
+  for (const migration of FEED_MIGRATIONS) await execMigration(feed, migration);
   for (const idx of FEED_INDEXES) await execDdl(feed, idx, true, skipped);
 
   const interactions = sql.db(INTERACTIONS_DB);

@@ -137,6 +137,51 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
   );
 }
 
+function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) {
+  const [url, setUrl] = useState<string | null>(card.video_url);
+  const key = card.video_key;
+  useEffect(() => {
+    setUrl(card.video_url);
+    if (!key) return;
+    let alive = true;
+    let acquired = false;
+    hydrateMedia(appsSpaceUri, key, card.video_mime ?? "video/mp4")
+      .then((u) => {
+        if (!alive) {
+          if (u) releaseMedia(key);
+          return;
+        }
+        if (u) acquired = true;
+        setUrl(u ?? card.video_url);
+      })
+      .catch((e) => {
+        console.error(`video hydrate failed (${key}):`, e);
+        if (alive) setUrl(card.video_url);
+      });
+    return () => {
+      alive = false;
+      if (acquired) releaseMedia(key);
+    };
+  }, [key, card.video_mime, card.video_url, appsSpaceUri]);
+
+  if (!url) {
+    return <Hero card={card} appsSpaceUri={appsSpaceUri} />;
+  }
+  return (
+    <figure className="video-media">
+      <video
+        src={url}
+        autoPlay
+        loop
+        muted
+        controls
+        playsInline
+        preload="metadata"
+      />
+    </figure>
+  );
+}
+
 /* ---- pull quote: red left rule, serif italic, mono cite ---- */
 
 function QuoteBlock({ card }: { card: FeedCard }) {
@@ -345,6 +390,7 @@ export function Card({
   onHide?: (id: string) => void;
 }) {
   const isArticle = card.render_type === "article";
+  const isVideo = card.render_type === "video";
   const body = card.body_md
     ? isArticle
       ? firstParagraph(card.body_md)
@@ -357,7 +403,11 @@ export function Card({
       <h2 className="headline">
         {isArticle ? <a href={cardHref(card)}>{card.headline}</a> : card.headline}
       </h2>
-      <Hero card={card} appsSpaceUri={appsSpaceUri} />
+      {isVideo ? (
+        <VideoMedia card={card} appsSpaceUri={appsSpaceUri} />
+      ) : (
+        <Hero card={card} appsSpaceUri={appsSpaceUri} />
+      )}
       <QuoteBlock card={card} />
       {body && <Body text={body} />}
       {isArticle && card.body_md && (
@@ -389,11 +439,16 @@ export function FullCard({
   readerDid: string;
   onHide?: (id: string) => void;
 }) {
+  const isVideo = card.render_type === "video";
   return (
     <article className="card article">
       <Kicker card={card} />
       <h1 className="headline">{card.headline}</h1>
-      <Hero card={card} appsSpaceUri={appsSpaceUri} />
+      {isVideo ? (
+        <VideoMedia card={card} appsSpaceUri={appsSpaceUri} />
+      ) : (
+        <Hero card={card} appsSpaceUri={appsSpaceUri} />
+      )}
       <QuoteBlock card={card} />
       {card.body_md && <Body text={card.body_md} />}
       {card.tags.length > 0 && (

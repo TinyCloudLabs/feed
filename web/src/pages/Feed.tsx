@@ -89,6 +89,11 @@ export function FeedPage({
   // tab) and exposes start() for the Get-updates click. Feed has no run history,
   // so it omits the onRunStarted/onRunUpdate callbacks.
   const build = useAgentBuild({ ensureDelegation, onFeedRefresh });
+  const emptyDone =
+    !build.building &&
+    build.live?.status === "done" &&
+    (build.live.published?.length ?? 0) === 0 &&
+    !build.error;
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -165,6 +170,11 @@ export function FeedPage({
 
       {error && <div className="feed-error">{error}</div>}
       {build.error && <div className="feed-error">{build.error}</div>}
+      {emptyDone && (
+        <div className="feed-notice" role="status">
+          Finished, but no artifacts were published. Add transcripts to Listen, then generate again.
+        </div>
+      )}
       {/* Background auto-delegation failure (spec audit §4): non-blocking — the
           feed still reads fine; only Generate needs the delegation. Surface it
           here so a silent failure isn't invisible after sign-in lands on /feed,

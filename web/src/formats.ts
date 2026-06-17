@@ -7,6 +7,7 @@ export const FORMAT_LABELS: Record<string, string> = {
   "insight-card": "Insight",
   article: "Article",
   podcast: "Podcast",
+  clip: "Clip",
   digest: "Digest",
   "social-post": "Social post",
   "investor-update-snippet": "Investor snippet",

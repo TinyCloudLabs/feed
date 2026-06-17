@@ -86,10 +86,10 @@ export const AGENT_SCOPES: PermissionEntry[] = [
     service: "tinycloud.kv",
     space: "applications",
     path: MEDIA_PREFIX,
-    // Minimal: the agent reads/writes hero blobs BY KEY (the SQL pointer carries
+    // Minimal: the agent reads/writes media blobs BY KEY (the SQL pointer carries
     // the exact key) — it never enumerates the user's media, so no list/metadata.
     actions: ["get", "put"],
-    description: "Read/write artifact media (hero images) by key.",
+    description: "Read/write artifact media (images, audio, video) by key.",
   },
 ];
 
@@ -132,7 +132,7 @@ const MANIFEST: Manifest = {
       space: "applications",
       path: MEDIA_PREFIX,
       actions: ["get", "list", "metadata"],
-      description: "Read artifact media (hero images, audio).",
+      description: "Read artifact media (images, audio, video).",
     },
     // Agent-delegated scopes, unioned into the recap so delegateTo derives.
     ...AGENT_SCOPES,
