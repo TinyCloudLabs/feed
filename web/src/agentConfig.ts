@@ -159,8 +159,10 @@ function resolveConfig(raw: RawAgentConfig | null): ResolvedAgentConfig {
   }
   // GUARD DID: prod = config.did ONLY (absent → "" so the live /agent/info DID
   // governs and a repoint auto-discovers the new agent); dev = config.did, else
-  // VITE fallback. In dev override mode, VITE_AGENT_DID wins when set.
-  const did = IS_PROD ? rawDid : ENV_CONFIG_OVERRIDE ? ENV_DID || rawDid : rawDid || ENV_DID;
+  // VITE fallback. In dev override mode, VITE_AGENT_DID wins when set; when it is
+  // intentionally absent, leave the guard blank so the local agent DID is
+  // auto-discovered instead of inheriting a production did from agent-config.json.
+  const did = IS_PROD ? rawDid : ENV_CONFIG_OVERRIDE ? ENV_DID : rawDid || ENV_DID;
   return {
     host,
     did,

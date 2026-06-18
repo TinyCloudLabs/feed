@@ -118,7 +118,15 @@ function AgentsBody({
   const onRunStarted = useCallback(
     (state: RunState) => {
       onRunsChange([
-        { runId: state.run_id, status: state.status, startedAt: new Date().toISOString() },
+        {
+          runId: state.run_id,
+          status: state.status,
+          startedAt: isoFromEpoch(state.startedAt) ?? new Date().toISOString(),
+          finishedAt: isoFromEpoch(state.finishedAt),
+          published: state.published,
+          error: state.error,
+          log: state.log,
+        },
         ...runs,
       ]);
     },
@@ -132,16 +140,25 @@ function AgentsBody({
       const next = existing
         ? runs.map((r) =>
             r.runId === state.run_id
-              ? { ...r, status: state.status, published: state.published, error: state.error }
+              ? {
+                  ...r,
+                  status: state.status,
+                  finishedAt: isoFromEpoch(state.finishedAt) ?? r.finishedAt,
+                  published: state.published,
+                  error: state.error,
+                  log: state.log,
+                }
               : r,
           )
         : [
             {
               runId: state.run_id,
               status: state.status,
-              startedAt: new Date().toISOString(),
+              startedAt: isoFromEpoch(state.startedAt) ?? new Date().toISOString(),
+              finishedAt: isoFromEpoch(state.finishedAt),
               published: state.published,
               error: state.error,
+              log: state.log,
             },
             ...runs,
           ];
@@ -197,10 +214,13 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
         {build.building ? "Building…" : "Generate the feed"}
       </button>
       {build.building && (
-        <p className="gen-progress-meta" role="status">
-          🛠 Building your feed…
-          {build.live ? ` · ${build.live.run_id} · ${build.live.status}` : ""}
-        </p>
+        <div className="gen-progress" role="status">
+          <p className="gen-progress-meta">
+            Building your feed…
+            {build.live ? ` · ${build.live.run_id} · ${build.live.status}` : ""}
+          </p>
+          <RunLog log={build.live?.log} />
+        </div>
       )}
       {emptyDone && (
         <div className="feed-notice" role="status" style={{ marginTop: 14 }}>
@@ -378,6 +398,7 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
               {new Date(r.startedAt).toLocaleString()} · {r.runId}
               {r.error ? ` · ${r.error}` : ""}
             </span>
+            <RunLog log={r.log} />
             {r.published?.length ? (
               <span className="run-published">
                 {r.published.map((p) => (
@@ -396,5 +417,21 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
         ))}
       </ul>
     </section>
+  );
+}
+
+function isoFromEpoch(value: number | undefined): string | undefined {
+  return typeof value === "number" ? new Date(value).toISOString() : undefined;
+}
+
+function RunLog({ log }: { log?: string[] }) {
+  const tail = log?.slice(-6) ?? [];
+  if (tail.length === 0) return null;
+  return (
+    <ol className="run-log-tail" aria-label="Recent run activity">
+      {tail.map((line, index) => (
+        <li key={`${index}:${line}`}>{line}</li>
+      ))}
+    </ol>
   );
 }

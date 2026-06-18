@@ -16,6 +16,8 @@ export interface RunRecord {
   runId: string;
   status: RunStatus;
   startedAt: string;
+  finishedAt?: string;
   published?: PublishedArtifact[];
   error?: string;
+  log?: string[];
 }

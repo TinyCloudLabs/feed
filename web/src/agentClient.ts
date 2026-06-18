@@ -88,6 +88,12 @@ export interface RunState {
   status: RunStatus;
   published?: PublishedArtifact[];
   error?: string;
+  /** Epoch ms the run was enqueued. */
+  startedAt?: number;
+  /** Epoch ms the run reached a terminal state. */
+  finishedAt?: number;
+  /** Bounded backend stage log tail for visibility while generation runs. */
+  log?: string[];
 }
 
 /** One entry in GET /agent/run (the run-list endpoint), newest-first. Carries the
@@ -102,6 +108,8 @@ export interface RunSummary {
   finishedAt?: number;
   published?: PublishedArtifact[];
   error?: string;
+  /** Bounded backend stage log tail. */
+  log?: string[];
 }
 
 // ── transport ────────────────────────────────────────────────────────────────

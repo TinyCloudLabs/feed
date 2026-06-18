@@ -163,7 +163,15 @@ export function useAgentBuild({
         if (!active || controller.signal.aborted) return;
         // Seed `live` from the summary so the indicator shows the run id/status
         // immediately, then let drivePoll's first poll refine it.
-        setLive({ run_id: active.run_id, status: active.status, published: active.published });
+        setLive({
+          run_id: active.run_id,
+          status: active.status,
+          startedAt: active.startedAt,
+          finishedAt: active.finishedAt,
+          published: active.published,
+          error: active.error,
+          log: active.log,
+        });
         await drivePoll(active.run_id, controller);
       } catch (e) {
         if (mounted.current && !(e instanceof DOMException && e.name === "AbortError")) {
@@ -199,7 +207,15 @@ export function useAgentBuild({
       // tab between mount and this click. If so, attach to it.
       const active = await getActiveRun(controller.signal);
       if (active && !controller.signal.aborted) {
-        setLive({ run_id: active.run_id, status: active.status, published: active.published });
+        setLive({
+          run_id: active.run_id,
+          status: active.status,
+          startedAt: active.startedAt,
+          finishedAt: active.finishedAt,
+          published: active.published,
+          error: active.error,
+          log: active.log,
+        });
         await drivePoll(active.run_id, controller);
         return;
       }
@@ -219,7 +235,11 @@ export function useAgentBuild({
         setLive({
           run_id: stillActive.run_id,
           status: stillActive.status,
+          startedAt: stillActive.startedAt,
+          finishedAt: stillActive.finishedAt,
           published: stillActive.published,
+          error: stillActive.error,
+          log: stillActive.log,
         });
         await drivePoll(stillActive.run_id, controller);
         return;

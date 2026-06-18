@@ -320,6 +320,22 @@ button {
   color: var(--ink-3);
 }
 
+.run-log-tail {
+  margin: 8px 0 0;
+  padding: 8px 0 0 18px;
+  border-top: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.55;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
+}
+
+.run-log-tail li + li {
+  margin-top: 3px;
+}
+
 /* error / stalled terminal state */
 .gen-progress--error .gen-progress-activity {
   color: var(--ink-2);
