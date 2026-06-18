@@ -135,6 +135,10 @@ interface AgentRunsResponse {
   lock?: RunLockSummary;
 }
 
+function isValidRunId(runId: string): boolean {
+  return /^run-\d+-[a-z0-9]{6}$/.test(runId);
+}
+
 // ── transport ────────────────────────────────────────────────────────────────
 
 /** A fetch that fails LOUDLY (no silent fallback) and surfaces the backend's
@@ -400,6 +404,9 @@ export async function startRun(): Promise<StartRunResult> {
   }
   const error = parsed?.error;
   if (res.status === 409 && error?.code === "run_in_progress" && typeof error.run_id === "string") {
+    if (!isValidRunId(error.run_id)) {
+      throw new Error(error.message ?? `agent run lock is held by ${error.run_id}`);
+    }
     return { run_id: error.run_id, status: "running", attached: true };
   }
 
