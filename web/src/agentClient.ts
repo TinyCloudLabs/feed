@@ -121,6 +121,20 @@ export interface RunSummary {
   log?: string[];
 }
 
+export interface RunLockSummary {
+  run_id: string;
+  owner: string;
+  pid: number;
+  acquiredAt: number;
+  ageMs: number;
+  reclaimable: boolean;
+}
+
+interface AgentRunsResponse {
+  runs?: RunSummary[];
+  lock?: RunLockSummary;
+}
+
 // ── transport ────────────────────────────────────────────────────────────────
 
 /** A fetch that fails LOUDLY (no silent fallback) and surfaces the backend's
@@ -413,7 +427,7 @@ export async function getRun(runId: string, signal?: AbortSignal): Promise<RunSt
  *  configured host (401/403/5xx) is a real fault and STILL throws — we don't
  *  swallow auth/transport problems. Returns `null` for the degraded case so callers
  *  can distinguish "endpoint unavailable" from "available, zero runs". */
-export async function listRuns(signal?: AbortSignal): Promise<RunSummary[] | null> {
+async function fetchRunsResponse(signal?: AbortSignal): Promise<AgentRunsResponse | null> {
   // We can't use agentFetch here (it throws on every non-OK), because we must
   // branch on the 404 to degrade gracefully. Mirror its config-await + host gate.
   const { host } = await loadAgentConfig();
@@ -443,8 +457,18 @@ export async function listRuns(signal?: AbortSignal): Promise<RunSummary[] | nul
       `agent GET /agent/runs failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ""}`,
     );
   }
-  const data = (await res.json()) as { runs?: RunSummary[] };
+  return (await res.json()) as AgentRunsResponse;
+}
+
+export async function listRuns(signal?: AbortSignal): Promise<RunSummary[] | null> {
+  const data = await fetchRunsResponse(signal);
+  if (!data) return null;
   return Array.isArray(data.runs) ? data.runs : [];
+}
+
+export async function getRunLock(signal?: AbortSignal): Promise<RunLockSummary | null> {
+  const data = await fetchRunsResponse(signal);
+  return data?.lock ?? null;
 }
 
 /** The newest run that is still in flight (status queued|running), or undefined

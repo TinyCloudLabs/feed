@@ -24,7 +24,9 @@ import {
   agentConfigured,
   agentHost,
   getAgentInfo,
+  getRunLock,
   type AgentInfo,
+  type RunLockSummary,
   type RunState,
 } from "../agentClient.ts";
 import { useAgentBuild } from "../useAgentBuild.ts";
@@ -186,6 +188,7 @@ function AgentsBody({
           agentConnecting={agentConnecting}
           agentError={agentError}
         />
+        <RunLockSection />
         <RunHistory runs={runs} />
       </details>
     </div>
@@ -378,6 +381,76 @@ function DelegationSection({
   );
 }
 
+function RunLockSection() {
+  const [lock, setLock] = useState<RunLockSummary | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const next = await getRunLock(controller.signal);
+        if (!controller.signal.aborted) {
+          setLock(next);
+          setLoaded(true);
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          setError(e instanceof Error ? e.message : String(e));
+          setLoaded(true);
+        }
+      }
+    })();
+    return () => {
+      controller.abort();
+    };
+  }, []);
+
+  if (error) {
+    return (
+      <section className="prefs-section">
+        <h3>Run lock</h3>
+        <div className="feed-error">{error}</div>
+      </section>
+    );
+  }
+
+  if (!loaded) {
+    return (
+      <section className="prefs-section">
+        <h3>Run lock</h3>
+        <p className="prefs-note">Loading run lock…</p>
+      </section>
+    );
+  }
+
+  if (!lock) {
+    return (
+      <section className="prefs-section">
+        <h3>Run lock</h3>
+        <p className="prefs-note">No active run lock.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="prefs-section">
+      <h3>Run lock</h3>
+      <ul>
+        <li className="learned">
+          <span className="prefs-text">
+            {lock.reclaimable ? "reclaimable" : "held"} · {lock.owner}
+          </span>
+          <span className="prefs-evidence">
+            {lock.run_id} · pid {lock.pid} · {formatDuration(lock.ageMs)}
+          </span>
+        </li>
+      </ul>
+    </section>
+  );
+}
+
 function RunHistory({ runs }: { runs: RunRecord[] }) {
   if (runs.length === 0) return null;
   return (
@@ -422,6 +495,16 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
 
 function isoFromEpoch(value: number | undefined): string | undefined {
   return typeof value === "number" ? new Date(value).toISOString() : undefined;
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "unknown age";
+  const minutes = Math.floor(ms / 60_000);
+  if (minutes < 1) return "less than 1 min";
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rem = minutes % 60;
+  return rem === 0 ? `${hours} hr` : `${hours} hr ${rem} min`;
 }
 
 function RunLog({ log }: { log?: string[] }) {
