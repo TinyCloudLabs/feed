@@ -85,6 +85,7 @@ const IS_PROD = import.meta.env.PROD;
 const ENV_HOST = (import.meta.env.VITE_AGENT_HOST || "").trim();
 const ENV_DID = (import.meta.env.VITE_AGENT_DID || "").trim();
 const ENV_TOKEN = (import.meta.env.VITE_AGENT_TOKEN || "").trim();
+const ENV_CONFIG_OVERRIDE = import.meta.env.VITE_AGENT_CONFIG_OVERRIDE === "1";
 
 /** Coerce an optional JSON string field to a trimmed string, or "" when absent.
  *  A present-but-non-string value is a malformed config → throw (loud). */
@@ -105,7 +106,9 @@ function optString(value: unknown, field: string): string {
  *      governs (DID auto-discovery survives a repoint). NO VITE_* fallback — it
  *      would silently boot the stale build-time host/DID.
  *    DEV — runtime config wins, else falls back to VITE_AGENT_* so `vite dev`
- *      works with a `.env.local` and a partial/absent static file.
+ *      works with a `.env.local` and a partial/absent static file. Set
+ *      VITE_AGENT_CONFIG_OVERRIDE=1 to explicitly make VITE_AGENT_* win in dev
+ *      for local-agent testing without committing a localhost config.
  *  TOKEN sources from VITE_AGENT_TOKEN in both modes (choice (a)).
  *
  *  PROD + null raw (missing config) THROWS — no silent fallback to a blank/stale
@@ -130,13 +133,22 @@ function resolveConfig(raw: RawAgentConfig | null): ResolvedAgentConfig {
   // time host/DID when the deployed JSON omits a field, defeating the whole point
   // (and blocking DID auto-discovery after a repoint). The VITE_* fallback for
   // host/DID is allowed ONLY under DEV (so `vite dev` works with a `.env.local`
-  // and a partial/empty static file). Token still sources from VITE_AGENT_TOKEN by
-  // design (choice (a) — the committed file carries no token).
+  // and a partial/empty static file). In dev only, VITE_AGENT_CONFIG_OVERRIDE=1
+  // flips precedence so local-agent testing does not require committing a
+  // localhost runtime config. Token still sources from VITE_AGENT_TOKEN by design
+  // (choice (a) — the committed file carries no token).
   const rawHost = optString(raw.host, "host");
   const rawDid = optString(raw.did, "did");
   const rawToken = optString(raw.token, "token");
-  // HOST: prod = runtime only; dev = runtime, else VITE fallback. Always validated.
-  const host = resolveAgentHost(IS_PROD ? rawHost : rawHost || ENV_HOST);
+  // HOST: prod = runtime only; dev = runtime, else VITE fallback. In dev override
+  // mode, VITE_AGENT_HOST wins when set. Always validated.
+  const host = resolveAgentHost(
+    IS_PROD
+      ? rawHost
+      : ENV_CONFIG_OVERRIDE
+        ? ENV_HOST || rawHost
+        : rawHost || ENV_HOST,
+  );
   // A present config with no usable host is a misconfig in prod — fail loudly
   // rather than render a silently-unconfigured (or stale build-time) agent.
   if (IS_PROD && host === "") {
@@ -147,8 +159,8 @@ function resolveConfig(raw: RawAgentConfig | null): ResolvedAgentConfig {
   }
   // GUARD DID: prod = config.did ONLY (absent → "" so the live /agent/info DID
   // governs and a repoint auto-discovers the new agent); dev = config.did, else
-  // VITE fallback.
-  const did = IS_PROD ? rawDid : rawDid || ENV_DID;
+  // VITE fallback. In dev override mode, VITE_AGENT_DID wins when set.
+  const did = IS_PROD ? rawDid : ENV_CONFIG_OVERRIDE ? ENV_DID || rawDid : rawDid || ENV_DID;
   return {
     host,
     did,

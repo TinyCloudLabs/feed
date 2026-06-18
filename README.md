@@ -15,10 +15,16 @@ no server, no `/api`, no sessions database. It signs in as the space **owner**
 
 ```sh
 bun install
-bun run dev        # local dev server (http://localhost:5173)
+bun run dev        # Portless dev server (https://feed.localhost)
+bun run dev:vite   # raw Vite fallback (http://localhost:5173)
 bun run build      # static bundle -> web/dist/
 bun run typecheck
 ```
+
+Portless serves HTTPS by default, which OpenKey/WebAuthn needs. On first run it
+may ask for sudo so it can bind port 443 and trust the local CA. To avoid sudo
+for a one-off local session, run `PORTLESS_PORT=1355 bun run dev` and open
+`https://feed.localhost:1355`.
 
 ### 5 pages + the agent flow
 
@@ -108,10 +114,10 @@ To verify the rendered feed against the live `applications` space:
 
 ```sh
 bun install
-bun run dev          # http://localhost:5173
+bun run dev          # https://feed.localhost
 ```
 
-1. Open `http://localhost:5173` and click **Sign in**.
+1. Open `https://feed.localhost` and click **Sign in**.
 2. Complete OpenKey/passkey sign-in **as the owner of the `applications` space**
    (the wallet that owns `xyz.tinycloud.artifacts`). The manifest requests
    `applications`-space `tinycloud.sql` + `tinycloud.kv` caps.
@@ -125,6 +131,47 @@ bun run dev          # http://localhost:5173
 
 The non-interactive data path (feed query, `raw_artifact` shape, KV hero decode)
 is verified against the live rows via the `tc` CLI owner session.
+
+### Local development with your Claude session
+
+For local generation, run a local distillery agent backend and point the feed at
+it. The feed must stay on HTTPS for OpenKey/WebAuthn; Portless provides the
+trusted local HTTPS URLs.
+
+```sh
+# 1. Start the feed over HTTPS.
+PORTLESS_PORT=1355 bun run dev
+# -> https://feed.localhost:1355
+
+# 2. In another terminal, start the local agent backend from the sibling
+# artifactory checkout. It invokes your logged-in Claude CLI session via
+# `claude -p`, so `claude` must already be logged in on this Mac.
+cd "../artifactory"
+AGENT_API_TOKEN=local-claude-dev \
+AGENT_ALLOWED_ORIGIN=https://feed.localhost:1355,https://feed.localhost \
+AGENT_NAME="Local Claude Distillery Agent" \
+bun harness/agent/src/server.ts
+# -> http://127.0.0.1:4097
+
+# 3. Register the local agent behind the same Portless HTTPS proxy.
+cd "../feed"
+PORTLESS_PORT=1355 bunx portless alias agent.feed 4097 --force
+# -> https://agent.feed.localhost:1355
+```
+
+For this local setup, keep `web/public/agent-config.json` pointed at the deployed
+agent and put the local override in `.env.local` (gitignored):
+
+```sh
+VITE_AGENT_CONFIG_OVERRIDE=1
+VITE_AGENT_HOST=https://agent.feed.localhost:1355
+VITE_AGENT_TOKEN=local-claude-dev
+```
+
+The local agent uses your Claude Code login because the backend's generate step
+runs `claude -p` with the real `$HOME` and the macOS session variables Claude
+needs for Keychain auth. The agent still requires an OpenKey/TinyCloud delegation
+from the feed before it can read Listen data or publish artifacts.
 
 ---
 
