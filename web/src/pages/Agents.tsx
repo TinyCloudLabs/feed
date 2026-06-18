@@ -188,7 +188,10 @@ function AgentsBody({
           agentConnecting={agentConnecting}
           agentError={agentError}
         />
-        <RunLockSection />
+        <RunLockSection
+          polling={build.building}
+          refreshKey={`${build.live?.run_id ?? "none"}:${build.live?.status ?? "idle"}:${runs.length}`}
+        />
         <RunHistory runs={runs} />
       </details>
     </div>
@@ -381,18 +384,19 @@ function DelegationSection({
   );
 }
 
-function RunLockSection() {
+function RunLockSection({ polling, refreshKey }: { polling: boolean; refreshKey: string }) {
   const [lock, setLock] = useState<RunLockSummary | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
-    void (async () => {
+    const load = async () => {
       try {
         const next = await getRunLock(controller.signal);
         if (!controller.signal.aborted) {
           setLock(next);
+          setError(null);
           setLoaded(true);
         }
       } catch (e) {
@@ -401,11 +405,14 @@ function RunLockSection() {
           setLoaded(true);
         }
       }
-    })();
+    };
+    void load();
+    const interval = polling ? window.setInterval(() => void load(), 5000) : undefined;
     return () => {
+      if (interval !== undefined) window.clearInterval(interval);
       controller.abort();
     };
-  }, []);
+  }, [polling, refreshKey]);
 
   if (error) {
     return (
