@@ -434,7 +434,10 @@ export async function getRun(runId: string, signal?: AbortSignal): Promise<RunSt
  *  configured host (401/403/5xx) is a real fault and STILL throws — we don't
  *  swallow auth/transport problems. Returns `null` for the degraded case so callers
  *  can distinguish "endpoint unavailable" from "available, zero runs". */
-async function fetchRunsResponse(signal?: AbortSignal): Promise<AgentRunsResponse | null> {
+async function fetchRunsResponse(
+  signal?: AbortSignal,
+  options: { softNetworkFailure?: boolean } = {},
+): Promise<AgentRunsResponse | null> {
   // We can't use agentFetch here (it throws on every non-OK), because we must
   // branch on the 404 to degrade gracefully. Mirror its config-await + host gate.
   const { host } = await loadAgentConfig();
@@ -449,10 +452,13 @@ async function fetchRunsResponse(signal?: AbortSignal): Promise<AgentRunsRespons
     });
   } catch (e) {
     // A genuine abort propagates (the caller cancelled). Any other network error
-    // means the endpoint is unreachable — treat as "older backend, no list" so a
-    // not-yet-redeployed agent doesn't break the page.
+    // can be soft-degraded for cold-start active-run detection, where an older or
+    // unreachable backend should not break the whole page. Operator visibility
+    // surfaces such as Run lock pass softNetworkFailure:false so the failure is
+    // shown instead of being misreported as "no lock".
     if (e instanceof DOMException && e.name === "AbortError") throw e;
-    return null;
+    if (options.softNetworkFailure) return null;
+    throw e;
   }
   // 404 → endpoint not deployed on this (older) agent: degrade to "unknown/none".
   if (res.status === 404) return null;
@@ -468,13 +474,13 @@ async function fetchRunsResponse(signal?: AbortSignal): Promise<AgentRunsRespons
 }
 
 export async function listRuns(signal?: AbortSignal): Promise<RunSummary[] | null> {
-  const data = await fetchRunsResponse(signal);
+  const data = await fetchRunsResponse(signal, { softNetworkFailure: true });
   if (!data) return null;
   return Array.isArray(data.runs) ? data.runs : [];
 }
 
 export async function getRunLock(signal?: AbortSignal): Promise<RunLockSummary | null> {
-  const data = await fetchRunsResponse(signal);
+  const data = await fetchRunsResponse(signal, { softNetworkFailure: false });
   return data?.lock ?? null;
 }
 
