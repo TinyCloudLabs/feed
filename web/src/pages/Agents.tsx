@@ -179,6 +179,12 @@ function AgentsBody({
  *  controller's state — disabled + "Building…" while a run is in flight (local OR
  *  resumed from another tab/session) so it can't start a duplicate. */
 function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> }) {
+  const emptyDone =
+    !build.building &&
+    build.live?.status === "done" &&
+    (build.live.published?.length ?? 0) === 0 &&
+    !build.error;
+
   return (
     <section className="generate">
       <button
@@ -195,6 +201,11 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
           🛠 Building your feed…
           {build.live ? ` · ${build.live.run_id} · ${build.live.status}` : ""}
         </p>
+      )}
+      {emptyDone && (
+        <div className="feed-notice" role="status" style={{ marginTop: 14 }}>
+          Finished, but no artifacts were published. Add transcripts to Listen, then generate again.
+        </div>
       )}
       {build.error && <div className="feed-error" style={{ marginTop: 14 }}>{build.error}</div>}
     </section>
@@ -357,7 +368,11 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
           <li key={r.runId} className="learned">
             <span className="prefs-text">
               {r.status}
-              {r.published?.length ? ` · ${r.published.length} artifact${r.published.length === 1 ? "" : "s"}` : ""}
+              {r.status === "done"
+                ? ` · ${r.published?.length ?? 0} artifact${(r.published?.length ?? 0) === 1 ? "" : "s"}`
+                : r.published?.length
+                  ? ` · ${r.published.length} artifact${r.published.length === 1 ? "" : "s"}`
+                  : ""}
             </span>
             <span className="prefs-evidence">
               {new Date(r.startedAt).toLocaleString()} · {r.runId}

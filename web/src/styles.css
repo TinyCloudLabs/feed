@@ -580,6 +580,20 @@ button.mono-chip::after {
   border: 1px solid var(--hairline);
 }
 
+.video-media {
+  margin: 18px 0 0;
+}
+
+.video-media video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  background: #000;
+  border-radius: 3px;
+  border: 1px solid var(--hairline);
+}
+
 .pull {
   margin: 18px 0 0;
   padding-left: 16px;
