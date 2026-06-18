@@ -436,7 +436,7 @@ export async function getRun(runId: string, signal?: AbortSignal): Promise<RunSt
  *  can distinguish "endpoint unavailable" from "available, zero runs". */
 async function fetchRunsResponse(
   signal?: AbortSignal,
-  options: { softNetworkFailure?: boolean } = {},
+  options: { softNetworkFailure?: boolean; softUnavailable?: boolean } = {},
 ): Promise<AgentRunsResponse | null> {
   // We can't use agentFetch here (it throws on every non-OK), because we must
   // branch on the 404 to degrade gracefully. Mirror its config-await + host gate.
@@ -460,8 +460,9 @@ async function fetchRunsResponse(
     if (options.softNetworkFailure) return null;
     throw e;
   }
-  // 404 → endpoint not deployed on this (older) agent: degrade to "unknown/none".
-  if (res.status === 404) return null;
+  // 404 → endpoint not deployed on this (older) agent. Only active-run resume
+  // soft-degrades this; operator-facing lock visibility should report it.
+  if (res.status === 404 && options.softUnavailable) return null;
   if (!res.ok) {
     // A real fault on the configured host (auth/transport/5xx) must surface, not
     // hide — same loud-failure rule as agentFetch.
@@ -474,13 +475,19 @@ async function fetchRunsResponse(
 }
 
 export async function listRuns(signal?: AbortSignal): Promise<RunSummary[] | null> {
-  const data = await fetchRunsResponse(signal, { softNetworkFailure: true });
+  const data = await fetchRunsResponse(signal, {
+    softNetworkFailure: true,
+    softUnavailable: true,
+  });
   if (!data) return null;
   return Array.isArray(data.runs) ? data.runs : [];
 }
 
 export async function getRunLock(signal?: AbortSignal): Promise<RunLockSummary | null> {
-  const data = await fetchRunsResponse(signal, { softNetworkFailure: false });
+  const data = await fetchRunsResponse(signal, {
+    softNetworkFailure: false,
+    softUnavailable: false,
+  });
   return data?.lock ?? null;
 }
 
