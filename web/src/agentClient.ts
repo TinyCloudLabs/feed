@@ -4,7 +4,7 @@
 // "Agent backend API"):
 //   GET  /agent/info           → { did, name, permissions[], challenge? }
 //   POST /agent/delegation     { serialized } → { ok, agentDid, delegationCid, spaceId, expiresAt }
-//   POST /agent/run            {} → { run_id, status: "queued" }
+//   POST /agent/run            {} → { run_id, status: "queued" } or 409 run_in_progress { run_id }
 //   GET  /agent/run/:run_id    → { run_id, status, published?[], error? }
 //
 // The user mints a delegation of AGENT_SCOPES to the agent's DID with the
@@ -94,6 +94,13 @@ export interface RunState {
   finishedAt?: number;
   /** Bounded backend stage log tail for visibility while generation runs. */
   log?: string[];
+}
+
+export interface StartRunResult {
+  run_id: string;
+  status: RunStatus;
+  /** True when POST /agent/run attached to an already-active backend run. */
+  attached?: boolean;
 }
 
 /** One entry in GET /agent/run (the run-list endpoint), newest-first. Carries the
@@ -347,13 +354,42 @@ export async function delegateToAgent(
   return { ack, prompted };
 }
 
-/** POST /agent/run — trigger a pipeline run under the stored delegation. */
-export async function startRun(): Promise<{ run_id: string; status: RunStatus }> {
-  return agentFetch<{ run_id: string; status: RunStatus }>("/agent/run", {
+/** POST /agent/run — trigger a pipeline run under the stored delegation. If the
+ *  backend's cross-process run lock reports an already-active run, attach to that
+ *  run instead of surfacing a generic 409 error; the caller will poll the returned
+ *  id and render the real terminal status. */
+export async function startRun(): Promise<StartRunResult> {
+  const { host, token } = await loadAgentConfig();
+  if (host === "") {
+    throw new Error("agent backend not configured (no host in /agent-config.json)");
+  }
+  const res = await fetch(`${host}/agent/run`, {
     method: "POST",
-    auth: true,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify({}),
   });
+  const body = await res.text().catch(() => "");
+  if (res.ok) {
+    return JSON.parse(body) as StartRunResult;
+  }
+
+  let parsed: { error?: { code?: string; message?: string; run_id?: string } } | null = null;
+  try {
+    parsed = body ? JSON.parse(body) : null;
+  } catch {
+    parsed = null;
+  }
+  const error = parsed?.error;
+  if (res.status === 409 && error?.code === "run_in_progress" && typeof error.run_id === "string") {
+    return { run_id: error.run_id, status: "running", attached: true };
+  }
+
+  throw new Error(
+    `agent POST /agent/run failed: ${res.status} ${res.statusText}${body ? ` — ${body}` : ""}`,
+  );
 }
 
 /** GET /agent/run/:run_id — current status of a run. */

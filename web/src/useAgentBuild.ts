@@ -7,9 +7,10 @@
 //     already in flight — this tab, ANOTHER tab, or another session — and resumes
 //     polling it. That cross-session detection is the whole point of the server
 //     endpoint: a build kicked off elsewhere shows up here as "🛠 Building…".
-//   • start() either ATTACHES to that already-active run or, when none is active,
-//     ensures a delegation + POSTs /agent/run, then polls to completion. It never
-//     POSTs a second run while one is live (local in-flight OR server-reported).
+//   • start() either ATTACHES to an already-active run or, when none is active,
+//     ensures a delegation + POSTs /agent/run, then polls to completion. The
+//     backend's shared run lock is authoritative; if a race still reaches POST,
+//     startRun() converts 409 run_in_progress into the active run id.
 //   • On terminal `done` it bumps the feed refresh key; on `error` it surfaces the
 //     message. The poll is bounded + abortable (the existing pollRun contract); we
 //     abort it on unmount so it can't setState after teardown.
@@ -225,11 +226,8 @@ export function useAgentBuild({
       await ensureDelegation();
       // FINAL pre-POST re-check, immediately before startRun(): ensureDelegation
       // above awaits, widening the check-then-create window — re-poll so a run
-      // that appeared during it is attached to instead of duplicated. This
-      // minimizes (but cannot fully close) the cross-TAB simultaneous-click race:
-      // two tabs can still both see "none active" here and both POST, because
-      // there's no backend run lock. A true guarantee needs server-side run
-      // idempotency (a fast-follow we may add); client-side this is best-effort.
+      // that appeared during it is attached to without an extra POST. The backend
+      // shared run lock is still the hard guarantee if two tabs race past this.
       const stillActive = await getActiveRun(controller.signal);
       if (stillActive && !controller.signal.aborted) {
         setLive({
@@ -244,7 +242,7 @@ export function useAgentBuild({
         await drivePoll(stillActive.run_id, controller);
         return;
       }
-      const { run_id, status } = await startRun();
+      const { run_id, status, attached } = await startRun();
       // startRun() isn't abortable, so the POST can complete AFTER an unmount/
       // sign-out. Guard before touching state or entering drivePoll, so we don't
       // setLive / fire onRunStarted / start a poll on a torn-down component. (The
@@ -253,7 +251,7 @@ export function useAgentBuild({
       if (!mounted.current || controller.signal.aborted) return;
       const state: RunState = { run_id, status };
       setLive(state);
-      onRunStartedRef.current?.(state);
+      if (!attached) onRunStartedRef.current?.(state);
       await drivePoll(run_id, controller);
     } catch (e) {
       if (mounted.current && !(e instanceof DOMException && e.name === "AbortError")) {
