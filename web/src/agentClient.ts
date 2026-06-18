@@ -31,9 +31,11 @@ import { loadAgentConfig, getAgentConfig } from "./agentConfig.ts";
 /** Default delegation lifetime when the backend doesn't dictate one (7 days). */
 const DELEGATION_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Default poll budget: stop after this long even if the run never terminates
- *  (the backend is unreachable / stuck), so the loop can't spin forever. */
-const POLL_MAX_ELAPSED_MS = 20 * 60 * 1000; // 20 min
+/** Default no-progress budget: stop only after this long without a fresh backend
+ *  progress log. Long generation can legitimately exceed 20 minutes; as long as
+ *  Artifactory's run heartbeat keeps advancing, Feed should keep polling instead
+ *  of declaring a live run stuck. */
+const POLL_NO_PROGRESS_MS = 20 * 60 * 1000; // 20 min
 
 /** True when a valid agent backend host is resolved. Reads the runtime config,
  *  which app bootstrap awaits before render — so this sync read always sees a
@@ -474,27 +476,39 @@ function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+function lastProgressAt(state: RunState): number {
+  const logs = Array.isArray(state.log) ? state.log : [];
+  for (let i = logs.length - 1; i >= 0; i--) {
+    const line = logs[i];
+    if (typeof line !== "string") continue;
+    const parsed = Date.parse(line.slice(0, 24));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return typeof state.startedAt === "number" ? state.startedAt : Date.now();
+}
+
 /** Poll a run to a terminal state (done|error), calling `onUpdate` on each poll.
- *  BOUNDED + ABORTABLE: stops after `maxElapsedMs` (default 20 min) so it can't
- *  spin forever against a stuck/unreachable backend, and aborts immediately when
- *  `signal` fires (caller passes an AbortController it cancels on unmount/sign-
- *  out). Throws on transport failure or timeout; an `error` STATUS is a valid
- *  terminal result the caller renders. */
+ *  BOUNDED + ABORTABLE: stops after `maxNoProgressMs` (default 20 min) with no
+ *  fresh progress log so it can't spin forever against a dead backend process,
+ *  while allowing long active generations to continue as heartbeat logs arrive.
+ *  Aborts immediately when `signal` fires (caller passes an AbortController it
+ *  cancels on unmount/sign-out). Throws on transport failure or timeout; an
+ *  `error` STATUS is a valid terminal result the caller renders. */
 export async function pollRun(
   runId: string,
   onUpdate: (state: RunState) => void,
-  options: { intervalMs?: number; maxElapsedMs?: number; signal?: AbortSignal } = {},
+  options: { intervalMs?: number; maxNoProgressMs?: number; signal?: AbortSignal } = {},
 ): Promise<RunState> {
   const intervalMs = options.intervalMs ?? 2000;
-  const maxElapsedMs = options.maxElapsedMs ?? POLL_MAX_ELAPSED_MS;
-  const deadline = Date.now() + maxElapsedMs;
+  const maxNoProgressMs = options.maxNoProgressMs ?? POLL_NO_PROGRESS_MS;
   for (;;) {
     const state = await getRun(runId, options.signal);
     onUpdate(state);
     if (state.status === "done" || state.status === "error") return state;
-    if (Date.now() + intervalMs >= deadline) {
+    const lastProgress = lastProgressAt(state);
+    if (Date.now() - lastProgress >= maxNoProgressMs) {
       throw new Error(
-        `run ${runId} did not finish within ${Math.round(maxElapsedMs / 60000)} min (last status: ${state.status})`,
+        `run ${runId} made no progress for ${Math.round(maxNoProgressMs / 60000)} min (last status: ${state.status})`,
       );
     }
     await abortableDelay(intervalMs, options.signal);
