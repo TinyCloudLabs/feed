@@ -11,9 +11,30 @@
   --ink-3: #7e7d78;
   --hairline: rgba(235, 234, 230, 0.14);
   --accent: #ff4f3d;
+  --soft-panel: rgba(235, 234, 230, 0.03);
+  --code-bg: rgba(235, 234, 230, 0.06);
+  --media-bg: #101a2d;
+  --media-stripe: rgba(235, 234, 230, 0.08);
+  --shadow-strong: rgba(0, 0, 0, 0.5);
   --serif: "Iowan Old Style", "New York", "Palatino", Georgia, serif;
   --sans: -apple-system, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
   --mono: "SF Mono", "JetBrains Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+
+html[data-theme="light"] {
+  --bg: #f7f5ef;
+  --ink: #1c1b19;
+  --ink-2: #56534d;
+  --ink-3: #8a857b;
+  --hairline: rgba(28, 27, 25, 0.16);
+  --accent: #dc3f30;
+  --soft-panel: rgba(28, 27, 25, 0.035);
+  --code-bg: rgba(28, 27, 25, 0.06);
+  --media-bg: #e7e2d8;
+  --media-stripe: rgba(28, 27, 25, 0.07);
+  --shadow-strong: rgba(28, 27, 25, 0.16);
+  color-scheme: light;
 }
 
 * {
@@ -107,6 +128,35 @@ button {
   justify-content: flex-end;
   gap: 4px 16px;
   flex: none;
+}
+
+.theme-toggle {
+  display: inline-grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin: 0 -10px;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: color 180ms ease-out;
+}
+
+.theme-toggle:hover,
+.theme-toggle:focus-visible {
+  color: var(--accent);
+  outline: none;
+}
+
+.theme-toggle svg {
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* active nav route: accent rule, no hover needed */
@@ -618,29 +668,48 @@ button.mono-chip::after {
 
 .hero {
   margin: 18px 0 0;
+  aspect-ratio: 16 / 10;
+  overflow: hidden;
+  border-radius: 3px;
+  border: 1px solid var(--hairline);
+  background: var(--media-bg);
 }
 
 .hero img {
   display: block;
   width: 100%;
-  aspect-ratio: 16 / 10;
+  height: 100%;
   object-fit: cover;
-  border-radius: 3px;
-  border: 1px solid var(--hairline);
 }
 
 .video-media {
   margin: 18px 0 0;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  border-radius: 3px;
+  border: 1px solid var(--hairline);
+  background: var(--media-bg);
 }
 
 .video-media video {
   display: block;
   width: 100%;
-  aspect-ratio: 1 / 1;
+  height: 100%;
   object-fit: cover;
   background: #000;
-  border-radius: 3px;
-  border: 1px solid var(--hairline);
+}
+
+.hero.is-loading,
+.video-media.is-loading {
+  background:
+    repeating-linear-gradient(
+      135deg,
+      transparent 0,
+      transparent 88px,
+      var(--media-stripe) 88px,
+      var(--media-stripe) 132px
+    ),
+    var(--media-bg);
 }
 
 .pull {
@@ -722,7 +791,7 @@ button.mono-chip::after {
 .card-body code {
   font-family: var(--mono);
   font-size: 0.88em;
-  background: rgba(235, 234, 230, 0.06);
+  background: var(--code-bg);
   padding: 0 3px;
   border-radius: 2px;
 }
@@ -790,6 +859,7 @@ button.tag::after {
   align-items: center;
   gap: 14px;
   margin-top: 16px;
+  min-height: 46px;
 }
 
 .audio-play {
@@ -813,6 +883,12 @@ button.tag::after {
   outline: none;
 }
 
+.audio-play:disabled {
+  color: var(--ink-3);
+  border-color: var(--hairline);
+  cursor: default;
+}
+
 .audio-track {
   flex: 1;
 }
@@ -826,6 +902,10 @@ button.tag::after {
   margin: -10px 0;
   background: transparent;
   cursor: pointer;
+}
+
+.audio-range:disabled {
+  cursor: default;
 }
 
 .audio-range::-webkit-slider-runnable-track {
@@ -868,6 +948,10 @@ button.tag::after {
   font-size: 10px;
   letter-spacing: 0.08em;
   color: var(--ink-3);
+}
+
+.audio.is-loading .audio-times {
+  opacity: 0.68;
 }
 
 /* ---- six-action footer: hairline-topped, quiet glyph+label ---- */
@@ -1096,7 +1180,7 @@ button.tag::after {
   background: var(--bg);
   border: 1px solid var(--hairline);
   border-radius: 3px;
-  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 6px 28px var(--shadow-strong);
 }
 
 .undo-toast-text {
@@ -1259,7 +1343,7 @@ button.tag::after {
   width: 100%;
   min-height: 50vh;
   padding: 14px;
-  background: rgba(235, 234, 230, 0.03);
+  background: var(--soft-panel);
   border: 1px solid var(--hairline);
   border-radius: 3px;
   color: var(--ink);
@@ -1499,7 +1583,7 @@ button.tag::after {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   cursor: pointer;
-  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.5);
+  box-shadow: 0 6px 28px var(--shadow-strong);
   animation: get-updates-in 220ms ease-out;
   transition: color 180ms ease-out, border-color 180ms ease-out;
 }

@@ -2,7 +2,10 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
 import { loadAgentConfig } from "./agentConfig.ts";
+import { applyTheme, readThemePreference } from "./theme.ts";
 import "./styles.css";
+
+applyTheme(readThemePreference());
 
 // Load the RUNTIME agent config (/agent-config.json) ONCE, BEFORE the first
 // render. This is the no-race guarantee: by the time any component mounts (and

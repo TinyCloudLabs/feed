@@ -104,6 +104,7 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
   const [url, setUrl] = useState<string | null>(null);
   const key = card.hero_image_key;
   useEffect(() => {
+    setUrl(null);
     if (!key) return;
     let alive = true;
     let acquired = false;
@@ -131,10 +132,10 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
     };
   }, [key, appsSpaceUri]);
 
-  if (!key || !url) return null;
+  if (!key) return null;
   return (
-    <figure className="hero">
-      <img src={url} alt="" loading="lazy" decoding="async" />
+    <figure className={`hero${url ? "" : " is-loading"}`} aria-busy={!url}>
+      {url && <img src={url} alt="" loading="lazy" decoding="async" />}
     </figure>
   );
 }
@@ -166,20 +167,22 @@ function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
     };
   }, [key, card.video_mime, card.video_url, appsSpaceUri]);
 
-  if (!url) {
+  if (!key && !url) {
     return <Hero card={card} appsSpaceUri={appsSpaceUri} />;
   }
   return (
-    <figure className="video-media">
-      <video
-        src={url}
-        autoPlay
-        loop
-        muted
-        controls
-        playsInline
-        preload="metadata"
-      />
+    <figure className={`video-media${url ? "" : " is-loading"}`} aria-busy={!url}>
+      {url && (
+        <video
+          src={url}
+          autoPlay
+          loop
+          muted
+          controls
+          playsInline
+          preload="metadata"
+        />
+      )}
     </figure>
   );
 }
@@ -227,7 +230,7 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
     };
   }, [key, card.audio_mime, appsSpaceUri]);
 
-  if (!key || !url) return null;
+  if (!key) return null;
 
   const toggle = () => {
     const el = audioRef.current;
@@ -249,10 +252,10 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
   };
 
   return (
-    <div className="audio">
+    <div className={`audio${url ? "" : " is-loading"}`} aria-busy={!url}>
       <audio
         ref={audioRef}
-        src={url}
+        src={url ?? undefined}
         preload="metadata"
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
@@ -264,6 +267,7 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
         type="button"
         className="audio-play"
         aria-label={playing ? "Pause podcast" : "Play podcast"}
+        disabled={!url}
         onClick={toggle}
       >
         <Glyph name={playing ? "pause" : "play"} size={18} />
@@ -277,7 +281,7 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
           step="0.1"
           value={Math.min(current, duration || current)}
           aria-label="Podcast playback position"
-          disabled={!duration}
+          disabled={!url || !duration}
           onChange={(e) => seek(e.currentTarget.value)}
         />
         <div className="audio-times" aria-hidden="true">
