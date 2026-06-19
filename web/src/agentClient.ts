@@ -71,6 +71,16 @@ export interface AgentInfo {
     transcriptCount: number;
     targetArtifacts: number;
     model: string;
+    media?: {
+      images?: {
+        enabled: boolean;
+        reason: string;
+      };
+      video?: {
+        enabled: boolean;
+        reason: string;
+      };
+    };
   };
   challenge?: string;
 }

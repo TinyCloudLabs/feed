@@ -306,6 +306,24 @@ function AgentInfoSection() {
               <span className="prefs-text">Model</span>
               <span className="prefs-evidence">{info.generation.model}</span>
             </li>
+            {info.generation.media?.images && (
+              <li className="learned">
+                <span className="prefs-text">Hero images</span>
+                <span className="prefs-evidence">
+                  {info.generation.media.images.enabled ? "Enabled" : "Disabled"} ·{" "}
+                  {info.generation.media.images.reason}
+                </span>
+              </li>
+            )}
+            {info.generation.media?.video && (
+              <li className="learned">
+                <span className="prefs-text">Video clips</span>
+                <span className="prefs-evidence">
+                  {info.generation.media.video.enabled ? "Enabled" : "Disabled"} ·{" "}
+                  {info.generation.media.video.reason}
+                </span>
+              </li>
+            )}
           </ul>
         </>
       )}
