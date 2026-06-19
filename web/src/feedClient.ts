@@ -95,6 +95,8 @@ function toCard(row: ArtifactRow): FeedCard {
     tags: parseJsonArray(row.tags),
     source_transcripts: parseJsonArray(row.source_transcripts),
     hero_image_key: row.hero_image_key,
+    audio_key: row.audio_key,
+    audio_mime: row.audio_mime,
     video_key: row.video_key,
     video_mime: row.video_mime,
     video_url: row.video_url,

@@ -56,8 +56,8 @@ export interface ArtifactRow {
 }
 
 /** Hydrated, render-ready card. Typed columns are authoritative; richer fields
- *  come from `raw` (the parsed `raw_artifact`); `hero_image_url` is a blob URL
- *  minted from the KV media bytes (or undefined when there's no hero). */
+ *  come from `raw` (the parsed `raw_artifact`); media URLs are blob URLs minted
+ *  from KV media bytes when a row carries a media key. */
 export interface FeedCard {
   id: string;
   type: string;
@@ -71,6 +71,8 @@ export interface FeedCard {
   source_transcripts: string[];
   hero_image_key: string | null;
   hero_image_url?: string;
+  audio_key: string | null;
+  audio_mime: string | null;
   video_key: string | null;
   video_mime: string | null;
   video_url: string | null;

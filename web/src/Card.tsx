@@ -1,6 +1,6 @@
 import { marked } from "marked";
 import DOMPurify from "dompurify";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { FeedCard, InteractionAction } from "./types.ts";
 import { typeLabel } from "./formats.ts";
 import { hydrateMedia, releaseMedia, recordInteraction } from "./feedClient.ts";
@@ -34,7 +34,7 @@ function firstParagraph(text: string): string {
 
 /* ---- glyphs: 1.6px-stroke outline icons in currentColor ---- */
 
-type GlyphName = InteractionAction | "arrow" | "back";
+type GlyphName = InteractionAction | "arrow" | "back" | "play" | "pause";
 
 export function Glyph({ name, size = 17 }: { name: GlyphName; size?: number }) {
   const paths: Record<GlyphName, ReactNode> = {
@@ -46,6 +46,8 @@ export function Glyph({ name, size = 17 }: { name: GlyphName; size?: number }) {
     promote: <path d="M7 17L17 7M9 7h8v8" />,
     arrow: <path d="M5 12h14M13 6l6 6-6 6" />,
     back: <path d="M19 12H5M11 18l-6-6 6-6" />,
+    play: <path d="M8 5v14l11-7-11-7z" />,
+    pause: <path d="M8 5v14M16 5v14" />,
   };
   return (
     <svg
@@ -179,6 +181,111 @@ function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
         preload="metadata"
       />
     </figure>
+  );
+}
+
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0:00";
+  const whole = Math.floor(seconds);
+  const mins = Math.floor(whole / 60);
+  const secs = whole % 60;
+  return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [current, setCurrent] = useState(0);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const key = card.audio_key;
+
+  useEffect(() => {
+    setUrl(null);
+    setPlaying(false);
+    setDuration(0);
+    setCurrent(0);
+    if (!key) return;
+    let alive = true;
+    let acquired = false;
+    hydrateMedia(appsSpaceUri, key, card.audio_mime ?? "audio/mp4")
+      .then((u) => {
+        if (!alive) {
+          if (u) releaseMedia(key);
+          return;
+        }
+        if (u) acquired = true;
+        setUrl(u);
+      })
+      .catch((e) => {
+        console.error(`audio hydrate failed (${key}):`, e);
+        if (alive) setUrl(null);
+      });
+    return () => {
+      alive = false;
+      if (acquired) releaseMedia(key);
+    };
+  }, [key, card.audio_mime, appsSpaceUri]);
+
+  if (!key || !url) return null;
+
+  const toggle = () => {
+    const el = audioRef.current;
+    if (!el) return;
+    if (el.paused) {
+      void el.play();
+    } else {
+      el.pause();
+    }
+  };
+
+  const seek = (value: string) => {
+    const el = audioRef.current;
+    if (!el) return;
+    const next = Number(value);
+    if (!Number.isFinite(next)) return;
+    el.currentTime = next;
+    setCurrent(next);
+  };
+
+  return (
+    <div className="audio">
+      <audio
+        ref={audioRef}
+        src={url}
+        preload="metadata"
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+        onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
+      />
+      <button
+        type="button"
+        className="audio-play"
+        aria-label={playing ? "Pause podcast" : "Play podcast"}
+        onClick={toggle}
+      >
+        <Glyph name={playing ? "pause" : "play"} size={18} />
+      </button>
+      <div className="audio-track">
+        <input
+          className="audio-range"
+          type="range"
+          min="0"
+          max={duration || 0}
+          step="0.1"
+          value={Math.min(current, duration || current)}
+          aria-label="Podcast playback position"
+          disabled={!duration}
+          onChange={(e) => seek(e.currentTarget.value)}
+        />
+        <div className="audio-times" aria-hidden="true">
+          <span>{formatTime(current)}</span>
+          <span>{formatTime(duration)}</span>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -408,6 +515,7 @@ export function Card({
       ) : (
         <Hero card={card} appsSpaceUri={appsSpaceUri} />
       )}
+      <AudioMedia card={card} appsSpaceUri={appsSpaceUri} />
       <QuoteBlock card={card} />
       {body && <Body text={body} />}
       {isArticle && card.body_md && (
@@ -449,6 +557,7 @@ export function FullCard({
       ) : (
         <Hero card={card} appsSpaceUri={appsSpaceUri} />
       )}
+      <AudioMedia card={card} appsSpaceUri={appsSpaceUri} />
       <QuoteBlock card={card} />
       {card.body_md && <Body text={card.body_md} />}
       {card.tags.length > 0 && (
