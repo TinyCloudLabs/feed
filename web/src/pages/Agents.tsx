@@ -126,6 +126,7 @@ function AgentsBody({
           startedAt: isoFromEpoch(state.startedAt) ?? new Date().toISOString(),
           finishedAt: isoFromEpoch(state.finishedAt),
           published: state.published,
+          held: state.held,
           media: state.media,
           error: state.error,
           log: state.log,
@@ -148,6 +149,7 @@ function AgentsBody({
                   status: state.status,
                   finishedAt: isoFromEpoch(state.finishedAt) ?? r.finishedAt,
                   published: state.published,
+                  held: state.held,
                   media: state.media,
                   error: state.error,
                   log: state.log,
@@ -161,6 +163,7 @@ function AgentsBody({
               startedAt: isoFromEpoch(state.startedAt) ?? new Date().toISOString(),
               finishedAt: isoFromEpoch(state.finishedAt),
               published: state.published,
+              held: state.held,
               media: state.media,
               error: state.error,
               log: state.log,
@@ -209,11 +212,12 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
     !build.building &&
     build.live?.status === "done" &&
     (build.live.published?.length ?? 0) === 0 &&
+    (build.live.held?.length ?? 0) === 0 &&
     !build.error;
-  const publishedDone =
+  const outcomeDone =
     !build.building &&
     build.live?.status === "done" &&
-    (build.live.published?.length ?? 0) > 0 &&
+    ((build.live.published?.length ?? 0) > 0 || (build.live.held?.length ?? 0) > 0) &&
     !build.error;
 
   return (
@@ -236,7 +240,7 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
           <RunLog log={build.live?.log} />
         </div>
       )}
-      {publishedDone && build.live && <LatestRunSummary state={build.live} />}
+      {outcomeDone && build.live && <LatestRunSummary state={build.live} />}
       {emptyDone && (
         <div className="feed-notice" role="status" style={{ marginTop: 14 }}>
           Finished, but no artifacts were published. Add transcripts to Listen, then generate again.
@@ -249,26 +253,15 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
 
 function LatestRunSummary({ state }: { state: RunState }) {
   const artifacts = state.published ?? [];
-  if (artifacts.length === 0) return null;
+  const held = state.held ?? [];
+  if (artifacts.length === 0 && held.length === 0) return null;
   return (
     <div className="latest-run-summary" role="status">
       <p className="gen-progress-meta">
-        Published · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media)}
+        Finished · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media, held.length)}
       </p>
-      <span className="run-published">
-        {artifacts.map((artifact) => (
-          <span key={`${artifact.type}/${artifact.slug}`} className="run-artifact">
-            <Link
-              to={{ kind: "article", slug: artifact.slug }}
-              className="tag"
-              aria-label={`Open ${artifact.slug}`}
-            >
-              {artifact.slug}
-            </Link>
-            <MediaBadges artifact={artifact} />
-          </span>
-        ))}
-      </span>
+      <RunPublished artifacts={artifacts} />
+      <RunHeld held={held} />
     </div>
   );
 }
@@ -559,22 +552,8 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
               {r.error ? ` · ${r.error}` : ""}
             </span>
             <RunLog log={r.log} />
-            {r.published?.length ? (
-              <span className="run-published">
-                {r.published.map((p) => (
-                  <span key={`${p.type}/${p.slug}`} className="run-artifact">
-                    <Link
-                      to={{ kind: "article", slug: p.slug }}
-                      className="tag"
-                      aria-label={`Open ${p.slug}`}
-                    >
-                      {p.slug}
-                    </Link>
-                    <MediaBadges artifact={p} />
-                  </span>
-                ))}
-              </span>
-            ) : null}
+            <RunPublished artifacts={r.published ?? []} />
+            <RunHeld held={r.held ?? []} />
           </li>
         ))}
       </ul>
@@ -584,19 +563,58 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
 
 function formatRunMediaSummary(run: RunRecord): string {
   const artifactCount = run.published?.length ?? 0;
-  if (run.status !== "done" && artifactCount === 0) return "";
-  return ` · ${formatRunResultSummary(artifactCount, run.media)}`;
+  const heldCount = run.held?.length ?? 0;
+  if (run.status !== "done" && artifactCount === 0 && heldCount === 0) return "";
+  return ` · ${formatRunResultSummary(artifactCount, run.media, heldCount)}`;
 }
 
-function formatRunResultSummary(artifactCount: number, media: RunRecord["media"]): string {
+function formatRunResultSummary(
+  artifactCount: number,
+  media: RunRecord["media"],
+  heldCount = 0,
+): string {
   const base = `${artifactCount} artifact${artifactCount === 1 ? "" : "s"}`;
-  if (!media) return base;
+  const held = heldCount > 0 ? ` · ${heldCount} held` : "";
+  if (!media) return `${base}${held}`;
   const parts = [
     media.heroImages > 0 ? `${media.heroImages} image${media.heroImages === 1 ? "" : "s"}` : null,
     media.audio > 0 ? `${media.audio} audio` : null,
     media.video > 0 ? `${media.video} video` : null,
   ].filter(Boolean);
-  return parts.length > 0 ? `${base} · ${parts.join(", ")}` : `${base} · no media`;
+  return parts.length > 0 ? `${base} · ${parts.join(", ")}${held}` : `${base} · no media${held}`;
+}
+
+function RunPublished({ artifacts }: { artifacts: NonNullable<RunRecord["published"]> }) {
+  if (artifacts.length === 0) return null;
+  return (
+    <span className="run-published">
+      {artifacts.map((artifact) => (
+        <span key={`${artifact.type}/${artifact.slug}`} className="run-artifact">
+          <Link
+            to={{ kind: "article", slug: artifact.slug }}
+            className="tag"
+            aria-label={`Open ${artifact.slug}`}
+          >
+            {artifact.slug}
+          </Link>
+          <MediaBadges artifact={artifact} />
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function RunHeld({ held }: { held: NonNullable<RunRecord["held"]> }) {
+  if (held.length === 0) return null;
+  return (
+    <span className="run-held">
+      {held.map((artifact) => (
+        <span key={`${artifact.type}/${artifact.slug}`} className="run-held-item">
+          held {artifact.type}/{artifact.slug}: {artifact.reason}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 function MediaBadges({ artifact }: { artifact: NonNullable<RunRecord["published"]>[number] }) {

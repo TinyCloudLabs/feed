@@ -1206,7 +1206,8 @@ button.tag::after {
 
 /* monospace DID, wraps on narrow viewports without breaking the layout */
 .agent-did,
-.run-published {
+.run-published,
+.run-held {
   display: block;
   margin: 6px 0 0;
   font-family: var(--mono);
@@ -1216,17 +1217,26 @@ button.tag::after {
   overflow-wrap: anywhere;
 }
 
-.run-published {
+.run-published,
+.run-held {
   display: flex;
   flex-wrap: wrap;
   gap: 4px 14px;
   margin-top: 6px;
 }
 
+.run-held {
+  color: var(--accent);
+}
+
 .run-artifact {
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
+}
+
+.run-held-item {
+  display: inline-block;
 }
 
 .run-media {

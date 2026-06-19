@@ -5,7 +5,7 @@
 //   GET  /agent/info           → { did, name, permissions[], challenge? }
 //   POST /agent/delegation     { serialized } → { ok, agentDid, delegationCid, spaceId, expiresAt }
 //   POST /agent/run            {} → { run_id, status: "queued" } or 409 run_in_progress { run_id }
-//   GET  /agent/run/:run_id    → { run_id, status, published?[], error? }
+//   GET  /agent/run/:run_id    → { run_id, status, published?[], held?[], error? }
 //
 // The user mints a delegation of AGENT_SCOPES to the agent's DID with the
 // signed-in session key (no extra wallet prompt — the recap already covers the
@@ -107,6 +107,12 @@ export interface PublishedArtifact {
   };
 }
 
+export interface HeldArtifact {
+  type: string;
+  slug: string;
+  reason: string;
+}
+
 export interface RunMediaSummary {
   heroImages: number;
   audio: number;
@@ -117,6 +123,7 @@ export interface RunState {
   run_id: string;
   status: RunStatus;
   published?: PublishedArtifact[];
+  held?: HeldArtifact[];
   media?: RunMediaSummary;
   error?: string;
   /** Epoch ms the run was enqueued. */
@@ -145,6 +152,7 @@ export interface RunSummary {
   /** Epoch ms the run reached a terminal state (absent while queued|running). */
   finishedAt?: number;
   published?: PublishedArtifact[];
+  held?: HeldArtifact[];
   media?: RunMediaSummary;
   error?: string;
   /** Bounded backend stage log tail. */
