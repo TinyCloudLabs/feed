@@ -71,6 +71,7 @@ export interface AgentInfo {
     transcriptCount: number;
     targetArtifacts: number;
     model: string;
+    mediaFocus?: "balanced" | "podcast" | "video";
     media?: {
       images?: {
         enabled: boolean;

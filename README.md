@@ -154,6 +154,12 @@ bun run artifact:dev:https
 # -> https://agent.feed.localhost:1355
 ```
 
+For a deliberate rich-media proof run, add `AGENT_MEDIA_FOCUS=podcast` to bias
+generation toward one real podcast/audio artifact when Gemini TTS is configured.
+Use `AGENT_MEDIA_FOCUS=video AGENT_ENABLE_VIDEO=1` only when `FAL_KEY` is
+configured and you intend to spend on a clip. The default `balanced` mode picks
+the strongest format for the material and should not force audio/video variety.
+
 Manual setup is still useful when debugging the two halves separately:
 
 ```sh

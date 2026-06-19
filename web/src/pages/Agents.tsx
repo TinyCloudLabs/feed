@@ -309,6 +309,12 @@ function AgentInfoSection() {
               <span className="prefs-text">Model</span>
               <span className="prefs-evidence">{info.generation.model}</span>
             </li>
+            {info.generation.mediaFocus && (
+              <li className="learned">
+                <span className="prefs-text">Media focus</span>
+                <span className="prefs-evidence">{info.generation.mediaFocus}</span>
+              </li>
+            )}
             {info.generation.media?.images && (
               <li className="learned">
                 <span className="prefs-text">Hero images</span>
