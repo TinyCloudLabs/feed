@@ -522,36 +522,50 @@ function qualityNotes(card: FeedCard): string | null {
   return rawString(quality?.notes);
 }
 
-function producerFields(card: FeedCard): string[] {
+type ProducerTrail = {
+  run: string[];
+  delegation: string[];
+};
+
+function firstRawString(record: Record<string, unknown>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = rawString(record[key]);
+    if (value) return value;
+  }
+  return null;
+}
+
+function producerTrail(card: FeedCard): ProducerTrail {
   const producer = rawRecord(card.raw.producer);
-  if (!producer) return [];
-  const fields = [
-    rawString(producer.pipeline),
-    rawString(producer.run_id) ? `run=${rawString(producer.run_id)}` : null,
-    rawString(producer.target_artifact_type)
-      ? `target=${rawString(producer.target_artifact_type)}`
-      : null,
-    rawString(producer.media_focus) ? `media=${rawString(producer.media_focus)}` : null,
-    rawString(producer.delegation_cid)
-      ? `delegation=${rawString(producer.delegation_cid)}`
-      : null,
-    rawString(producer.delegation_expires_at)
-      ? `expires=${rawString(producer.delegation_expires_at)}`
-      : null,
-    rawString(producer.delegated_space)
-      ? `space=${rawString(producer.delegated_space)}`
-      : null,
-    rawString(producer.published_by_agent_at)
-      ? `agent_publish=${rawString(producer.published_by_agent_at)}`
-      : null,
-  ];
-  return fields.filter((field): field is string => Boolean(field));
+  if (!producer) return { run: [], delegation: [] };
+  const runId = firstRawString(producer, "run_id", "runId");
+  const target = firstRawString(producer, "target_artifact_type", "targetArtifactType");
+  const mediaFocus = firstRawString(producer, "media_focus", "mediaFocus");
+  const publishedAt = firstRawString(producer, "published_by_agent_at", "publishedByAgentAt");
+  const delegationCid = firstRawString(producer, "delegation_cid", "delegationCid");
+  const delegationExpiresAt = firstRawString(producer, "delegation_expires_at", "delegationExpiresAt");
+  const delegatedSpace = firstRawString(producer, "delegated_space", "delegatedSpace");
+
+  return {
+    run: [
+      rawString(producer.pipeline),
+      runId ? `run=${runId}` : null,
+      target ? `target=${target}` : null,
+      mediaFocus ? `media=${mediaFocus}` : null,
+      publishedAt ? `agent_publish=${publishedAt}` : null,
+    ].filter((field): field is string => Boolean(field)),
+    delegation: [
+      delegationCid ? `cid=${delegationCid}` : null,
+      delegationExpiresAt ? `expires=${delegationExpiresAt}` : null,
+      delegatedSpace ? `space=${delegatedSpace}` : null,
+    ].filter((field): field is string => Boolean(field)),
+  };
 }
 
 function DataTrail({ card }: { card: FeedCard }) {
   const quotes = sourceQuotes(card);
   const notes = qualityNotes(card);
-  const producer = producerFields(card);
+  const producer = producerTrail(card);
   const sources = card.source_transcripts.map(fileLeaf);
   const mediaKeys = [
     card.hero_image_key ? `hero=${card.hero_image_key}` : null,
@@ -562,17 +576,24 @@ function DataTrail({ card }: { card: FeedCard }) {
     sources.length > 0 ? `${sources.length} source${sources.length === 1 ? "" : "s"}` : null,
     quotes.length > 0 ? `${quotes.length} quote${quotes.length === 1 ? "" : "s"}` : null,
     mediaKeys.length > 0 ? `${mediaKeys.length} media` : null,
-    producer.length > 0 ? "run" : null,
+    producer.run.length > 0 ? "run" : null,
+    producer.delegation.length > 0 ? "delegation" : null,
   ].filter(Boolean);
 
   return (
-    <details className="data-trail" open>
+    <details className="data-trail">
       <summary>Data trail{summaryBits.length > 0 ? ` · ${summaryBits.join(" · ")}` : ""}</summary>
       <div className="data-trail-body">
-        {producer.length > 0 && (
+        {producer.run.length > 0 && (
           <div className="data-row">
             <span>Run</span>
-            <p>{producer.join(" · ")}</p>
+            <p>{producer.run.join(" · ")}</p>
+          </div>
+        )}
+        {producer.delegation.length > 0 && (
+          <div className="data-row">
+            <span>Delegation</span>
+            <p>{producer.delegation.join(" · ")}</p>
           </div>
         )}
         <div className="data-row">
