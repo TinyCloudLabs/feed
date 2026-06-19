@@ -1246,6 +1246,17 @@ button.tag::after {
   margin-top: 26px;
 }
 
+.latest-run-summary {
+  margin: 14px 0 0;
+  padding: 12px 0;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.latest-run-summary .run-published {
+  margin-top: 8px;
+}
+
 .prefs-section-title {
   margin: 22px 0 6px;
   font-family: var(--mono);

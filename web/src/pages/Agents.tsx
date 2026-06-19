@@ -210,6 +210,11 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
     build.live?.status === "done" &&
     (build.live.published?.length ?? 0) === 0 &&
     !build.error;
+  const publishedDone =
+    !build.building &&
+    build.live?.status === "done" &&
+    (build.live.published?.length ?? 0) > 0 &&
+    !build.error;
 
   return (
     <section className="generate">
@@ -231,6 +236,7 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
           <RunLog log={build.live?.log} />
         </div>
       )}
+      {publishedDone && build.live && <LatestRunSummary state={build.live} />}
       {emptyDone && (
         <div className="feed-notice" role="status" style={{ marginTop: 14 }}>
           Finished, but no artifacts were published. Add transcripts to Listen, then generate again.
@@ -238,6 +244,32 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
       )}
       {build.error && <div className="feed-error" style={{ marginTop: 14 }}>{build.error}</div>}
     </section>
+  );
+}
+
+function LatestRunSummary({ state }: { state: RunState }) {
+  const artifacts = state.published ?? [];
+  if (artifacts.length === 0) return null;
+  return (
+    <div className="latest-run-summary" role="status">
+      <p className="gen-progress-meta">
+        Published · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media)}
+      </p>
+      <span className="run-published">
+        {artifacts.map((artifact) => (
+          <span key={`${artifact.type}/${artifact.slug}`} className="run-artifact">
+            <Link
+              to={{ kind: "article", slug: artifact.slug }}
+              className="tag"
+              aria-label={`Open ${artifact.slug}`}
+            >
+              {artifact.slug}
+            </Link>
+            <MediaBadges artifact={artifact} />
+          </span>
+        ))}
+      </span>
+    </div>
   );
 }
 
@@ -553,15 +585,18 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
 function formatRunMediaSummary(run: RunRecord): string {
   const artifactCount = run.published?.length ?? 0;
   if (run.status !== "done" && artifactCount === 0) return "";
+  return ` · ${formatRunResultSummary(artifactCount, run.media)}`;
+}
+
+function formatRunResultSummary(artifactCount: number, media: RunRecord["media"]): string {
   const base = `${artifactCount} artifact${artifactCount === 1 ? "" : "s"}`;
-  const media = run.media;
-  if (!media) return ` · ${base}`;
+  if (!media) return base;
   const parts = [
     media.heroImages > 0 ? `${media.heroImages} image${media.heroImages === 1 ? "" : "s"}` : null,
     media.audio > 0 ? `${media.audio} audio` : null,
     media.video > 0 ? `${media.video} video` : null,
   ].filter(Boolean);
-  return parts.length > 0 ? ` · ${base} · ${parts.join(", ")}` : ` · ${base} · no media`;
+  return parts.length > 0 ? `${base} · ${parts.join(", ")}` : `${base} · no media`;
 }
 
 function MediaBadges({ artifact }: { artifact: NonNullable<RunRecord["published"]>[number] }) {
