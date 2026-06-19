@@ -284,6 +284,31 @@ function AgentInfoSection() {
           <span className="prefs-evidence">{info.did}</span>
         </li>
       </ul>
+      {info.generation && (
+        <>
+          <h3>Generation</h3>
+          <ul>
+            <li className="learned">
+              <span className="prefs-text">Target artifacts</span>
+              <span className="prefs-evidence">
+                Up to {info.generation.targetArtifacts} publishable Feed artifact
+                {info.generation.targetArtifacts === 1 ? "" : "s"} per run
+              </span>
+            </li>
+            <li className="learned">
+              <span className="prefs-text">Transcript window</span>
+              <span className="prefs-evidence">
+                {info.generation.transcriptCount} Listen transcript
+                {info.generation.transcriptCount === 1 ? "" : "s"} per run
+              </span>
+            </li>
+            <li className="learned">
+              <span className="prefs-text">Model</span>
+              <span className="prefs-evidence">{info.generation.model}</span>
+            </li>
+          </ul>
+        </>
+      )}
       <h3>Requested permissions</h3>
       <ul>
         {info.permissions.map((p, i) => (

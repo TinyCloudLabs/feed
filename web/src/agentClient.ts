@@ -66,6 +66,12 @@ export interface AgentInfo {
   did: string;
   name: string;
   permissions: PermissionEntry[];
+  /** Optional generation settings exposed by newer Artifactory agents. */
+  generation?: {
+    transcriptCount: number;
+    targetArtifacts: number;
+    model: string;
+  };
   challenge?: string;
 }
 
