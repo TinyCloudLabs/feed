@@ -33,7 +33,7 @@ The app is a small path-routed SPA (`web/src/router.tsx`) with five routes:
 | Route | Page | What it does |
 | --- | --- | --- |
 | `/` | **Connect** | OpenKey sign-in, then `GET /agent/info`, `delegateTo(agentDid, scopes)`, `POST /agent/delegation`. Shows delegation status/expiry + re-grant. |
-| `/feed` | **Feed** | Artifact cards + More/Less/Save. Empty state links to `/agents`. |
+| `/feed` | **Feed** | Artifact cards + More/Less/Save. Each card has a collapsed **Data trail** with TinyCloud row metadata, media KV keys, source quotes/files, and quality notes. Empty state links to `/agents`. |
 | `/a/:slug` | **Artifact** | Full article detail. |
 | `/agents` | **Agents** | Delegation status, re-grant/revoke, **Generate** (`POST /agent/run` → poll `GET /agent/run/:id`), run history. |
 | `/preferences` | **Preferences** | Interaction history (the signal feeding server-side learned preferences). |
@@ -107,6 +107,13 @@ Space-scoped storage goes through `tcw.sqlForSpace(uri)` / `tcw.kvForSpace(uri)`
 by the row's `render_type` (`tweet` \| `article` in v1); richer fields come from
 the lossless `raw_artifact` JSON.
 
+The card **Data trail** intentionally exposes the operational trail for
+development: SQL row `id`, `slug`, schema version, `publisher_did`, media KV
+keys (`hero_image_key`, `audio_key`, `video_key`), approval/audience fields,
+source transcript file names, `quality.notes`, and `source_quotes` from
+`raw_artifact`. This is not a separate API; it renders data already present in
+the TinyCloud artifact row.
+
 ### Manual browser verification (owner sign-in)
 
 The one step that can't be automated headlessly is the passkey/wallet sign-in.
@@ -121,10 +128,9 @@ bun run dev          # https://feed.localhost
 2. Complete OpenKey/passkey sign-in **as the owner of the `applications` space**
    (the wallet that owns `xyz.tinycloud.artifacts`). The manifest requests
    `applications`-space `tinycloud.sql` + `tinycloud.kv` caps.
-3. The feed loads published artifacts newest-first. With the current live data
-   you should see **1 article** ("Why seat-based pricing punishes the customers
-   you most want to keep" — with a hydrated hero image) and **1 tweet** ("Seat
-   pricing taxes your power users").
+3. The feed loads published artifacts newest-first. Open **Data trail** at the
+   bottom of a card to inspect the TinyCloud row id, publisher DID, media KV
+   keys, source transcript files, quality notes, and verified quotes.
 4. **More / Less / Save** on a card writes an `interaction` row (nonce-protected)
    to `xyz.tinycloud.artifacts/interactions`; **Less** hides the card with an
    undo toast. Open an article via "Continue reading" to see the full view.
@@ -136,7 +142,19 @@ is verified against the live rows via the `tc` CLI owner session.
 
 For local generation, run a local distillery agent backend and point the feed at
 it. The feed must stay on HTTPS for OpenKey/WebAuthn; Portless provides the
-trusted local HTTPS URLs.
+trusted local HTTPS URLs. The easiest path is the sibling Artifactory launcher:
+
+```sh
+cd "../artifactory"
+AGENT_API_TOKEN=local-claude-dev \
+VITE_AGENT_TOKEN=local-claude-dev \
+PORTLESS_PORT=1355 \
+bun run artifact:dev:https
+# -> https://feed.localhost:1355
+# -> https://agent.feed.localhost:1355
+```
+
+Manual setup is still useful when debugging the two halves separately:
 
 ```sh
 # 1. Start the feed over HTTPS.
