@@ -51,7 +51,8 @@ startup (see "Repointing the agent" below), not from build-time env directly.
 If the browser still has a stored delegation ack but the agent backend restarted
 and returns `409 no_delegation` on `POST /agent/run`, Feed clears that local ack,
 re-posts a fresh delegation through the normal space/DID guards, and retries the
-run once before surfacing an error.
+run once before surfacing an error. That recovery is shown as a non-fatal run
+notice on both `/feed` and `/agents` so backend/session drift is visible.
 
 ### Environment + Cloudflare Pages
 

@@ -246,6 +246,11 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
           Finished, but no artifacts were published. Add transcripts to Listen, then generate again.
         </div>
       )}
+      {build.notice && (
+        <div className="feed-notice" role="status" style={{ marginTop: 14 }}>
+          {build.notice}
+        </div>
+      )}
       {build.error && <div className="feed-error" style={{ marginTop: 14 }}>{build.error}</div>}
     </section>
   );

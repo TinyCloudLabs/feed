@@ -42,6 +42,8 @@ export interface AgentBuild {
   live: RunState | null;
   /** A user-facing run failure / transport error (not an abort). */
   error: string | null;
+  /** Non-fatal run lifecycle visibility, e.g. stale delegation recovery. */
+  notice: string | null;
   /** Start a build, or ATTACH to one already active (no duplicate POST). */
   start: () => Promise<void>;
 }
@@ -65,6 +67,7 @@ export function useAgentBuild({
   const [building, setBuilding] = useState(false);
   const [live, setLive] = useState<RunState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   // Mirror the caller callbacks into refs so drivePoll / the mount effect / start
   // stay STABLE even when a caller passes inline (non-memoized) callbacks — e.g.
@@ -204,6 +207,7 @@ export function useAgentBuild({
     if (starting.current || building || activeRunId.current) return;
     starting.current = true;
     setError(null);
+    setNotice(null);
     const controller = new AbortController();
     pollAbort.current?.abort();
     pollAbort.current = controller;
@@ -259,6 +263,7 @@ export function useAgentBuild({
           // The browser can have a valid-looking ack while a restarted backend
           // has lost its active delegation. Drop the local ack, re-post a fresh
           // delegation through App's normal space/DID guards, then retry once.
+          setNotice("Agent delegation was stale after a backend restart; reconnected and retried.");
           clearStoredDelegation();
           await ensureDelegation();
           return await startRun();
@@ -291,5 +296,5 @@ export function useAgentBuild({
     }
   }, [building, drivePoll, ensureDelegation]);
 
-  return { building, live, error, start };
+  return { building, live, error, notice, start };
 }

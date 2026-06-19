@@ -175,6 +175,11 @@ export function FeedPage({
           Finished, but no artifacts were published. Add transcripts to Listen, then generate again.
         </div>
       )}
+      {build.notice && (
+        <div className="feed-notice" role="status">
+          {build.notice}
+        </div>
+      )}
       {/* Background auto-delegation failure (spec audit §4): non-blocking — the
           feed still reads fine; only Generate needs the delegation. Surface it
           here so a silent failure isn't invisible after sign-in lands on /feed,
