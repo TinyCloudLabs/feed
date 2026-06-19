@@ -9,6 +9,7 @@ import { loadInteractions } from "../feedClient.ts";
 import { Shell } from "../Nav.tsx";
 import type { InteractionRow } from "../types.ts";
 import type { Session } from "../session.ts";
+import { confidenceText, summarizePreferenceSignals } from "../preferenceSignals.ts";
 
 const ACTION_LABEL: Record<string, string> = {
   more: "More like this",
@@ -23,6 +24,7 @@ export function PreferencesPage({ session }: { session: Session }) {
   const [rows, setRows] = useState<InteractionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const summary = summarizePreferenceSignals(rows);
 
   useEffect(() => {
     let alive = true;
@@ -47,13 +49,39 @@ export function PreferencesPage({ session }: { session: Session }) {
     <Shell title="Preferences" sub="interaction history">
       <div className="prefs">
         <section className="prefs-section">
-          <h3>Learned preferences</h3>
+          <h3>Signal summary</h3>
           <p className="prefs-note">
-            Learned preferences are distilled server-side from your interactions
-            and shape what the agent generates. They&rsquo;ll appear here once the
-            preferences store lands; for now your interaction history below is the
-            signal driving it.
+            Feed captures these interactions; Artifactory reads them before the
+            next run as weak backpressure. Early feedback is noisy, so the agent
+            preserves exploration until signals repeat.
           </p>
+          {!loading && !error && rows.length > 0 && (
+            <div className="signal-summary">
+              <div className="signal-summary-head">
+                <strong>{confidenceText(summary.confidence)}</strong>
+                <span>
+                  {summary.total} event{summary.total === 1 ? "" : "s"} ·{" "}
+                  {summary.positive} positive · {summary.negative} suppressive
+                  {summary.notes > 0 ? ` · ${summary.notes} note${summary.notes === 1 ? "" : "s"}` : ""}
+                </span>
+              </div>
+              {summary.actionLines.length > 0 && (
+                <p className="signal-line">{summary.actionLines.join(" · ")}</p>
+              )}
+              {summary.typeSignals.length > 0 && (
+                <ul className="signal-types" aria-label="Artifact type signals">
+                  {summary.typeSignals.slice(0, 5).map((signal) => (
+                    <li key={signal.artifactType}>
+                      <span>{signal.artifactType}</span>
+                      <span>
+                        +{signal.positive} / -{signal.negative} · {signal.total}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </section>
 
         <section className="prefs-section">

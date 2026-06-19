@@ -1155,6 +1155,62 @@ button.tag::after {
   color: var(--ink-3);
 }
 
+.signal-summary {
+  margin-top: 16px;
+  padding: 12px 0;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.signal-summary-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.signal-summary-head strong {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.signal-line {
+  margin: 10px 0 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+}
+
+.signal-types {
+  display: grid;
+  gap: 0;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.signal-types li {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--hairline);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-2);
+}
+
+.signal-types li:last-child {
+  border-bottom: none;
+}
+
 .prefs-actions {
   display: flex;
   gap: 22px;

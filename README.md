@@ -36,7 +36,7 @@ The app is a small path-routed SPA (`web/src/router.tsx`) with five routes:
 | `/feed` | **Feed** | Composed artifact cards + More/Less/Save. Each card has an expanded **Data trail** with TinyCloud row metadata, producer run/delegation provenance, media KV keys, source quotes/files, and quality notes. Empty state links to `/agents`. |
 | `/a/:slug` | **Artifact** | Full article detail. |
 | `/agents` | **Agents** | Delegation status, re-grant/revoke, **Generate** (`POST /agent/run` → poll `GET /agent/run/:id`), run history. |
-| `/preferences` | **Preferences** | Interaction history (the signal feeding server-side learned preferences). |
+| `/preferences` | **Preferences** | Weak-signal summary plus interaction history (the signal Artifactory reads before generation). |
 
 The user delegates **Listen-read + artifacts-read/write** to a stable agent
 `did:pkh` (`web/src/tinycloud.ts` `AGENT_SCOPES`). The broadened sign-in manifest
@@ -126,6 +126,12 @@ artifact stays first; after that, the composer picks from a small recency window
 to reduce same-type/source/run clumps and to surface media variety when it is
 available. This is deterministic and local to the viewer: TinyCloud remains the
 durable chronological store, while Feed gets a fresher first page.
+
+The Preferences page summarizes the same interaction rows with
+`summarizePreferenceSignals` (`web/src/preferenceSignals.ts`). It labels sparse
+feedback as an early signal, only marks it directional after repeated aligned
+evidence, and keeps the raw interaction history visible so the user can inspect
+what Artifactory will treat as weak-prior generation backpressure.
 
 Checks:
 
