@@ -11,6 +11,7 @@
 
 import type { IDatabaseHandle, IKVService } from "@tinycloud/sdk-services";
 import { tcw, FEED_DB, INTERACTIONS_DB } from "./tinycloud.ts";
+import { composeFeed } from "./feedComposition.ts";
 import type {
   ArtifactRow,
   FeedCard,
@@ -137,19 +138,21 @@ export async function loadFeed(
   limit = 50,
   offset = 0,
 ): Promise<FeedCard[]> {
+  const readLimit = offset === 0 ? Math.min(Math.max(limit * 3, limit), 150) : limit;
   const db = spaceSql(appsSpaceUri).db(FEED_DB);
   const res = await db.query<unknown>(
     `SELECT ${COLUMNS} FROM artifact ` +
       `WHERE render_type IN ('tweet','article','video') ` +
       `ORDER BY published_at DESC LIMIT ? OFFSET ?`,
-    [limit, offset],
+    [readLimit, offset],
   );
   if (!res.ok) {
     if (isMissingTable(res.error.message)) return [];
     throw new Error(`feed read failed: ${res.error.message}`);
   }
   const rows = zipRows<ArtifactRow>(res.data.columns, res.data.rows);
-  return rows.map(toCard);
+  const cards = rows.map(toCard);
+  return offset === 0 ? composeFeed(cards, limit) : cards;
 }
 
 // ── media hydration ──────────────────────────────────────────────────────────

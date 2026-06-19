@@ -17,5 +17,6 @@
     "noEmit": true,
     "types": ["vite/client"]
   },
-  "include": ["web/src"]
+  "include": ["web/src"],
+  "exclude": ["web/src/**/*.test.ts"]
 }

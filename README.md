@@ -33,7 +33,7 @@ The app is a small path-routed SPA (`web/src/router.tsx`) with five routes:
 | Route | Page | What it does |
 | --- | --- | --- |
 | `/` | **Connect** | OpenKey sign-in, then `GET /agent/info`, `delegateTo(agentDid, scopes)`, `POST /agent/delegation`. Shows delegation status/expiry + re-grant. |
-| `/feed` | **Feed** | Artifact cards + More/Less/Save. Each card has an expanded **Data trail** with TinyCloud row metadata, producer run/delegation provenance, media KV keys, source quotes/files, and quality notes. Empty state links to `/agents`. |
+| `/feed` | **Feed** | Composed artifact cards + More/Less/Save. Each card has an expanded **Data trail** with TinyCloud row metadata, producer run/delegation provenance, media KV keys, source quotes/files, and quality notes. Empty state links to `/agents`. |
 | `/a/:slug` | **Artifact** | Full article detail. |
 | `/agents` | **Agents** | Delegation status, re-grant/revoke, **Generate** (`POST /agent/run` → poll `GET /agent/run/:id`), run history. |
 | `/preferences` | **Preferences** | Interaction history (the signal feeding server-side learned preferences). |
@@ -120,6 +120,20 @@ approval/audience fields, source transcript file names, `quality.notes`, and
 `source_quotes` from `raw_artifact`. This is not a separate API; it renders data
 already present in the TinyCloud artifact row.
 
+Feed reads newest-first rows from TinyCloud, but the visible page is passed
+through `composeFeed` (`web/src/feedComposition.ts`) before render. The newest
+artifact stays first; after that, the composer picks from a small recency window
+to reduce same-type/source/run clumps and to surface media variety when it is
+available. This is deterministic and local to the viewer: TinyCloud remains the
+durable chronological store, while Feed gets a fresher first page.
+
+Checks:
+
+```sh
+bun run test
+bun run typecheck
+```
+
 ### Manual browser verification (owner sign-in)
 
 The one step that can't be automated headlessly is the passkey/wallet sign-in.
@@ -134,9 +148,10 @@ bun run dev          # https://feed.localhost
 2. Complete OpenKey/passkey sign-in **as the owner of the `applications` space**
    (the wallet that owns `xyz.tinycloud.artifacts`). The manifest requests
    `applications`-space `tinycloud.sql` + `tinycloud.kv` caps.
-3. The feed loads published artifacts newest-first. Open **Data trail** at the
-   bottom of a card to inspect the TinyCloud row id, publisher DID, media KV
-   keys, source transcript files, quality notes, and verified quotes.
+3. The feed loads published artifacts and composes the first page from a bounded
+   newest-first window. Open **Data trail** at the bottom of a card to inspect
+   the TinyCloud row id, publisher DID, run provenance, media KV keys, source
+   transcript files, quality notes, and verified quotes.
 4. **More / Less / Save** on a card writes an `interaction` row (nonce-protected)
    to `xyz.tinycloud.artifacts/interactions`; **Less** hides the card with an
    undo toast. Open an article via "Continue reading" to see the full view.
