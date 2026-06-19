@@ -60,6 +60,17 @@ export class AgentDidMismatchError extends Error {
   }
 }
 
+/** Thrown when the backend has no active delegation even though the browser may
+ *  have a locally stored delegation ack. This commonly happens after an agent
+ *  backend restart; callers should clear the local ack, re-post a fresh
+ *  delegation, and retry POST /agent/run once. */
+export class AgentNoDelegationError extends Error {
+  constructor(message = "No delegation granted yet. POST /agent/delegation first.") {
+    super(message);
+    this.name = "AgentNoDelegationError";
+  }
+}
+
 // ── contract response shapes ─────────────────────────────────────────────────
 
 export interface AgentInfo {
@@ -450,6 +461,9 @@ export async function startRun(): Promise<StartRunResult> {
       throw new Error(error.message ?? `agent run lock is held by ${error.run_id}`);
     }
     return { run_id: error.run_id, status: "running", attached: true };
+  }
+  if (res.status === 409 && error?.code === "no_delegation") {
+    throw new AgentNoDelegationError(error.message);
   }
 
   throw new Error(

@@ -21,10 +21,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AgentNoDelegationError,
   agentConfigured,
+  clearStoredDelegation,
   getActiveRun,
   pollRun,
   startRun,
+  type StartRunResult,
   type RunState,
 } from "./agentClient.ts";
 
@@ -248,7 +251,21 @@ export function useAgentBuild({
         await drivePoll(stillActive.run_id, controller);
         return;
       }
-      const { run_id, status, attached } = await startRun();
+      const startWithDelegationRecovery = async (): Promise<StartRunResult> => {
+        try {
+          return await startRun();
+        } catch (e) {
+          if (!(e instanceof AgentNoDelegationError)) throw e;
+          // The browser can have a valid-looking ack while a restarted backend
+          // has lost its active delegation. Drop the local ack, re-post a fresh
+          // delegation through App's normal space/DID guards, then retry once.
+          clearStoredDelegation();
+          await ensureDelegation();
+          return await startRun();
+        }
+      };
+
+      const { run_id, status, attached } = await startWithDelegationRecovery();
       // startRun() isn't abortable, so the POST can complete AFTER an unmount/
       // sign-out. Guard before touching state or entering drivePoll, so we don't
       // setLive / fire onRunStarted / start a poll on a torn-down component. (The
