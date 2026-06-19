@@ -33,7 +33,7 @@ The app is a small path-routed SPA (`web/src/router.tsx`) with five routes:
 | Route | Page | What it does |
 | --- | --- | --- |
 | `/` | **Connect** | OpenKey sign-in, then `GET /agent/info`, `delegateTo(agentDid, scopes)`, `POST /agent/delegation`. Shows delegation status/expiry + re-grant. |
-| `/feed` | **Feed** | Artifact cards + More/Less/Save. Each card has a collapsed **Data trail** with TinyCloud row metadata, media KV keys, source quotes/files, and quality notes. Empty state links to `/agents`. |
+| `/feed` | **Feed** | Artifact cards + More/Less/Save. Each card has an expanded **Data trail** with TinyCloud row metadata, producer run/delegation provenance, media KV keys, source quotes/files, and quality notes. Empty state links to `/agents`. |
 | `/a/:slug` | **Artifact** | Full article detail. |
 | `/agents` | **Agents** | Delegation status, re-grant/revoke, **Generate** (`POST /agent/run` → poll `GET /agent/run/:id`), run history. |
 | `/preferences` | **Preferences** | Interaction history (the signal feeding server-side learned preferences). |
@@ -113,11 +113,12 @@ by the row's `render_type` (`tweet` \| `article` in v1); richer fields come from
 the lossless `raw_artifact` JSON.
 
 The card **Data trail** intentionally exposes the operational trail for
-development: SQL row `id`, `slug`, schema version, `publisher_did`, media KV
-keys (`hero_image_key`, `audio_key`, `video_key`), approval/audience fields,
-source transcript file names, `quality.notes`, and `source_quotes` from
-`raw_artifact`. This is not a separate API; it renders data already present in
-the TinyCloud artifact row.
+development: SQL row `id`, `slug`, schema version, `publisher_did`, producer
+`run_id`, delegated space, delegation CID/expiry, target artifact type, media
+focus, media KV keys (`hero_image_key`, `audio_key`, `video_key`),
+approval/audience fields, source transcript file names, `quality.notes`, and
+`source_quotes` from `raw_artifact`. This is not a separate API; it renders data
+already present in the TinyCloud artifact row.
 
 ### Manual browser verification (owner sign-in)
 

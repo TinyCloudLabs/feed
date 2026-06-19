@@ -522,20 +522,59 @@ function qualityNotes(card: FeedCard): string | null {
   return rawString(quality?.notes);
 }
 
+function producerFields(card: FeedCard): string[] {
+  const producer = rawRecord(card.raw.producer);
+  if (!producer) return [];
+  const fields = [
+    rawString(producer.pipeline),
+    rawString(producer.run_id) ? `run=${rawString(producer.run_id)}` : null,
+    rawString(producer.target_artifact_type)
+      ? `target=${rawString(producer.target_artifact_type)}`
+      : null,
+    rawString(producer.media_focus) ? `media=${rawString(producer.media_focus)}` : null,
+    rawString(producer.delegation_cid)
+      ? `delegation=${rawString(producer.delegation_cid)}`
+      : null,
+    rawString(producer.delegation_expires_at)
+      ? `expires=${rawString(producer.delegation_expires_at)}`
+      : null,
+    rawString(producer.delegated_space)
+      ? `space=${rawString(producer.delegated_space)}`
+      : null,
+    rawString(producer.published_by_agent_at)
+      ? `agent_publish=${rawString(producer.published_by_agent_at)}`
+      : null,
+  ];
+  return fields.filter((field): field is string => Boolean(field));
+}
+
 function DataTrail({ card }: { card: FeedCard }) {
   const quotes = sourceQuotes(card);
   const notes = qualityNotes(card);
+  const producer = producerFields(card);
   const sources = card.source_transcripts.map(fileLeaf);
   const mediaKeys = [
     card.hero_image_key ? `hero=${card.hero_image_key}` : null,
     card.audio_key ? `audio=${card.audio_key}` : null,
     card.video_key ? `video=${card.video_key}` : null,
   ].filter(Boolean);
+  const summaryBits = [
+    sources.length > 0 ? `${sources.length} source${sources.length === 1 ? "" : "s"}` : null,
+    quotes.length > 0 ? `${quotes.length} quote${quotes.length === 1 ? "" : "s"}` : null,
+    mediaKeys.length > 0 ? `${mediaKeys.length} media` : null,
+    producer.length > 0 ? "run" : null,
+  ].filter(Boolean);
 
   return (
-    <details className="data-trail">
-      <summary>Data trail</summary>
+    <details className="data-trail" open>
+      <summary>Data trail{summaryBits.length > 0 ? ` · ${summaryBits.join(" · ")}` : ""}</summary>
       <div className="data-trail-body">
+        {producer.length > 0 && (
+          <div className="data-row">
+            <span>Run</span>
+            <p>{producer.join(" · ")}</p>
+          </div>
+        )}
         <div className="data-row">
           <span>TinyCloud</span>
           <p>
