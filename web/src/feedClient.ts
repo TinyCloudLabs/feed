@@ -100,11 +100,16 @@ function toCard(row: ArtifactRow): FeedCard {
     video_key: row.video_key,
     video_mime: row.video_mime,
     video_url: row.video_url,
+    audience: row.audience,
+    approval_status: row.approval_status,
+    platform: row.platform,
     generation_model: row.generation_model,
     critic_pass: row.critic_pass === 1,
     quotes_verified: row.quotes_verified === 1,
     generated_at: row.generated_at,
     published_at: row.published_at,
+    publisher_did: row.publisher_did,
+    schema_version: row.schema_version,
     raw,
   };
 }

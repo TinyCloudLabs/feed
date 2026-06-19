@@ -76,11 +76,16 @@ export interface FeedCard {
   video_key: string | null;
   video_mime: string | null;
   video_url: string | null;
+  audience: string | null;
+  approval_status: string;
+  platform: string | null;
   generation_model: string | null;
   critic_pass: boolean;
   quotes_verified: boolean;
   generated_at: string;
   published_at: string;
+  publisher_did: string;
+  schema_version: number;
   /** The full lossless Artifact JSON, for fields not promoted to columns. */
   raw: Record<string, unknown>;
 }
