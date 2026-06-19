@@ -16,6 +16,49 @@ import { AgentsPage } from "./pages/Agents.tsx";
 import { PreferencesPage } from "./pages/Preferences.tsx";
 
 const UNDO_MS = 8000;
+const SCHEMA_BOOTSTRAP_ATTEMPTS = 3;
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function transientSchemaBootstrapError(e: unknown): boolean {
+  const message = e instanceof Error ? e.message : String(e);
+  return /connection pool timed out|failed to acquire connection|internal error/i.test(message);
+}
+
+async function bootstrapSchemaWithRetry(
+  appsSpaceUri: string,
+  onEvent: (event: Record<string, unknown>) => void,
+): Promise<{ skippedIndexes: string[] }> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SCHEMA_BOOTSTRAP_ATTEMPTS; attempt++) {
+    const started = performance.now();
+    onEvent({ stage: "schema-bootstrap-attempt", attempt, elapsedMs: 0 });
+    try {
+      const result = await bootstrapSchema(appsSpaceUri);
+      onEvent({
+        stage: "schema-bootstrap-result",
+        attempt,
+        elapsedMs: Math.round(performance.now() - started),
+        skippedIndexes: result.skippedIndexes.length,
+      });
+      return result;
+    } catch (e) {
+      lastError = e;
+      const retryable = transientSchemaBootstrapError(e);
+      onEvent({
+        stage: retryable ? "schema-bootstrap-retryable-error" : "schema-bootstrap-failed",
+        attempt,
+        elapsedMs: Math.round(performance.now() - started),
+        message: e instanceof Error ? e.message : String(e),
+      });
+      if (!retryable || attempt === SCHEMA_BOOTSTRAP_ATTEMPTS) break;
+      await wait(750 * attempt);
+    }
+  }
+  throw lastError;
+}
 
 function restoreStageLabel(trace: SessionRestoreTrace): string {
   switch (trace.stage) {
@@ -220,25 +263,27 @@ export function App() {
           // Do not hold the whole app on idempotent schema bootstrap after the
           // session is already restored. Run it in the background, log timing,
           // and refresh the feed when it completes.
-          const bootstrapStarted = performance.now();
           console.info("[TinyFeed restore]", { stage: "schema-bootstrap-start", elapsedMs: 0 });
-          bootstrapSchema(restored.appsSpaceUri)
-            .then(({ skippedIndexes }) => {
-              console.info("[TinyFeed restore]", {
-                stage: "schema-bootstrap-result",
-                elapsedMs: Math.round(performance.now() - bootstrapStarted),
-                skippedIndexes: skippedIndexes.length,
-              });
+          bootstrapSchemaWithRetry(restored.appsSpaceUri, (event) => {
+            console.info("[TinyFeed restore]", event);
+          })
+            .then(() => {
               bumpFeedRefresh();
             })
             .catch((e) => {
+              const retryable = transientSchemaBootstrapError(e);
               console.warn("[TinyFeed restore]", {
-                stage: "schema-bootstrap-failed",
-                elapsedMs: Math.round(performance.now() - bootstrapStarted),
+                stage: retryable ? "schema-bootstrap-deferred" : "schema-bootstrap-failed",
                 message: e instanceof Error ? e.message : String(e),
               });
               if (!cancelled) {
-                setRestoreError(e instanceof Error ? e.message : String(e));
+                setRestoreError(
+                  retryable
+                    ? "TinyCloud schema setup is busy; feed reads still work, and setup will retry on refresh."
+                    : e instanceof Error
+                      ? e.message
+                      : String(e),
+                );
               }
             });
           ensureAgentDelegation(restored.appsSpaceUri).catch(() => {});
