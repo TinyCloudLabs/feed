@@ -77,6 +77,10 @@ export interface AgentInfo {
         enabled: boolean;
         reason: string;
       };
+      audio?: {
+        enabled: boolean;
+        reason: string;
+      };
       video?: {
         enabled: boolean;
         reason: string;

@@ -349,6 +349,15 @@ function AgentInfoSection() {
                 </span>
               </li>
             )}
+            {info.generation.media?.audio && (
+              <li className="learned">
+                <span className="prefs-text">Podcast audio</span>
+                <span className="prefs-evidence">
+                  {info.generation.media.audio.enabled ? "Enabled" : "Disabled"} ·{" "}
+                  {info.generation.media.audio.reason}
+                </span>
+              </li>
+            )}
             {info.generation.media?.video && (
               <li className="learned">
                 <span className="prefs-text">Video clips</span>
