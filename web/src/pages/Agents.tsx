@@ -525,14 +525,16 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
             {r.published?.length ? (
               <span className="run-published">
                 {r.published.map((p) => (
-                  <Link
-                    key={p.slug}
-                    to={{ kind: "article", slug: p.slug }}
-                    className="tag"
-                    aria-label={`Open ${p.slug}`}
-                  >
-                    {p.slug}
-                  </Link>
+                  <span key={`${p.type}/${p.slug}`} className="run-artifact">
+                    <Link
+                      to={{ kind: "article", slug: p.slug }}
+                      className="tag"
+                      aria-label={`Open ${p.slug}`}
+                    >
+                      {p.slug}
+                    </Link>
+                    <MediaBadges artifact={p} />
+                  </span>
                 ))}
               </span>
             ) : null}
@@ -541,6 +543,18 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
       </ul>
     </section>
   );
+}
+
+function MediaBadges({ artifact }: { artifact: NonNullable<RunRecord["published"]>[number] }) {
+  const media = artifact.media;
+  if (!media) return null;
+  const badges = [
+    media.heroImage ? "image" : null,
+    media.audio ? "audio" : null,
+    media.video ? "video" : null,
+  ].filter(Boolean);
+  if (badges.length === 0) return <span className="run-media muted">no media</span>;
+  return <span className="run-media">{badges.join(" · ")}</span>;
 }
 
 function isoFromEpoch(value: number | undefined): string | undefined {

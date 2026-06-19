@@ -99,6 +99,11 @@ export type RunStatus = "queued" | "running" | "done" | "error";
 export interface PublishedArtifact {
   type: string;
   slug: string;
+  media?: {
+    heroImage: boolean;
+    audio: boolean;
+    video: boolean;
+  };
 }
 
 export interface RunState {

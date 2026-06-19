@@ -1147,6 +1147,20 @@ button.tag::after {
   margin-top: 6px;
 }
 
+.run-artifact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.run-media {
+  color: var(--ink-3);
+}
+
+.run-media.muted {
+  color: color-mix(in srgb, var(--ink-3) 70%, transparent);
+}
+
 .connect-heading {
   margin-top: 26px;
   text-align: left;
