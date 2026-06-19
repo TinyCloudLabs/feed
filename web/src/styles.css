@@ -458,6 +458,39 @@ button.mono-chip::after {
   margin-top: 8px;
 }
 
+.restore-trace {
+  width: min(520px, 100%);
+  margin: 18px auto 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+
+.restore-trace summary {
+  cursor: pointer;
+  text-transform: uppercase;
+}
+
+.restore-trace ol {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.restore-trace li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  column-gap: 18px;
+  border-bottom: 1px solid var(--hairline);
+  padding-bottom: 8px;
+}
+
 .feed-error {
   padding: 14px 0;
   border-bottom: 1px solid var(--hairline);

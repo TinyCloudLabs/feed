@@ -61,6 +61,7 @@ export function FeedPage({
   ensureDelegation,
   onFeedRefresh,
   agentError,
+  sessionError,
 }: {
   session: Session;
   hidden: ReadonlySet<string>;
@@ -76,6 +77,8 @@ export function FeedPage({
    *  here directly, so without this a silent failure would be invisible until the
    *  user opened Agents / clicked Generate. Rendered as a non-blocking notice. */
   agentError?: string | null;
+  /** Background restored-session setup failure, e.g. schema bootstrap. */
+  sessionError?: string | null;
 }) {
   const [cards, setCards] = useState<FeedCard[]>([]);
   const [loading, setLoading] = useState(true);
@@ -169,6 +172,7 @@ export function FeedPage({
       )}
 
       {error && <div className="feed-error">{error}</div>}
+      {sessionError && <div className="feed-error">{sessionError}</div>}
       {build.error && <div className="feed-error">{build.error}</div>}
       {emptyDone && (
         <div className="feed-notice" role="status">

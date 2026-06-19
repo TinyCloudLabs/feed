@@ -158,6 +158,25 @@ const AGENT_MANIFEST: Manifest | null = AGENT_DID
 
 let instance: TinyCloudWeb | null = null;
 
+export type SessionRestoreTrace = {
+  stage: string;
+  elapsedMs: number;
+  status?: string;
+  hasAddress?: boolean;
+};
+
+type SessionRestoreTraceSink = (trace: SessionRestoreTrace) => void;
+
+function restoreTracer(onTrace?: SessionRestoreTraceSink): SessionRestoreTraceSink {
+  const started = performance.now();
+  return (trace) => {
+    const elapsedMs = Math.round(performance.now() - started);
+    const event = { ...trace, elapsedMs };
+    onTrace?.(event);
+    console.info("[TinyFeed restore]", event);
+  };
+}
+
 /** The signed-in singleton. Throws before `signIn()` — every read/write path
  *  runs inside an active session, so an absent instance is a bug, not a state
  *  to paper over. */
@@ -234,15 +253,24 @@ export async function signIn(): Promise<{ appsSpaceUri: string; readerDid: strin
  *  nothing to restore (missing/expired). A CORRUPT or unexpected-failure status
  *  throws — we don't paper over a real restore failure (standing rule), we
  *  surface it and let the caller fall back to sign-in. */
-export async function restoreSession(): Promise<{ appsSpaceUri: string; readerDid: string } | null> {
+export async function restoreSession(
+  onTrace?: SessionRestoreTraceSink,
+): Promise<{ appsSpaceUri: string; readerDid: string } | null> {
+  const trace = restoreTracer(onTrace);
+  trace({ stage: "read-address", elapsedMs: 0 });
   const address = lastSignedInAddress();
+  trace({ stage: "address-result", elapsedMs: 0, hasAddress: Boolean(address) });
   if (!address) return null;
   const t = new TinyCloudWeb(buildConfig());
+  trace({ stage: "sdk-created", elapsedMs: 0 });
+  trace({ stage: "sdk-restore-start", elapsedMs: 0 });
   const result = await t.restoreSession(address);
+  trace({ stage: "sdk-restore-result", elapsedMs: 0, status: result.status });
   if (result.status === "restored") {
     instance = t;
     const appsSpaceUri = t.space("applications").id;
     const readerDid = t.did;
+    trace({ stage: "space-ready", elapsedMs: 0 });
     return { appsSpaceUri, readerDid };
   }
   // Nothing to restore: clear the stale address pointer so we don't keep trying.
@@ -252,10 +280,12 @@ export async function restoreSession(): Promise<{ appsSpaceUri: string; readerDi
     } catch {
       // ignore
     }
+    trace({ stage: "stale-address-cleared", elapsedMs: 0, status: result.status });
     return null;
   }
   // corrupt / restore-failed / storage-unavailable / disabled: a real problem —
   // surface it rather than silently falling back.
+  trace({ stage: "restore-failed", elapsedMs: 0, status: result.status });
   throw result.error ?? new Error(`session restore failed: ${result.status}`);
 }
 

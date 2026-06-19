@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { restoreSession, signOut } from "./tinycloud.ts";
+import { restoreSession, signOut, type SessionRestoreTrace } from "./tinycloud.ts";
 import {
   agentConfigured,
   clearStoredDelegation,
@@ -17,6 +17,29 @@ import { PreferencesPage } from "./pages/Preferences.tsx";
 
 const UNDO_MS = 8000;
 
+function restoreStageLabel(trace: SessionRestoreTrace): string {
+  switch (trace.stage) {
+    case "read-address":
+      return "Checking saved sign-in";
+    case "address-result":
+      return trace.hasAddress ? "Saved sign-in found" : "No saved sign-in";
+    case "sdk-created":
+      return "Preparing TinyCloud session";
+    case "sdk-restore-start":
+      return "Restoring TinyCloud session";
+    case "sdk-restore-result":
+      return trace.status ? `TinyCloud restore: ${trace.status}` : "TinyCloud restore finished";
+    case "space-ready":
+      return "Applications space ready";
+    case "stale-address-cleared":
+      return trace.status ? `Cleared stale saved sign-in: ${trace.status}` : "Cleared stale saved sign-in";
+    case "restore-failed":
+      return trace.status ? `Restore failed: ${trace.status}` : "Restore failed";
+    default:
+      return trace.stage;
+  }
+}
+
 export function App() {
   const route = useRoute();
   const [session, setSession] = useState<Session | null>(null);
@@ -31,6 +54,8 @@ export function App() {
   // reload / new tab. Starts true and flips false once restore resolves.
   const [restoring, setRestoring] = useState(true);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [restoreStatus, setRestoreStatus] = useState("Checking saved sign-in");
+  const [restoreTrace, setRestoreTrace] = useState<SessionRestoreTrace[]>([]);
   // True while the agent auto-connect is in flight; carries any auto-delegate
   // failure (surfaced, not swallowed) so Connect/Agents can show it.
   const [agentConnecting, setAgentConnecting] = useState(false);
@@ -173,13 +198,16 @@ export function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const restored = await restoreSession();
+        const restored = await restoreSession((trace) => {
+          if (cancelled) return;
+          setRestoreTrace((prev) => [...prev, trace]);
+          setRestoreStatus(restoreStageLabel(trace));
+        });
         if (cancelled) return;
         if (restored) {
-          await bootstrapSchema(restored.appsSpaceUri);
-          if (cancelled) return;
           sessionRef.current = restored;
           setSession(restored);
+          setRestoring(false);
           // A restored session should also land on the feed (spec §1) — but
           // ONLY when there's no deeper intent: if the user deep-linked to a
           // specific route (/agents, /a/:slug, …) we honor it. We read the live
@@ -189,6 +217,30 @@ export function App() {
           if (parseRoute(location.pathname).kind === "connect") {
             navigate({ kind: "feed" });
           }
+          // Do not hold the whole app on idempotent schema bootstrap after the
+          // session is already restored. Run it in the background, log timing,
+          // and refresh the feed when it completes.
+          const bootstrapStarted = performance.now();
+          console.info("[TinyFeed restore]", { stage: "schema-bootstrap-start", elapsedMs: 0 });
+          bootstrapSchema(restored.appsSpaceUri)
+            .then(({ skippedIndexes }) => {
+              console.info("[TinyFeed restore]", {
+                stage: "schema-bootstrap-result",
+                elapsedMs: Math.round(performance.now() - bootstrapStarted),
+                skippedIndexes: skippedIndexes.length,
+              });
+              bumpFeedRefresh();
+            })
+            .catch((e) => {
+              console.warn("[TinyFeed restore]", {
+                stage: "schema-bootstrap-failed",
+                elapsedMs: Math.round(performance.now() - bootstrapStarted),
+                message: e instanceof Error ? e.message : String(e),
+              });
+              if (!cancelled) {
+                setRestoreError(e instanceof Error ? e.message : String(e));
+              }
+            });
           ensureAgentDelegation(restored.appsSpaceUri).catch(() => {});
         }
       } catch (e) {
@@ -209,7 +261,20 @@ export function App() {
     return (
       <div className="feed-status">
         <p className="feed-status-line">Restoring session…</p>
-        <p className="feed-status-sub">Reusing your saved sign-in</p>
+        <p className="feed-status-sub">{restoreStatus}</p>
+        {restoreTrace.length > 0 && (
+          <details className="restore-trace">
+            <summary>Details</summary>
+            <ol>
+              {restoreTrace.map((trace, index) => (
+                <li key={`${trace.stage}-${index}`}>
+                  <span>{restoreStageLabel(trace)}</span>
+                  <span>{trace.elapsedMs}ms</span>
+                </li>
+              ))}
+            </ol>
+          </details>
+        )}
         {restoreError && (
           <div className="feed-error" style={{ marginTop: 14 }}>{restoreError}</div>
         )}
@@ -257,6 +322,7 @@ export function App() {
           ensureDelegation={ensureAgentDelegation}
           onFeedRefresh={bumpFeedRefresh}
           agentError={agentError}
+          sessionError={restoreError}
         />
       )}
       {route.kind === "article" && session && (
