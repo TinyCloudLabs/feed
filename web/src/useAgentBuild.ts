@@ -170,6 +170,7 @@ export function useAgentBuild({
           startedAt: active.startedAt,
           finishedAt: active.finishedAt,
           published: active.published,
+          media: active.media,
           error: active.error,
           log: active.log,
         });
@@ -214,6 +215,7 @@ export function useAgentBuild({
           startedAt: active.startedAt,
           finishedAt: active.finishedAt,
           published: active.published,
+          media: active.media,
           error: active.error,
           log: active.log,
         });
@@ -236,6 +238,7 @@ export function useAgentBuild({
           startedAt: stillActive.startedAt,
           finishedAt: stillActive.finishedAt,
           published: stillActive.published,
+          media: stillActive.media,
           error: stillActive.error,
           log: stillActive.log,
         });

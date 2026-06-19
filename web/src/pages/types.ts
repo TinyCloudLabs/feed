@@ -1,6 +1,6 @@
 // Shared page-level types.
 
-import type { RunStatus, PublishedArtifact } from "../agentClient.ts";
+import type { RunStatus, PublishedArtifact, RunMediaSummary } from "../agentClient.ts";
 
 /** The active delegation as acked by the backend (POST /agent/delegation). */
 export interface DelegationInfo {
@@ -18,6 +18,7 @@ export interface RunRecord {
   startedAt: string;
   finishedAt?: string;
   published?: PublishedArtifact[];
+  media?: RunMediaSummary;
   error?: string;
   log?: string[];
 }

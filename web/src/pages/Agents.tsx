@@ -126,6 +126,7 @@ function AgentsBody({
           startedAt: isoFromEpoch(state.startedAt) ?? new Date().toISOString(),
           finishedAt: isoFromEpoch(state.finishedAt),
           published: state.published,
+          media: state.media,
           error: state.error,
           log: state.log,
         },
@@ -147,6 +148,7 @@ function AgentsBody({
                   status: state.status,
                   finishedAt: isoFromEpoch(state.finishedAt) ?? r.finishedAt,
                   published: state.published,
+                  media: state.media,
                   error: state.error,
                   log: state.log,
                 }
@@ -159,6 +161,7 @@ function AgentsBody({
               startedAt: isoFromEpoch(state.startedAt) ?? new Date().toISOString(),
               finishedAt: isoFromEpoch(state.finishedAt),
               published: state.published,
+              media: state.media,
               error: state.error,
               log: state.log,
             },
@@ -511,11 +514,7 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
           <li key={r.runId} className="learned">
             <span className="prefs-text">
               {r.status}
-              {r.status === "done"
-                ? ` · ${r.published?.length ?? 0} artifact${(r.published?.length ?? 0) === 1 ? "" : "s"}`
-                : r.published?.length
-                  ? ` · ${r.published.length} artifact${r.published.length === 1 ? "" : "s"}`
-                  : ""}
+              {formatRunMediaSummary(r)}
             </span>
             <span className="prefs-evidence">
               {new Date(r.startedAt).toLocaleString()} · {r.runId}
@@ -543,6 +542,20 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
       </ul>
     </section>
   );
+}
+
+function formatRunMediaSummary(run: RunRecord): string {
+  const artifactCount = run.published?.length ?? 0;
+  if (run.status !== "done" && artifactCount === 0) return "";
+  const base = `${artifactCount} artifact${artifactCount === 1 ? "" : "s"}`;
+  const media = run.media;
+  if (!media) return ` · ${base}`;
+  const parts = [
+    media.heroImages > 0 ? `${media.heroImages} image${media.heroImages === 1 ? "" : "s"}` : null,
+    media.audio > 0 ? `${media.audio} audio` : null,
+    media.video > 0 ? `${media.video} video` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? ` · ${base} · ${parts.join(", ")}` : ` · ${base} · no media`;
 }
 
 function MediaBadges({ artifact }: { artifact: NonNullable<RunRecord["published"]>[number] }) {

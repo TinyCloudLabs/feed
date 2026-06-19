@@ -106,10 +106,17 @@ export interface PublishedArtifact {
   };
 }
 
+export interface RunMediaSummary {
+  heroImages: number;
+  audio: number;
+  video: number;
+}
+
 export interface RunState {
   run_id: string;
   status: RunStatus;
   published?: PublishedArtifact[];
+  media?: RunMediaSummary;
   error?: string;
   /** Epoch ms the run was enqueued. */
   startedAt?: number;
@@ -137,6 +144,7 @@ export interface RunSummary {
   /** Epoch ms the run reached a terminal state (absent while queued|running). */
   finishedAt?: number;
   published?: PublishedArtifact[];
+  media?: RunMediaSummary;
   error?: string;
   /** Bounded backend stage log tail. */
   log?: string[];
