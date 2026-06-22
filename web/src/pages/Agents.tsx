@@ -36,6 +36,19 @@ import { DelegationCard } from "./Connect.tsx";
 import type { DelegationInfo, RunRecord } from "./types.ts";
 import { runLogTail } from "../runTelemetry.ts";
 
+const RUN_TARGETS = [
+  { value: "auto", label: "Auto" },
+  { value: "article", label: "Article" },
+  { value: "podcast", label: "Podcast" },
+  { value: "clip", label: "Video" },
+] as const;
+
+type RunTarget = (typeof RUN_TARGETS)[number]["value"];
+
+function runTargetArtifactType(target: RunTarget): string | undefined {
+  return target === "auto" ? undefined : target;
+}
+
 export function AgentsPage({
   delegation,
   runs,
@@ -114,6 +127,7 @@ function AgentsBody({
   onRunsChange: (runs: RunRecord[]) => void;
   onFeedRefresh: () => void;
 }) {
+  const [runTarget, setRunTarget] = useState<RunTarget>("auto");
   // The Agents page keeps a run HISTORY, so it threads onRunStarted (prepend a new
   // record) and onRunUpdate (update the live record) into the shared controller —
   // the same history-maintenance the old GenerateSection did inline, now driven by
@@ -186,7 +200,7 @@ function AgentsBody({
 
   return (
     <div className="agents">
-      <GenerateSection build={build} />
+      <GenerateSection build={build} runTarget={runTarget} onRunTargetChange={setRunTarget} />
 
       {/* Everything secondary lives under Details, collapsed by default (spec §3):
           the agent DID + requested permissions, the delegation card with the
@@ -214,7 +228,15 @@ function AgentsBody({
 /** The prominent primary action: "Generate the feed". Reflects the shared build
  *  controller's state — disabled + "Building…" while a run is in flight (local OR
  *  resumed from another tab/session) so it can't start a duplicate. */
-function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> }) {
+function GenerateSection({
+  build,
+  runTarget,
+  onRunTargetChange,
+}: {
+  build: ReturnType<typeof useAgentBuild>;
+  runTarget: RunTarget;
+  onRunTargetChange: (target: RunTarget) => void;
+}) {
   const emptyDone =
     !build.building &&
     build.live?.status === "done" &&
@@ -229,11 +251,26 @@ function GenerateSection({ build }: { build: ReturnType<typeof useAgentBuild> })
 
   return (
     <section className="generate">
+      <div className="run-target" role="radiogroup" aria-label="Generation target">
+        {RUN_TARGETS.map((target) => (
+          <button
+            key={target.value}
+            type="button"
+            role="radio"
+            aria-checked={runTarget === target.value}
+            className={`run-target-button${runTarget === target.value ? " active" : ""}`}
+            disabled={build.building}
+            onClick={() => onRunTargetChange(target.value)}
+          >
+            {target.label}
+          </button>
+        ))}
+      </div>
       <button
         type="button"
         className={`generate-primary${build.building ? " gen-busy" : ""}`}
         disabled={build.building}
-        onClick={() => void build.start()}
+        onClick={() => void build.start({ artifactType: runTargetArtifactType(runTarget) })}
       >
         {build.building ? <span className="gen-spinner" aria-hidden="true" /> : null}
         {build.building ? "Building…" : "Generate the feed"}

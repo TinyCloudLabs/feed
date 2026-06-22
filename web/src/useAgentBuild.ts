@@ -45,7 +45,7 @@ export interface AgentBuild {
   /** Non-fatal run lifecycle visibility, e.g. stale delegation recovery. */
   notice: string | null;
   /** Start a build, or ATTACH to one already active (no duplicate POST). */
-  start: () => Promise<void>;
+  start: (opts?: { artifactType?: string }) => Promise<void>;
 }
 
 export function useAgentBuild({
@@ -178,6 +178,8 @@ export function useAgentBuild({
           published: active.published,
           held: active.held,
           media: active.media,
+          targetArtifactType: active.targetArtifactType,
+          proof: active.proof,
           error: active.error,
           log: active.log,
         });
@@ -197,7 +199,7 @@ export function useAgentBuild({
     };
   }, [drivePoll]);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (opts: { artifactType?: string } = {}) => {
     // Already building (local or resumed) — attach, don't POST a second run.
     // `starting` (synchronous ref) is the authoritative in-tab guard: it's set
     // BELOW before any await, so two start() calls in the same tick (double-click,
@@ -225,6 +227,8 @@ export function useAgentBuild({
           published: active.published,
           held: active.held,
           media: active.media,
+          targetArtifactType: active.targetArtifactType,
+          proof: active.proof,
           error: active.error,
           log: active.log,
         });
@@ -249,6 +253,8 @@ export function useAgentBuild({
           published: stillActive.published,
           held: stillActive.held,
           media: stillActive.media,
+          targetArtifactType: stillActive.targetArtifactType,
+          proof: stillActive.proof,
           error: stillActive.error,
           log: stillActive.log,
         });
@@ -257,7 +263,7 @@ export function useAgentBuild({
       }
       const startWithDelegationRecovery = async (): Promise<StartRunResult> => {
         try {
-          return await startRun();
+          return await startRun(opts.artifactType ? { artifactType: opts.artifactType } : {});
         } catch (e) {
           if (!(e instanceof AgentNoDelegationError)) throw e;
           // The browser can have a valid-looking ack while a restarted backend
@@ -266,7 +272,7 @@ export function useAgentBuild({
           setNotice("Agent delegation was stale after a backend restart; reconnected and retried.");
           clearStoredDelegation();
           await ensureDelegation();
-          return await startRun();
+          return await startRun(opts.artifactType ? { artifactType: opts.artifactType } : {});
         }
       };
 
@@ -277,7 +283,7 @@ export function useAgentBuild({
       // run was created server-side; on the next mount getActiveRun() will pick it
       // up and resume it.)
       if (!mounted.current || controller.signal.aborted) return;
-      const state: RunState = { run_id, status };
+      const state: RunState = { run_id, status, targetArtifactType: opts.artifactType };
       setLive(state);
       if (!attached) onRunStartedRef.current?.(state);
       await drivePoll(run_id, controller);

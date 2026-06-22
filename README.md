@@ -56,9 +56,9 @@ notice on both `/feed` and `/agents` so backend/session drift is visible.
 Newer Artifactory agents may accept an optional `artifactType` on `POST
 /agent/run` and return `targetArtifactType` + `proof` from `GET /agent/run/:id`
 and `GET /agent/runs`. Feed treats that as operator evidence, not a hard product
-mode: the Agents page shows whether a targeted run actually published the
-requested type, including rich-media checks for `clip` video, `podcast` audio,
-and `article` hero images.
+mode: the Agents page has an Auto/Article/Podcast/Video target selector and
+shows whether a targeted run actually published the requested type, including
+rich-media checks for `clip` video, `podcast` audio, and `article` hero images.
 
 ### Environment + Cloudflare Pages
 
@@ -192,8 +192,9 @@ generation toward one real podcast/audio artifact when Gemini TTS is configured.
 Use `AGENT_MEDIA_FOCUS=video AGENT_ENABLE_VIDEO=1` only when `FAL_KEY` is
 configured and you intend to spend on a clip. The default `balanced` mode picks
 the strongest format for the material and should not force audio/video variety.
-For a targeted operator proof, use Artifactory's Smithers workflows or call
-`startRun({ artifactType })`; the returned proof block is displayed in `/agents`.
+For a targeted operator proof, use the `/agents` target selector, Artifactory's
+Smithers workflows, or call `startRun({ artifactType })`; the returned proof
+block is displayed in `/agents`.
 
 Manual setup is still useful when debugging the two halves separately:
 
