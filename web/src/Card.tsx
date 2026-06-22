@@ -101,12 +101,44 @@ function Body({ text }: { text: string }) {
 
 /* ---- hero: hydrated from KV (media key -> base64 -> blob URL) ---- */
 
+function useNearViewport<T extends HTMLElement>(enabled: boolean, rootMargin = "900px") {
+  const ref = useRef<T | null>(null);
+  const [near, setNear] = useState(!enabled);
+
+  useEffect(() => {
+    if (!enabled) {
+      setNear(true);
+      return;
+    }
+    if (near) return;
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      setNear(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setNear(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [enabled, near, rootMargin]);
+
+  return [ref, near] as const;
+}
+
 function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) {
   const [url, setUrl] = useState<string | null>(null);
   const key = card.hero_image_key;
+  const [frameRef, shouldHydrate] = useNearViewport<HTMLElement>(Boolean(key));
   useEffect(() => {
     setUrl(null);
-    if (!key) return;
+    if (!key || !shouldHydrate) return;
     let alive = true;
     let acquired = false;
     hydrateMedia(appsSpaceUri, key)
@@ -131,11 +163,11 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
       // Drop this mount's reference; revokes the blob URL when no card holds it.
       if (acquired) releaseMedia(key);
     };
-  }, [key, appsSpaceUri]);
+  }, [key, appsSpaceUri, shouldHydrate]);
 
   if (!key) return null;
   return (
-    <figure className={`hero${url ? "" : " is-loading"}`} aria-busy={!url}>
+    <figure ref={frameRef} className={`hero${url ? "" : " is-loading"}`} aria-busy={!url}>
       {url && <img src={url} alt="" loading="lazy" decoding="async" />}
     </figure>
   );
@@ -144,9 +176,10 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
 function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) {
   const [url, setUrl] = useState<string | null>(card.video_url);
   const key = card.video_key;
+  const [frameRef, shouldHydrate] = useNearViewport<HTMLElement>(Boolean(key));
   useEffect(() => {
     setUrl(card.video_url);
-    if (!key) return;
+    if (!key || !shouldHydrate) return;
     let alive = true;
     let acquired = false;
     hydrateMedia(appsSpaceUri, key, card.video_mime ?? "video/mp4")
@@ -166,13 +199,13 @@ function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
       alive = false;
       if (acquired) releaseMedia(key);
     };
-  }, [key, card.video_mime, card.video_url, appsSpaceUri]);
+  }, [key, card.video_mime, card.video_url, appsSpaceUri, shouldHydrate]);
 
   if (!key && !url) {
     return <Hero card={card} appsSpaceUri={appsSpaceUri} />;
   }
   return (
-    <figure className={`video-media${url ? "" : " is-loading"}`} aria-busy={!url}>
+    <figure ref={frameRef} className={`video-media${url ? "" : " is-loading"}`} aria-busy={!url}>
       {url && (
         <video
           src={url}
@@ -203,13 +236,14 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
   const [current, setCurrent] = useState(0);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const key = card.audio_key;
+  const [frameRef, shouldHydrate] = useNearViewport<HTMLDivElement>(Boolean(key));
 
   useEffect(() => {
     setUrl(null);
     setPlaying(false);
     setDuration(0);
     setCurrent(0);
-    if (!key) return;
+    if (!key || !shouldHydrate) return;
     let alive = true;
     let acquired = false;
     hydrateMedia(appsSpaceUri, key, card.audio_mime ?? "audio/mp4")
@@ -229,7 +263,7 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
       alive = false;
       if (acquired) releaseMedia(key);
     };
-  }, [key, card.audio_mime, appsSpaceUri]);
+  }, [key, card.audio_mime, appsSpaceUri, shouldHydrate]);
 
   if (!key) return null;
 
@@ -253,7 +287,7 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
   };
 
   return (
-    <div className={`audio${url ? "" : " is-loading"}`} aria-busy={!url}>
+    <div ref={frameRef} className={`audio${url ? "" : " is-loading"}`} aria-busy={!url}>
       <audio
         ref={audioRef}
         src={url ?? undefined}
