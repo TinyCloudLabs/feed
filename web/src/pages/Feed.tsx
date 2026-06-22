@@ -18,12 +18,14 @@ import { useAgentBuild } from "../useAgentBuild.ts";
 import { Shell } from "../Nav.tsx";
 import { Link } from "../router.tsx";
 import type { Session } from "../session.ts";
+import type { RunState } from "../agentClient.ts";
 import {
   filterByMedia,
   mediaFilterCounts,
   MEDIA_FILTERS,
   type MediaFilter,
 } from "../mediaFilters.ts";
+import { formatRunAge, runLogTail } from "../runTelemetry.ts";
 
 const PAGE_SIZE = 50;
 const MEDIA_FILTER_LABELS: Record<MediaFilter, string> = {
@@ -238,11 +240,14 @@ export function FeedPage({
           including one started in another tab/session (detected on mount). */}
       {build.building && (
         <div className="build-indicator" role="status" aria-live="polite">
-          <span className="gen-spinner" aria-hidden="true" />
-          <span className="build-indicator-text">
-            🛠 Building your feed…
-            {build.live ? ` · ${build.live.run_id} · ${build.live.status}` : ""}
-          </span>
+          <div className="build-indicator-main">
+            <span className="gen-spinner" aria-hidden="true" />
+            <span className="build-indicator-text">
+              🛠 Building your feed…
+              {build.live ? ` · ${build.live.run_id} · ${build.live.status}` : ""}
+            </span>
+          </div>
+          <FeedRunDetails state={build.live} />
         </div>
       )}
 
@@ -303,5 +308,25 @@ export function FeedPage({
         </button>
       )}
     </Shell>
+  );
+}
+
+function FeedRunDetails({ state }: { state: RunState | null }) {
+  const tail = runLogTail(state?.log);
+  const age = formatRunAge(state?.startedAt);
+  if (!state && tail.length === 0) return null;
+  return (
+    <details className="build-run-details">
+      <summary>Run details{age ? ` · ${age}` : ""}</summary>
+      {tail.length > 0 ? (
+        <ol className="run-log-tail" aria-label="Recent run activity">
+          {tail.map((line, index) => (
+            <li key={`${index}:${line}`}>{line}</li>
+          ))}
+        </ol>
+      ) : (
+        <p className="build-run-empty">Waiting for backend activity…</p>
+      )}
+    </details>
   );
 }

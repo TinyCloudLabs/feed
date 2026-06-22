@@ -34,6 +34,7 @@ import { Shell } from "../Nav.tsx";
 import { Link } from "../router.tsx";
 import { DelegationCard } from "./Connect.tsx";
 import type { DelegationInfo, RunRecord } from "./types.ts";
+import { runLogTail } from "../runTelemetry.ts";
 
 export function AgentsPage({
   delegation,
@@ -658,7 +659,7 @@ function formatDuration(ms: number): string {
 }
 
 function RunLog({ log }: { log?: string[] }) {
-  const tail = log?.slice(-6) ?? [];
+  const tail = runLogTail(log);
   if (tail.length === 0) return null;
   return (
     <ol className="run-log-tail" aria-label="Recent run activity">
