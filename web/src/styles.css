@@ -1432,7 +1432,8 @@ button.tag::after {
 /* monospace DID, wraps on narrow viewports without breaking the layout */
 .agent-did,
 .run-published,
-.run-held {
+.run-held,
+.run-proof {
   display: block;
   margin: 6px 0 0;
   font-family: var(--mono);
@@ -1451,6 +1452,14 @@ button.tag::after {
 }
 
 .run-held {
+  color: var(--accent);
+}
+
+.run-proof {
+  color: var(--ink-2);
+}
+
+.run-proof.failed {
   color: var(--accent);
 }
 

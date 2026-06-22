@@ -4,8 +4,8 @@
 // "Agent backend API"):
 //   GET  /agent/info           → { did, name, permissions[], challenge? }
 //   POST /agent/delegation     { serialized } → { ok, agentDid, delegationCid, spaceId, expiresAt }
-//   POST /agent/run            {} → { run_id, status: "queued" } or 409 run_in_progress { run_id }
-//   GET  /agent/run/:run_id    → { run_id, status, published?[], held?[], error? }
+//   POST /agent/run            { artifactType?: string } → { run_id, status: "queued" } or 409 run_in_progress { run_id }
+//   GET  /agent/run/:run_id    → { run_id, status, published?[], held?[], proof?, error? }
 //
 // The user mints a delegation of AGENT_SCOPES to the agent's DID with the
 // signed-in session key (no extra wallet prompt — the recap already covers the
@@ -134,12 +134,24 @@ export interface RunMediaSummary {
   video: number;
 }
 
+export interface RunProof {
+  ok: boolean;
+  targetArtifactType?: string;
+  checks: Array<{
+    name: string;
+    ok: boolean;
+    detail: string;
+  }>;
+}
+
 export interface RunState {
   run_id: string;
   status: RunStatus;
   published?: PublishedArtifact[];
   held?: HeldArtifact[];
   media?: RunMediaSummary;
+  targetArtifactType?: string;
+  proof?: RunProof;
   error?: string;
   /** Epoch ms the run was enqueued. */
   startedAt?: number;
@@ -169,6 +181,8 @@ export interface RunSummary {
   published?: PublishedArtifact[];
   held?: HeldArtifact[];
   media?: RunMediaSummary;
+  targetArtifactType?: string;
+  proof?: RunProof;
   error?: string;
   /** Bounded backend stage log tail. */
   log?: string[];
@@ -431,7 +445,7 @@ export async function delegateToAgent(
  *  backend's cross-process run lock reports an already-active run, attach to that
  *  run instead of surfacing a generic 409 error; the caller will poll the returned
  *  id and render the real terminal status. */
-export async function startRun(): Promise<StartRunResult> {
+export async function startRun(opts: { artifactType?: string } = {}): Promise<StartRunResult> {
   const { host, token } = await loadAgentConfig();
   if (host === "") {
     throw new Error("agent backend not configured (no host in /agent-config.json)");
@@ -442,7 +456,7 @@ export async function startRun(): Promise<StartRunResult> {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({}),
+    body: JSON.stringify(opts.artifactType ? { artifactType: opts.artifactType } : {}),
   });
   const body = await res.text().catch(() => "");
   if (res.ok) {

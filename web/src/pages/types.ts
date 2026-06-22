@@ -5,6 +5,7 @@ import type {
   PublishedArtifact,
   HeldArtifact,
   RunMediaSummary,
+  RunProof,
 } from "../agentClient.ts";
 
 /** The active delegation as acked by the backend (POST /agent/delegation). */
@@ -25,6 +26,8 @@ export interface RunRecord {
   published?: PublishedArtifact[];
   held?: HeldArtifact[];
   media?: RunMediaSummary;
+  targetArtifactType?: string;
+  proof?: RunProof;
   error?: string;
   log?: string[];
 }

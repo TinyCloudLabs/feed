@@ -129,6 +129,8 @@ function AgentsBody({
           published: state.published,
           held: state.held,
           media: state.media,
+          targetArtifactType: state.targetArtifactType,
+          proof: state.proof,
           error: state.error,
           log: state.log,
         },
@@ -152,6 +154,8 @@ function AgentsBody({
                   published: state.published,
                   held: state.held,
                   media: state.media,
+                  targetArtifactType: state.targetArtifactType,
+                  proof: state.proof,
                   error: state.error,
                   log: state.log,
                 }
@@ -166,6 +170,8 @@ function AgentsBody({
               published: state.published,
               held: state.held,
               media: state.media,
+              targetArtifactType: state.targetArtifactType,
+              proof: state.proof,
               error: state.error,
               log: state.log,
             },
@@ -266,6 +272,7 @@ function LatestRunSummary({ state }: { state: RunState }) {
       <p className="gen-progress-meta">
         Finished · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media, held.length)}
       </p>
+      <RunProof proof={state.proof} />
       <RunPublished artifacts={artifacts} />
       <RunHeld held={held} />
     </div>
@@ -566,6 +573,7 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
               {new Date(r.startedAt).toLocaleString()} · {r.runId}
               {r.error ? ` · ${r.error}` : ""}
             </span>
+            <RunProof proof={r.proof} />
             <RunLog log={r.log} />
             <RunPublished artifacts={r.published ?? []} />
             <RunHeld held={r.held ?? []} />
@@ -628,6 +636,17 @@ function RunHeld({ held }: { held: NonNullable<RunRecord["held"]> }) {
           held {artifact.type}/{artifact.slug}: {artifact.reason}
         </span>
       ))}
+    </span>
+  );
+}
+
+function RunProof({ proof }: { proof?: RunRecord["proof"] }) {
+  if (!proof || !proof.targetArtifactType) return null;
+  const label = proof.ok ? "proved" : "not proved";
+  return (
+    <span className={`run-proof${proof.ok ? "" : " failed"}`}>
+      {label} {proof.targetArtifactType}
+      {proof.checks.length > 0 ? ` · ${proof.checks.filter((check) => check.ok).length}/${proof.checks.length}` : ""}
     </span>
   );
 }
