@@ -144,6 +144,7 @@ function AgentsBody({
           held: state.held,
           media: state.media,
           targetArtifactType: state.targetArtifactType,
+          mixPlan: state.mixPlan,
           proof: state.proof,
           error: state.error,
           log: state.log,
@@ -169,6 +170,7 @@ function AgentsBody({
                   held: state.held,
                   media: state.media,
                   targetArtifactType: state.targetArtifactType,
+                  mixPlan: state.mixPlan,
                   proof: state.proof,
                   error: state.error,
                   log: state.log,
@@ -185,6 +187,7 @@ function AgentsBody({
               held: state.held,
               media: state.media,
               targetArtifactType: state.targetArtifactType,
+              mixPlan: state.mixPlan,
               proof: state.proof,
               error: state.error,
               log: state.log,
@@ -310,6 +313,7 @@ function LatestRunSummary({ state }: { state: RunState }) {
         Finished · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media, held.length)}
       </p>
       <RunProof proof={state.proof} />
+      <RunMixPlan mixPlan={state.mixPlan} />
       <RunPublished artifacts={artifacts} />
       <RunHeld held={held} />
     </div>
@@ -611,6 +615,7 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
               {r.error ? ` · ${r.error}` : ""}
             </span>
             <RunProof proof={r.proof} />
+            <RunMixPlan mixPlan={r.mixPlan} />
             <RunLog log={r.log} />
             <RunPublished artifacts={r.published ?? []} />
             <RunHeld held={r.held ?? []} />
@@ -685,6 +690,23 @@ function RunProof({ proof }: { proof?: RunRecord["proof"] }) {
       {label} {proof.targetArtifactType}
       {proof.checks.length > 0 ? ` · ${proof.checks.filter((check) => check.ok).length}/${proof.checks.length}` : ""}
     </span>
+  );
+}
+
+function RunMixPlan({ mixPlan }: { mixPlan?: RunRecord["mixPlan"] }) {
+  if (!mixPlan) return null;
+  const label =
+    mixPlan.status === "ready"
+      ? `mix plan · ${mixPlan.bytes ?? 0} bytes${mixPlan.truncated ? " · truncated" : ""}`
+      : `mix plan · ${mixPlan.status}${mixPlan.error ? ` · ${mixPlan.error}` : ""}`;
+  if (mixPlan.status !== "ready" || !mixPlan.content) {
+    return <span className={`run-mix-plan ${mixPlan.status}`}>{label}</span>;
+  }
+  return (
+    <details className="run-mix-plan">
+      <summary>{label}</summary>
+      <pre>{mixPlan.content}</pre>
+    </details>
   );
 }
 

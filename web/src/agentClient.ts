@@ -144,6 +144,16 @@ export interface RunProof {
   }>;
 }
 
+export interface RunMixPlan {
+  status: "ready" | "missing" | "error";
+  path: "artifacts/mix-plan.md";
+  content?: string;
+  bytes?: number;
+  truncated?: boolean;
+  updatedAt?: string;
+  error?: string;
+}
+
 export interface RunState {
   run_id: string;
   status: RunStatus;
@@ -151,6 +161,7 @@ export interface RunState {
   held?: HeldArtifact[];
   media?: RunMediaSummary;
   targetArtifactType?: string;
+  mixPlan?: RunMixPlan;
   proof?: RunProof;
   error?: string;
   /** Epoch ms the run was enqueued. */
@@ -182,6 +193,7 @@ export interface RunSummary {
   held?: HeldArtifact[];
   media?: RunMediaSummary;
   targetArtifactType?: string;
+  mixPlan?: RunMixPlan;
   proof?: RunProof;
   error?: string;
   /** Bounded backend stage log tail. */

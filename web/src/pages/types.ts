@@ -6,6 +6,7 @@ import type {
   HeldArtifact,
   RunMediaSummary,
   RunProof,
+  RunMixPlan,
 } from "../agentClient.ts";
 
 /** The active delegation as acked by the backend (POST /agent/delegation). */
@@ -27,6 +28,7 @@ export interface RunRecord {
   held?: HeldArtifact[];
   media?: RunMediaSummary;
   targetArtifactType?: string;
+  mixPlan?: RunMixPlan;
   proof?: RunProof;
   error?: string;
   log?: string[];
