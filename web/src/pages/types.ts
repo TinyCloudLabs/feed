@@ -8,6 +8,7 @@ import type {
   RunProof,
   RunMixPlan,
   RunCorpusPlan,
+  RunExecutionSource,
 } from "../agentClient.ts";
 
 /** The active delegation as acked by the backend (POST /agent/delegation). */
@@ -28,6 +29,7 @@ export interface RunRecord {
   published?: PublishedArtifact[];
   held?: HeldArtifact[];
   media?: RunMediaSummary;
+  executionSource?: RunExecutionSource;
   targetArtifactType?: string;
   corpusPlan?: RunCorpusPlan;
   mixPlan?: RunMixPlan;

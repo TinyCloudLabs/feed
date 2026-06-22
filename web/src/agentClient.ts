@@ -168,12 +168,19 @@ export interface RunCorpusPlan {
   nextOffset?: number;
 }
 
+export interface RunExecutionSource {
+  source: "agent-http" | "smithers-agent-run" | "smithers-agent-run-staged";
+  label: string;
+  entrypoint: string;
+}
+
 export interface RunState {
   run_id: string;
   status: RunStatus;
   published?: PublishedArtifact[];
   held?: HeldArtifact[];
   media?: RunMediaSummary;
+  executionSource?: RunExecutionSource;
   targetArtifactType?: string;
   corpusPlan?: RunCorpusPlan;
   mixPlan?: RunMixPlan;
@@ -207,6 +214,7 @@ export interface RunSummary {
   published?: PublishedArtifact[];
   held?: HeldArtifact[];
   media?: RunMediaSummary;
+  executionSource?: RunExecutionSource;
   targetArtifactType?: string;
   corpusPlan?: RunCorpusPlan;
   mixPlan?: RunMixPlan;

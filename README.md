@@ -63,7 +63,10 @@ rich-media checks for `clip` video, `podcast` audio, and `article` hero images.
 Agents that expose `corpusPlan` and `mixPlan` also render both planning
 snapshots in run history: `corpusPlan` shows which Listen conversations were
 selected or rotated past, while `mixPlan` shows compact / developed /
-rich-media intent, diversity checks, and weak-backpressure notes.
+rich-media intent, diversity checks, and weak-backpressure notes. Agents that
+expose `executionSource` show whether the run came from Feed HTTP, Smithers
+`agent-run`, or Smithers staged `agent-run`, which makes operator runs
+distinguishable after the shared run lock is released.
 
 ### Environment + Cloudflare Pages
 

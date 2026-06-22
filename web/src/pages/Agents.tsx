@@ -143,6 +143,7 @@ function AgentsBody({
           published: state.published,
           held: state.held,
           media: state.media,
+          executionSource: state.executionSource,
           targetArtifactType: state.targetArtifactType,
           corpusPlan: state.corpusPlan,
           mixPlan: state.mixPlan,
@@ -170,6 +171,7 @@ function AgentsBody({
                   published: state.published,
                   held: state.held,
                   media: state.media,
+                  executionSource: state.executionSource ?? r.executionSource,
                   targetArtifactType: state.targetArtifactType,
                   corpusPlan: state.corpusPlan,
                   mixPlan: state.mixPlan,
@@ -188,6 +190,7 @@ function AgentsBody({
               published: state.published,
               held: state.held,
               media: state.media,
+              executionSource: state.executionSource,
               targetArtifactType: state.targetArtifactType,
               corpusPlan: state.corpusPlan,
               mixPlan: state.mixPlan,
@@ -313,7 +316,9 @@ function LatestRunSummary({ state }: { state: RunState }) {
   return (
     <div className="latest-run-summary" role="status">
       <p className="gen-progress-meta">
-        Finished · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media, held.length)}
+        Finished · {state.run_id}
+        {formatExecutionSource(state.executionSource)} ·{" "}
+        {formatRunResultSummary(artifacts.length, state.media, held.length)}
       </p>
       <RunProof proof={state.proof} />
       <RunCorpusPlan corpusPlan={state.corpusPlan} />
@@ -616,6 +621,7 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
             </span>
             <span className="prefs-evidence">
               {new Date(r.startedAt).toLocaleString()} · {r.runId}
+              {formatExecutionSource(r.executionSource)}
               {r.error ? ` · ${r.error}` : ""}
             </span>
             <RunProof proof={r.proof} />
@@ -636,6 +642,11 @@ function formatRunMediaSummary(run: RunRecord): string {
   const heldCount = run.held?.length ?? 0;
   if (run.status !== "done" && artifactCount === 0 && heldCount === 0) return "";
   return ` · ${formatRunResultSummary(artifactCount, run.media, heldCount)}`;
+}
+
+function formatExecutionSource(source: RunRecord["executionSource"]): string {
+  if (!source) return "";
+  return ` · ${source.label || source.source}`;
 }
 
 function formatRunResultSummary(
