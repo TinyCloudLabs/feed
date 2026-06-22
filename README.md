@@ -59,9 +59,10 @@ and `GET /agent/runs`. Feed treats that as operator evidence, not a hard product
 mode: the Agents page has an Auto/Article/Podcast/Video target selector and
 shows whether a targeted run actually published the requested type, including
 rich-media checks for `clip` video, `podcast` audio, and `article` hero images.
-Agents that expose `mixPlan` also render the run's `plan-feed-mix` snapshot in
-run history, including compact / developed / rich-media intent, diversity
-checks, and weak-backpressure notes.
+Agents that expose `corpusPlan` and `mixPlan` also render both planning
+snapshots in run history: `corpusPlan` shows which Listen conversations were
+selected or rotated past, while `mixPlan` shows compact / developed /
+rich-media intent, diversity checks, and weak-backpressure notes.
 
 ### Environment + Cloudflare Pages
 

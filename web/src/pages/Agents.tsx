@@ -144,6 +144,7 @@ function AgentsBody({
           held: state.held,
           media: state.media,
           targetArtifactType: state.targetArtifactType,
+          corpusPlan: state.corpusPlan,
           mixPlan: state.mixPlan,
           proof: state.proof,
           error: state.error,
@@ -170,6 +171,7 @@ function AgentsBody({
                   held: state.held,
                   media: state.media,
                   targetArtifactType: state.targetArtifactType,
+                  corpusPlan: state.corpusPlan,
                   mixPlan: state.mixPlan,
                   proof: state.proof,
                   error: state.error,
@@ -187,6 +189,7 @@ function AgentsBody({
               held: state.held,
               media: state.media,
               targetArtifactType: state.targetArtifactType,
+              corpusPlan: state.corpusPlan,
               mixPlan: state.mixPlan,
               proof: state.proof,
               error: state.error,
@@ -313,6 +316,7 @@ function LatestRunSummary({ state }: { state: RunState }) {
         Finished · {state.run_id} · {formatRunResultSummary(artifacts.length, state.media, held.length)}
       </p>
       <RunProof proof={state.proof} />
+      <RunCorpusPlan corpusPlan={state.corpusPlan} />
       <RunMixPlan mixPlan={state.mixPlan} />
       <RunPublished artifacts={artifacts} />
       <RunHeld held={held} />
@@ -615,6 +619,7 @@ function RunHistory({ runs }: { runs: RunRecord[] }) {
               {r.error ? ` · ${r.error}` : ""}
             </span>
             <RunProof proof={r.proof} />
+            <RunCorpusPlan corpusPlan={r.corpusPlan} />
             <RunMixPlan mixPlan={r.mixPlan} />
             <RunLog log={r.log} />
             <RunPublished artifacts={r.published ?? []} />
@@ -690,6 +695,33 @@ function RunProof({ proof }: { proof?: RunRecord["proof"] }) {
       {label} {proof.targetArtifactType}
       {proof.checks.length > 0 ? ` · ${proof.checks.filter((check) => check.ok).length}/${proof.checks.length}` : ""}
     </span>
+  );
+}
+
+function RunCorpusPlan({ corpusPlan }: { corpusPlan?: RunRecord["corpusPlan"] }) {
+  if (!corpusPlan) return null;
+  const selectedCount = corpusPlan.selected.length;
+  const total = typeof corpusPlan.candidateCount === "number" ? `/${corpusPlan.candidateCount}` : "";
+  const offset = `offset ${corpusPlan.offset}`;
+  const next = typeof corpusPlan.nextOffset === "number" ? ` · next ${corpusPlan.nextOffset}` : "";
+  const skipped = typeof corpusPlan.skippedRecent === "number" ? ` · skipped recent ${corpusPlan.skippedRecent}` : "";
+  const label = `corpus plan · ${corpusPlan.source} · ${selectedCount}${total} selected · ${offset}${next}${skipped}`;
+  if (selectedCount === 0) return <span className="run-corpus-plan">{label}</span>;
+  return (
+    <details className="run-corpus-plan">
+      <summary>{label}</summary>
+      <ol>
+        {corpusPlan.selected.map((selection) => (
+          <li key={selection.id}>
+            <span>{selection.title || selection.id}</span>
+            <span>
+              {selection.transcriptStorage ? `${selection.transcriptStorage} · ` : ""}
+              {selection.reason}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </details>
   );
 }
 

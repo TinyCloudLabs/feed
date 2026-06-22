@@ -1434,6 +1434,7 @@ button.tag::after {
 .run-published,
 .run-held,
 .run-proof,
+.run-corpus-plan,
 .run-mix-plan {
   display: block;
   margin: 6px 0 0;
@@ -1464,6 +1465,7 @@ button.tag::after {
   color: var(--accent);
 }
 
+.run-corpus-plan,
 .run-mix-plan {
   color: var(--ink-3);
 }
@@ -1473,8 +1475,26 @@ button.tag::after {
   color: var(--accent);
 }
 
+.run-corpus-plan summary,
 .run-mix-plan summary {
   cursor: pointer;
+}
+
+.run-corpus-plan ol {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.run-corpus-plan li {
+  margin: 4px 0;
+}
+
+.run-corpus-plan li span {
+  display: block;
+}
+
+.run-corpus-plan li span + span {
+  color: color-mix(in srgb, var(--ink-3) 75%, transparent);
 }
 
 .run-mix-plan pre {

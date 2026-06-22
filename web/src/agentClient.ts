@@ -154,6 +154,20 @@ export interface RunMixPlan {
   error?: string;
 }
 
+export interface RunCorpusPlan {
+  source: "selected" | "rotation" | "explicit";
+  offset: number;
+  candidateCount?: number;
+  selected: Array<{
+    id: string;
+    title?: string;
+    transcriptStorage?: "kv" | "inline" | "none";
+    reason: string;
+  }>;
+  skippedRecent?: number;
+  nextOffset?: number;
+}
+
 export interface RunState {
   run_id: string;
   status: RunStatus;
@@ -161,6 +175,7 @@ export interface RunState {
   held?: HeldArtifact[];
   media?: RunMediaSummary;
   targetArtifactType?: string;
+  corpusPlan?: RunCorpusPlan;
   mixPlan?: RunMixPlan;
   proof?: RunProof;
   error?: string;
@@ -193,6 +208,7 @@ export interface RunSummary {
   held?: HeldArtifact[];
   media?: RunMediaSummary;
   targetArtifactType?: string;
+  corpusPlan?: RunCorpusPlan;
   mixPlan?: RunMixPlan;
   proof?: RunProof;
   error?: string;
