@@ -458,6 +458,58 @@ button.mono-chip::after {
   height: 44px;
 }
 
+.media-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 22px;
+}
+
+.media-filter-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--hairline);
+  border-radius: 3px;
+  background: none;
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.media-filter-button:hover,
+.media-filter-button:focus-visible {
+  border-color: var(--accent);
+  color: var(--ink);
+  outline: none;
+}
+
+.media-filter-button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.media-filter-button:disabled {
+  cursor: default;
+  color: var(--ink-4);
+  opacity: 0.55;
+}
+
+.media-filter-button:disabled:hover {
+  border-color: var(--hairline);
+  color: var(--ink-4);
+}
+
+.media-filter-count {
+  color: inherit;
+}
+
 /* ---- narrow viewports: stack the masthead so the control row can wrap ----
    At phone widths the title + (Preferences · Generate · Rescan · Sign out) row
    won't fit side-by-side and the trailing control (Rescan/Sign out) gets cut

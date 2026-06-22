@@ -18,8 +18,20 @@ import { useAgentBuild } from "../useAgentBuild.ts";
 import { Shell } from "../Nav.tsx";
 import { Link } from "../router.tsx";
 import type { Session } from "../session.ts";
+import {
+  filterByMedia,
+  mediaFilterCounts,
+  MEDIA_FILTERS,
+  type MediaFilter,
+} from "../mediaFilters.ts";
 
 const PAGE_SIZE = 50;
+const MEDIA_FILTER_LABELS: Record<MediaFilter, string> = {
+  all: "All",
+  video: "Video",
+  audio: "Audio",
+  image: "Images",
+};
 
 /** How long the transient "Get updates" pill lingers after the feed loads before
  *  it quietly fades out (spec §2). */
@@ -84,6 +96,7 @@ export function FeedPage({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeTag, setActiveTag] = useState<string | null>(null);
+  const [mediaFilter, setMediaFilter] = useState<MediaFilter>("all");
   // Drives the transient "Get updates" pill: shown once the feed has loaded, then
   // auto-hidden after GET_UPDATES_VISIBLE_MS, and immediately on click/build.
   const [showGetUpdates, setShowGetUpdates] = useState(false);
@@ -136,9 +149,12 @@ export function FeedPage({
     void build.start();
   }, [build]);
 
-  const visible = cards.filter(
+  const baseVisible = cards.filter(
     (c) => !hidden.has(c.id) && (!activeTag || c.tags.includes(activeTag)),
   );
+  const mediaCounts = mediaFilterCounts(baseVisible);
+  const hasMediaChoices = mediaCounts.video > 0 || mediaCounts.audio > 0 || mediaCounts.image > 0;
+  const visible = filterByMedia(baseVisible, mediaFilter);
 
   const sub = (
     <>
@@ -169,6 +185,27 @@ export function FeedPage({
         >
           tag: {activeTag} ✕
         </button>
+      )}
+
+      {!loading && mediaCounts.all > 0 && hasMediaChoices && (
+        <div className="media-filter" role="group" aria-label="Filter feed by media">
+          {MEDIA_FILTERS.map((filter) => {
+            const count = mediaCounts[filter];
+            return (
+              <button
+                key={filter}
+                type="button"
+                className={`media-filter-button${mediaFilter === filter ? " active" : ""}`}
+                aria-pressed={mediaFilter === filter}
+                disabled={filter !== "all" && count === 0}
+                onClick={() => setMediaFilter(filter)}
+              >
+                <span>{MEDIA_FILTER_LABELS[filter]}</span>
+                <span className="media-filter-count">{count}</span>
+              </button>
+            );
+          })}
+        </div>
       )}
 
       {error && <div className="feed-error">{error}</div>}
@@ -218,10 +255,16 @@ export function FeedPage({
         ) : visible.length === 0 ? (
           <div className="feed-status">
             <p className="feed-status-line">
-              {activeTag ? "Nothing for this tag." : "Nothing yet."}
+              {mediaFilter !== "all"
+                ? `No ${MEDIA_FILTER_LABELS[mediaFilter].toLowerCase()} artifacts in this view.`
+                : activeTag
+                  ? "Nothing for this tag."
+                  : "Nothing yet."}
             </p>
             <p className="feed-status-sub">
-              {activeTag
+              {mediaFilter !== "all"
+                ? "Switch the media filter to see the rest of this view"
+                : activeTag
                 ? "Clear the filter to see everything"
                 : "Connect an agent and Generate to fill your feed"}
             </p>
