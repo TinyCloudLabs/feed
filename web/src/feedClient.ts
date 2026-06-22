@@ -19,6 +19,7 @@ import type {
   InteractionRow,
   RenderType,
 } from "./types.ts";
+import { mediaTimer, type MediaKind } from "./mediaDiagnostics.ts";
 
 // ── space-scoped storage accessors ──────────────────────────────────────────
 
@@ -176,21 +177,32 @@ export async function hydrateMedia(
   appsSpaceUri: string,
   key: string,
   mime = "image/jpeg",
+  diagnostics: { kind?: MediaKind; slug?: string | null } = {},
 ): Promise<string | null> {
+  const kind = diagnostics.kind ?? "media";
+  const done = mediaTimer("hydrate", { kind, key, slug: diagnostics.slug, mime });
   const cached = mediaCache.get(key);
   if (cached) {
     cached.refs += 1;
+    done("hydrate:cache-hit", { refs: cached.refs });
     return cached.url;
   }
 
   const kv = spaceKv(appsSpaceUri);
   const res = await kv.get<string>(key);
   if (!res.ok) {
-    if (res.error.code === "KV_NOT_FOUND" || res.error.code === "NOT_FOUND") return null;
+    if (res.error.code === "KV_NOT_FOUND" || res.error.code === "NOT_FOUND") {
+      done("hydrate:not-found");
+      return null;
+    }
+    done("hydrate:error", { code: res.error.code });
     throw new Error(`media read failed (${key}): ${res.error.message}`);
   }
   const b64 = res.data.data;
-  if (typeof b64 !== "string") throw new Error(`media ${key} is not a base64 string`);
+  if (typeof b64 !== "string") {
+    done("hydrate:error", { reason: "not-base64-string" });
+    throw new Error(`media ${key} is not a base64 string`);
+  }
   const bytes = base64ToBytes(b64);
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   // A concurrent hydrate of the same key may have populated the cache while this
@@ -199,9 +211,11 @@ export async function hydrateMedia(
   if (raced) {
     URL.revokeObjectURL(url);
     raced.refs += 1;
+    done("hydrate:race-hit", { refs: raced.refs, bytes: bytes.byteLength });
     return raced.url;
   }
   mediaCache.set(key, { url, refs: 1 });
+  done("hydrate:ready", { bytes: bytes.byteLength });
   return url;
 }
 

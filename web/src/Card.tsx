@@ -5,6 +5,7 @@ import type { FeedCard, InteractionAction } from "./types.ts";
 import { typeLabel } from "./formats.ts";
 import { hydrateMedia, releaseMedia, recordInteraction } from "./feedClient.ts";
 import { buildDataTrail, fileLeaf } from "./dataTrail.ts";
+import { mediaDebug } from "./mediaDiagnostics.ts";
 
 marked.setOptions({ gfm: true, breaks: false });
 
@@ -141,7 +142,7 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
     if (!key || !shouldHydrate) return;
     let alive = true;
     let acquired = false;
-    hydrateMedia(appsSpaceUri, key)
+    hydrateMedia(appsSpaceUri, key, "image/jpeg", { kind: "hero", slug: card.slug })
       .then((u) => {
         if (!alive) {
           // Unmounted before resolve — release the reference we just took so the
@@ -168,7 +169,21 @@ function Hero({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: string }) 
   if (!key) return null;
   return (
     <figure ref={frameRef} className={`hero${url ? "" : " is-loading"}`} aria-busy={!url}>
-      {url && <img src={url} alt="" loading="lazy" decoding="async" />}
+      {url && (
+        <img
+          src={url}
+          alt=""
+          loading="lazy"
+          decoding="async"
+          onLoad={(e) =>
+            mediaDebug("element:loaded", { kind: "hero", key, slug: card.slug }, {
+              naturalWidth: e.currentTarget.naturalWidth,
+              naturalHeight: e.currentTarget.naturalHeight,
+            })
+          }
+          onError={() => mediaDebug("element:error", { kind: "hero", key, slug: card.slug })}
+        />
+      )}
     </figure>
   );
 }
@@ -182,7 +197,7 @@ function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
     if (!key || !shouldHydrate) return;
     let alive = true;
     let acquired = false;
-    hydrateMedia(appsSpaceUri, key, card.video_mime ?? "video/mp4")
+    hydrateMedia(appsSpaceUri, key, card.video_mime ?? "video/mp4", { kind: "video", slug: card.slug })
       .then((u) => {
         if (!alive) {
           if (u) releaseMedia(key);
@@ -215,6 +230,23 @@ function VideoMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
           controls
           playsInline
           preload="metadata"
+          onLoadedMetadata={(e) =>
+            mediaDebug("element:metadata", { kind: "video", key, slug: card.slug }, {
+              duration: Math.round(e.currentTarget.duration || 0),
+              videoWidth: e.currentTarget.videoWidth,
+              videoHeight: e.currentTarget.videoHeight,
+            })
+          }
+          onCanPlay={(e) =>
+            mediaDebug("element:can-play", { kind: "video", key, slug: card.slug }, {
+              readyState: e.currentTarget.readyState,
+            })
+          }
+          onError={(e) =>
+            mediaDebug("element:error", { kind: "video", key, slug: card.slug }, {
+              code: e.currentTarget.error?.code ?? null,
+            })
+          }
         />
       )}
     </figure>
@@ -246,7 +278,7 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
     if (!key || !shouldHydrate) return;
     let alive = true;
     let acquired = false;
-    hydrateMedia(appsSpaceUri, key, card.audio_mime ?? "audio/mp4")
+    hydrateMedia(appsSpaceUri, key, card.audio_mime ?? "audio/mp4", { kind: "audio", slug: card.slug })
       .then((u) => {
         if (!alive) {
           if (u) releaseMedia(key);
@@ -295,7 +327,12 @@ function AudioMedia({ card, appsSpaceUri }: { card: FeedCard; appsSpaceUri: stri
         onPlay={() => setPlaying(true)}
         onPause={() => setPlaying(false)}
         onEnded={() => setPlaying(false)}
-        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration || 0)}
+        onLoadedMetadata={(e) => {
+          setDuration(e.currentTarget.duration || 0);
+          mediaDebug("element:metadata", { kind: "audio", key, slug: card.slug }, {
+            duration: Math.round(e.currentTarget.duration || 0),
+          });
+        }}
         onTimeUpdate={(e) => setCurrent(e.currentTarget.currentTime)}
       />
       <button

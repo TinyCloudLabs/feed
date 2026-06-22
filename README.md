@@ -110,7 +110,7 @@ change and no VITE rebuild.** The DID is also **auto-discovered** from
 | --- | --- | --- |
 | Artifact feed | SQL `xyz.tinycloud.artifacts/feed` (applications space) | `tcw.sqlForSpace(appsUri).db(feed).query(...)` |
 | Interactions | SQL `xyz.tinycloud.artifacts/interactions` | `tcw.sqlForSpace(appsUri).db(interactions).execute(INSERT ...)` |
-| Media (hero) | KV `xyz.tinycloud.artifacts/media/<id>/...` | `tcw.kvForSpace(appsUri).get(key)` → base64 → blob URL |
+| Media (hero/audio/video) | KV `xyz.tinycloud.artifacts/media/<id>/...` | `tcw.kvForSpace(appsUri).get(key)` → base64 → blob URL |
 
 Space-scoped storage goes through `tcw.sqlForSpace(uri)` / `tcw.kvForSpace(uri)`
 (`@tinycloud/web-sdk` >= 2.4.0-beta.2); the codebase reaches them through the two
@@ -138,6 +138,17 @@ The Preferences page summarizes the same interaction rows with
 feedback as an early signal, only marks it directional after repeated aligned
 evidence, and keeps the raw interaction history visible so the user can inspect
 what Artifactory will treat as weak-prior generation backpressure.
+
+Media hydration diagnostics are enabled by default on `*.localhost` and Vite dev
+builds. They log structured `[TinyFeed media]` console events for KV hydration
+start/ready/cache-hit/not-found/error plus image/video/audio element readiness.
+Use them from the signed-in browser when media appears lazy or unstable:
+
+```js
+localStorage.setItem("tinyfeed:media-debug", "1") // force diagnostics on
+localStorage.setItem("tinyfeed:media-debug", "0") // force diagnostics off
+localStorage.removeItem("tinyfeed:media-debug")   // return to localhost/dev default
+```
 
 Checks:
 
