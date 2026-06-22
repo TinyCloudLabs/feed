@@ -9,9 +9,10 @@ A Vite + React app (`web/`) that talks to TinyCloud **directly from the browser*
 via the [`@tinycloud/web-sdk`](https://www.npmjs.com/package/@tinycloud/web-sdk) —
 no server, no `/api`, no sessions database. It signs in as the space **owner**
 (v1; scoped reader delegation comes later), reads published artifacts from the
-`feed` SQL DB in the owner's `applications` space, renders **tweet** and
-**article** cards, hydrates hero images from KV, and writes reader
-**interaction** events (nonce-protected) back to the `interactions` SQL DB.
+`feed` SQL DB in the owner's `applications` space, renders compact text,
+articles, podcasts, and clips, hydrates hero/audio/video media from KV, and
+writes reader **interaction** events (nonce-protected) back to the
+`interactions` SQL DB.
 
 ```sh
 bun install
@@ -119,8 +120,9 @@ change and no VITE rebuild.** The DID is also **auto-discovered** from
 Space-scoped storage goes through `tcw.sqlForSpace(uri)` / `tcw.kvForSpace(uri)`
 (`@tinycloud/web-sdk` >= 2.4.0-beta.2); the codebase reaches them through the two
 `spaceSql` / `spaceKv` helpers in `web/src/feedClient.ts`. Render shape is driven
-by the row's `render_type` (`tweet` \| `article` in v1); richer fields come from
-the lossless `raw_artifact` JSON.
+by the row's `render_type` and the format-specific fields preserved in the
+lossless `raw_artifact` JSON, including compact text, articles, podcasts, and
+clips with optional hero/audio/video media keys.
 
 The card **Data trail** intentionally exposes the operational trail for
 development: SQL row `id`, `slug`, schema version, `publisher_did`, producer
@@ -204,9 +206,12 @@ bun run artifact:dev:https
 
 For a deliberate rich-media proof run, add `AGENT_MEDIA_FOCUS=podcast` to bias
 generation toward one real podcast/audio artifact when Gemini TTS is configured.
-Use `AGENT_MEDIA_FOCUS=video AGENT_ENABLE_VIDEO=1` only when `FAL_KEY` is
-configured and you intend to spend on a clip. The default `balanced` mode picks
-the strongest format for the material and should not force audio/video variety.
+Use `AGENT_MEDIA_FOCUS=video AGENT_ENABLE_VIDEO=1` to bias generation toward one
+real clip. Gemini/Veo is the preferred lower-cost video path when configured;
+FAL/Seedance remains the higher-control clip path when `FAL_KEY` is configured
+and you intend to spend on that provider. The default `balanced` mode picks the
+strongest format for the material, but video-enabled auto runs should still
+record a concrete held/skip reason when no clip ships.
 For a targeted operator proof, use the `/agents` target selector, Artifactory's
 Smithers workflows, or call `startRun({ artifactType })`; the returned proof
 block is displayed in `/agents`.
