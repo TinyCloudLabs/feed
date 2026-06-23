@@ -40,6 +40,9 @@ function card(overrides: Partial<FeedCard> = {}): FeedCard {
       producer: {
         pipeline: "artifactory-agent",
         run_id: "run-123",
+        execution_source: "smithers-agent-run-staged",
+        execution_source_label: "Smithers staged agent-run",
+        execution_entrypoint: "bun run smithers:agent-run:staged",
         target_artifact_type: "clip",
         media_focus: "video",
         published_by_agent_at: "2026-06-22T14:23:07.000Z",
@@ -77,6 +80,8 @@ describe("data trail", () => {
     expect(trail.producer.run).toEqual([
       "artifactory-agent",
       "run=run-123",
+      "source=Smithers staged agent-run",
+      "entry=bun run smithers:agent-run:staged",
       "target=clip",
       "media=video",
       "agent_publish=2026-06-22T14:23:07.000Z",

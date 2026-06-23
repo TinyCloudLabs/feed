@@ -69,6 +69,10 @@ function producerTrail(card: FeedCard): ProducerTrail {
   const runId = firstRawString(producer, "run_id", "runId");
   const target = firstRawString(producer, "target_artifact_type", "targetArtifactType");
   const mediaFocus = firstRawString(producer, "media_focus", "mediaFocus");
+  const executionSource =
+    firstRawString(producer, "execution_source_label", "executionSourceLabel") ??
+    firstRawString(producer, "execution_source", "executionSource");
+  const executionEntrypoint = firstRawString(producer, "execution_entrypoint", "executionEntrypoint");
   const publishedAt = firstRawString(producer, "published_by_agent_at", "publishedByAgentAt");
   const delegationCid = firstRawString(producer, "delegation_cid", "delegationCid");
   const delegationExpiresAt = firstRawString(producer, "delegation_expires_at", "delegationExpiresAt");
@@ -78,6 +82,8 @@ function producerTrail(card: FeedCard): ProducerTrail {
     run: [
       rawString(producer.pipeline),
       runId ? `run=${runId}` : null,
+      executionSource ? `source=${executionSource}` : null,
+      executionEntrypoint ? `entry=${executionEntrypoint}` : null,
       target ? `target=${target}` : null,
       mediaFocus ? `media=${mediaFocus}` : null,
       publishedAt ? `agent_publish=${publishedAt}` : null,
