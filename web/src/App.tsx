@@ -1,411 +1,313 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { restoreSession, signOut, type SessionRestoreTrace } from "./tinycloud.ts";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import type {
+  ControlIntentEvent,
+  FeedArtifactProjection,
+  FeedbackEvent,
+} from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
-  agentConfigured,
-  clearStoredDelegation,
-  ensureDelegation,
-} from "./agentClient.ts";
-import { bootstrapSchema } from "./feedClient.ts";
-import { navigate, parseRoute, useRoute } from "./router.tsx";
-import type { Session } from "./session.ts";
-import type { DelegationInfo, RunRecord } from "./pages/types.ts";
-import { ConnectPage } from "./pages/Connect.tsx";
-import { FeedPage } from "./pages/Feed.tsx";
-import { ArticlePage } from "./pages/Article.tsx";
-import { AgentsPage } from "./pages/Agents.tsx";
-import { PreferencesPage } from "./pages/Preferences.tsx";
+  restoreSession,
+  signIn,
+  signOut,
+  submitFeedHostDelegations,
+  type FeedSession,
+} from "./auth.ts";
+import type { FeedHostDelegationPolicy } from "./delegation.ts";
+import { FeedV1HostClient, FeedV1HostError } from "./feedV1HostClient.ts";
+import { bodyPreview, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
 
-const UNDO_MS = 8000;
-const SCHEMA_BOOTSTRAP_ATTEMPTS = 3;
+type LoadState = "idle" | "loading" | "ready" | "error";
+type DelegationState = "idle" | "loading" | "ready" | "error";
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+function shortAddress(value: string): string {
+  return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
 }
 
-function transientSchemaBootstrapError(e: unknown): boolean {
-  const message = e instanceof Error ? e.message : String(e);
-  return /connection pool timed out|failed to acquire connection|internal error/i.test(message);
-}
-
-async function bootstrapSchemaWithRetry(
-  appsSpaceUri: string,
-  onEvent: (event: Record<string, unknown>) => void,
-): Promise<{ skippedIndexes: string[] }> {
-  let lastError: unknown;
-  for (let attempt = 1; attempt <= SCHEMA_BOOTSTRAP_ATTEMPTS; attempt++) {
-    const started = performance.now();
-    onEvent({ stage: "schema-bootstrap-attempt", attempt, elapsedMs: 0 });
-    try {
-      const result = await bootstrapSchema(appsSpaceUri);
-      onEvent({
-        stage: "schema-bootstrap-result",
-        attempt,
-        elapsedMs: Math.round(performance.now() - started),
-        skippedIndexes: result.skippedIndexes.length,
-      });
-      return result;
-    } catch (e) {
-      lastError = e;
-      const retryable = transientSchemaBootstrapError(e);
-      onEvent({
-        stage: retryable ? "schema-bootstrap-retryable-error" : "schema-bootstrap-failed",
-        attempt,
-        elapsedMs: Math.round(performance.now() - started),
-        message: e instanceof Error ? e.message : String(e),
-      });
-      if (!retryable || attempt === SCHEMA_BOOTSTRAP_ATTEMPTS) break;
-      await wait(750 * attempt);
-    }
-  }
-  throw lastError;
-}
-
-function restoreStageLabel(trace: SessionRestoreTrace): string {
-  switch (trace.stage) {
-    case "read-address":
-      return "Checking saved sign-in";
-    case "address-result":
-      return trace.hasAddress ? "Saved sign-in found" : "No saved sign-in";
-    case "sdk-created":
-      return "Preparing TinyCloud session";
-    case "sdk-restore-start":
-      return "Restoring TinyCloud session";
-    case "sdk-restore-result":
-      return trace.status ? `TinyCloud restore: ${trace.status}` : "TinyCloud restore finished";
-    case "space-ready":
-      return "Applications space ready";
-    case "stale-address-cleared":
-      return trace.status ? `Cleared stale saved sign-in: ${trace.status}` : "Cleared stale saved sign-in";
-    case "restore-failed":
-      return trace.status ? `Restore failed: ${trace.status}` : "Restore failed";
-    default:
-      return trace.stage;
-  }
+function newNonce(): string {
+  return crypto.randomUUID();
 }
 
 export function App() {
-  const route = useRoute();
-  const [session, setSession] = useState<Session | null>(null);
-  // Live mirror of `session` for the stable ensureAgentDelegation callback: the
-  // re-grant / Generate paths need the CURRENT session's space without depending
-  // on a stale closure. Sign-in / restore pass the space explicitly (no ref-
-  // timing gap right after they resolve).
-  const sessionRef = useRef<Session | null>(null);
-  const [delegation, setDelegation] = useState<DelegationInfo | null>(null);
-  // Restore-on-mount gate: until the persisted-session check finishes we render
-  // a brief "Restoring…" state instead of flashing the sign-in screen on every
-  // reload / new tab. Starts true and flips false once restore resolves.
-  const [restoring, setRestoring] = useState(true);
-  const [restoreError, setRestoreError] = useState<string | null>(null);
-  const [restoreStatus, setRestoreStatus] = useState("Checking saved sign-in");
-  const [restoreTrace, setRestoreTrace] = useState<SessionRestoreTrace[]>([]);
-  // True while the agent auto-connect is in flight; carries any auto-delegate
-  // failure (surfaced, not swallowed) so Connect/Agents can show it.
-  const [agentConnecting, setAgentConnecting] = useState(false);
-  const [agentError, setAgentError] = useState<string | null>(null);
-  const [runs, setRuns] = useState<RunRecord[]>([]);
-  // Bumped after a successful agent run so the feed re-reads the user's space.
-  const [feedRefreshKey, setFeedRefreshKey] = useState(0);
-  // Stable refresh callback so the build controller's poll effect (which depends
-  // on it) isn't re-created on every App render.
-  const bumpFeedRefresh = useCallback(() => setFeedRefreshKey((k) => k + 1), []);
+  const [session, setSession] = useState<FeedSession | null>(null);
+  const [policy, setPolicy] = useState<FeedHostDelegationPolicy | null>(null);
+  const [restoreDone, setRestoreDone] = useState(false);
+  const [signInError, setSignInError] = useState<string | null>(null);
+  const [delegationState, setDelegationState] = useState<DelegationState>("idle");
+  const [items, setItems] = useState<FeedItem[]>([]);
+  const [loadState, setLoadState] = useState<LoadState>("idle");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
 
-  // Cards dismissed via "less" — hidden immediately, session-only (the
-  // distill-preferences loop handles durable effects).
-  const [hidden, setHidden] = useState<ReadonlySet<string>>(new Set());
-  const [undo, setUndo] = useState<{ id: string } | null>(null);
-  const undoTimer = useRef<number | null>(null);
-
-  const hideCard = useCallback((id: string) => {
-    setHidden((prev) => new Set(prev).add(id));
-    setUndo({ id });
-    if (undoTimer.current !== null) window.clearTimeout(undoTimer.current);
-    undoTimer.current = window.setTimeout(() => setUndo(null), UNDO_MS);
-  }, []);
-
-  const pauseUndoTimer = useCallback(() => {
-    if (undoTimer.current !== null) {
-      window.clearTimeout(undoTimer.current);
-      undoTimer.current = null;
-    }
-  }, []);
-  const resumeUndoTimer = useCallback(() => {
-    if (undoTimer.current !== null) window.clearTimeout(undoTimer.current);
-    undoTimer.current = window.setTimeout(() => setUndo(null), UNDO_MS);
-  }, []);
-
-  const undoHide = useCallback(() => {
-    setUndo((u) => {
-      if (u) {
-        setHidden((prev) => {
-          const next = new Set(prev);
-          next.delete(u.id);
-          return next;
-        });
-      }
-      return null;
-    });
-    if (undoTimer.current !== null) window.clearTimeout(undoTimer.current);
-  }, []);
-
-  const onSignOut = useCallback(() => {
-    // Clear local restore pointers up front so a signOut() rejection can't leave
-    // a restorable session; signOut() also clears them internally (defense in
-    // depth). Swallow only the signOut rejection here — the pointers are gone.
-    clearStoredDelegation();
-    sessionRef.current = null;
-    signOut().catch(() => {});
-    setSession(null);
-    setDelegation(null);
-    setRuns([]);
-    navigate({ kind: "connect" });
-  }, []);
-
-  // Auto-connect the agent: reuse a valid stored delegation (bound to THIS
-  // session's space) or mint a fresh one, with NO manual "look up agent" /
-  // "delegate" clicks. Runs after sign-in (fresh OR restored) and on demand from
-  // Generate. `spaceUri` is the active session's applications-space URI — passed
-  // explicitly by sign-in/restore, else read from sessionRef for re-grant/
-  // Generate. A no-op when the agent backend isn't configured or there's no
-  // session. Errors are CAPTURED into agentError (surfaced by Connect/Agents)
-  // rather than swallowed; the promise still rejects so callers that await it
-  // (Generate) can abort the run.
-  const ensureAgentDelegation = useCallback(async (spaceUri?: string) => {
-    if (!agentConfigured()) return;
-    const space = spaceUri ?? sessionRef.current?.appsSpaceUri;
-    if (!space) return;
-    setAgentConnecting(true);
-    setAgentError(null);
-    try {
-      const ack = await ensureDelegation(space);
-      setDelegation({
-        agentDid: ack.agentDid,
-        delegationCid: ack.delegationCid,
-        spaceId: ack.spaceId,
-        expiresAt: ack.expiresAt,
-      });
-    } catch (e) {
-      setAgentError(e instanceof Error ? e.message : String(e));
-      throw e;
-    } finally {
-      setAgentConnecting(false);
-    }
-  }, []);
-
-  // Re-grant: drop the stored + in-memory delegation, then mint a fresh one.
-  // The recovery affordance behind the otherwise-automatic agent connect.
-  const reGrantAgent = useCallback(async () => {
-    clearStoredDelegation();
-    setDelegation(null);
-    await ensureAgentDelegation();
-  }, [ensureAgentDelegation]);
-
-  // Local revoke: forget the delegation (stored + in-memory) without re-minting.
-  // Client-side only — the contract has no server revoke endpoint in the MVP.
-  const forgetDelegation = useCallback(() => {
-    clearStoredDelegation();
-    setDelegation(null);
-  }, []);
-
-  // Called by Connect after a FRESH sign-in: adopt the session, land the user on
-  // the feed, and auto-connect the agent IN THE BACKGROUND so they see their feed
-  // immediately rather than the delegate screen.
-  const onSession = useCallback(
-    (s: Session) => {
-      sessionRef.current = s;
-      setSession(s);
-      // Sign-in lands on the feed (spec §1) — but HONOR a deep link: an
-      // unauthenticated /agents or /a/:slug renders ConnectPage as a fallback, so
-      // after sign-in the user should return to where they were headed. Mirror the
-      // restore-on-mount guard: read the live pathname once and only redirect when
-      // it's the DEFAULT connect route ("/"). The feed must NOT block on the agent
-      // delegation below (it reads the user's space directly; a missing delegation
-      // only affects Generate, which auto-ensures one when clicked).
-      if (parseRoute(location.pathname).kind === "connect") {
-        navigate({ kind: "feed" });
-      }
-      // Fire-and-forget: the error (if any) lands in agentError; the rejection
-      // here is already captured, so ignore it at the call site. Pass the space
-      // explicitly so the delegation binds to THIS session.
-      ensureAgentDelegation(s.appsSpaceUri).catch(() => {});
-    },
-    [ensureAgentDelegation],
+  const client = useMemo(
+    () => new FeedV1HostClient({ baseUrl: FEED_HOST_URL, token: FEED_HOST_TOKEN || undefined, actorId: session?.readerDid }),
+    [session?.readerDid],
   );
 
-  // Restore-on-mount: rehydrate a persisted session WITHOUT a passkey prompt, so
-  // reload / new tab / "continue reading" don't force a re-sign-in. On success
-  // we also re-bootstrap the schema (idempotent) and auto-connect the agent —
-  // the same ready state a fresh sign-in produces. A missing/expired session
-  // falls through to Connect; a real restore failure is surfaced, not hidden.
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
-      try {
-        const restored = await restoreSession((trace) => {
-          if (cancelled) return;
-          setRestoreTrace((prev) => [...prev, trace]);
-          setRestoreStatus(restoreStageLabel(trace));
-        });
-        if (cancelled) return;
-        if (restored) {
-          sessionRef.current = restored;
-          setSession(restored);
-          setRestoring(false);
-          // A restored session should also land on the feed (spec §1) — but
-          // ONLY when there's no deeper intent: if the user deep-linked to a
-          // specific route (/agents, /a/:slug, …) we honor it. We read the live
-          // pathname here (one-shot, at restore time) rather than the routed
-          // state so this can't re-run on later navigation. Only the DEFAULT
-          // connect route ("/") is redirected to the feed.
-          if (parseRoute(location.pathname).kind === "connect") {
-            navigate({ kind: "feed" });
+    const bootstrap = async () => {
+      const nextPolicy = await client.getDelegationPolicy();
+      if (cancelled) return;
+      setPolicy(nextPolicy);
+      const restored = await restoreSession(nextPolicy);
+      if (!cancelled && restored) setSession(restored);
+    };
+    bootstrap()
+      .then(() => undefined)
+      .catch((error: unknown) => {
+        if (!cancelled) setSignInError(error instanceof Error ? error.message : String(error));
+      })
+      .finally(() => {
+        if (!cancelled) setRestoreDone(true);
+      });
+    return () => {
+      cancelled = true;
+      };
+  }, []);
+
+  useEffect(() => {
+    if (!session || !policy) return;
+    let cancelled = false;
+    setDelegationState("loading");
+    submitFeedHostDelegations({ client, policy, actorId: session.readerDid })
+      .then(() => {
+        if (!cancelled) setDelegationState("ready");
+      })
+      .catch(async (error: unknown) => {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (message.includes("fresh wallet-backed delegation")) {
+            await signOut();
+            if (cancelled) return;
+            setSession(null);
+            setSignInError(message);
+            setItems([]);
+            setDelegationState("idle");
+            setLoadState("idle");
+            return;
           }
-          // Do not hold the whole app on idempotent schema bootstrap after the
-          // session is already restored. Run it in the background, log timing,
-          // and refresh the feed when it completes.
-          console.info("[TinyFeed restore]", { stage: "schema-bootstrap-start", elapsedMs: 0 });
-          bootstrapSchemaWithRetry(restored.appsSpaceUri, (event) => {
-            console.info("[TinyFeed restore]", event);
-          })
-            .then(() => {
-              bumpFeedRefresh();
-            })
-            .catch((e) => {
-              const retryable = transientSchemaBootstrapError(e);
-              console.warn("[TinyFeed restore]", {
-                stage: retryable ? "schema-bootstrap-deferred" : "schema-bootstrap-failed",
-                message: e instanceof Error ? e.message : String(e),
-              });
-              if (!cancelled) {
-                setRestoreError(
-                  retryable
-                    ? "TinyCloud schema setup is busy; feed reads still work, and setup will retry on refresh."
-                    : e instanceof Error
-                      ? e.message
-                      : String(e),
-                );
-              }
-            });
-          ensureAgentDelegation(restored.appsSpaceUri).catch(() => {});
+          setDelegationState("error");
+          setLoadState("error");
+          setLoadError(message);
         }
-      } catch (e) {
-        if (!cancelled) setRestoreError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) setRestoring(false);
-      }
-    })();
+      });
     return () => {
       cancelled = true;
     };
-  }, [ensureAgentDelegation]);
+  }, [client, policy, session]);
 
-  // While restore-on-mount is in flight, hold a brief "Restoring…" state instead
-  // of flashing the sign-in screen. Once it resolves we either have a session
-  // (render the route) or fall through to Connect.
-  if (restoring) {
-    return (
-      <div className="feed-status">
-        <p className="feed-status-line">Restoring session…</p>
-        <p className="feed-status-sub">{restoreStatus}</p>
-        {restoreTrace.length > 0 && (
-          <details className="restore-trace">
-            <summary>Details</summary>
-            <ol>
-              {restoreTrace.map((trace, index) => (
-                <li key={`${trace.stage}-${index}`}>
-                  <span>{restoreStageLabel(trace)}</span>
-                  <span>{trace.elapsedMs}ms</span>
-                </li>
-              ))}
-            </ol>
-          </details>
-        )}
-        {restoreError && (
-          <div className="feed-error" style={{ marginTop: 14 }}>{restoreError}</div>
-        )}
-      </div>
-    );
+  const loadFeed = useCallback(async () => {
+    if (!session || delegationState !== "ready") return;
+    setLoadState("loading");
+    setLoadError(null);
+    try {
+      const page = await client.listFeed({ limit: 40 });
+      const hydrated = await Promise.all(
+        page.items.map(async (projection): Promise<FeedItem> => {
+          try {
+            const artifact = await client.getArtifact(projection.artifactId);
+            return { projection, artifact };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return { projection, artifact: null, error: message };
+          }
+        }),
+      );
+      setItems(sortedFeed(hydrated));
+      setLoadState("ready");
+    } catch (error) {
+      setLoadState("error");
+      setLoadError(formatHostError(error));
+    }
+  }, [client, delegationState, session]);
+
+  useEffect(() => {
+    void loadFeed();
+  }, [loadFeed]);
+
+  const connect = async () => {
+    setSignInError(null);
+    try {
+      const nextPolicy = policy ?? await client.getDelegationPolicy();
+      setPolicy(nextPolicy);
+      setSession(await signIn(nextPolicy));
+    } catch (error) {
+      setSignInError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const disconnect = async () => {
+    await signOut();
+    setSession(null);
+    setDelegationState("idle");
+    setItems([]);
+    setLoadState("idle");
+  };
+
+  const sendFeedback = async (projection: FeedArtifactProjection, signal: FeedbackEvent["signal"]) => {
+    if (!session) return;
+    const actionId = `${projection.artifactId}:${signal}`;
+    setBusyAction(actionId);
+    try {
+      await client.postFeedback({
+        eventId: crypto.randomUUID(),
+        artifactId: projection.artifactId,
+        actorId: session.readerDid,
+        readerNonce: newNonce(),
+        signal,
+        createdAt: new Date().toISOString(),
+      });
+      await loadFeed();
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const sendAskFeed = async () => {
+    if (!session) return;
+    const event: ControlIntentEvent = {
+      eventId: crypto.randomUUID(),
+      actorId: session.readerDid,
+      readerNonce: newNonce(),
+      intentKind: "ask_feed",
+      status: "accepted",
+      targetRef: "feed",
+      payload: { prompt: "Generate something useful from my latest Listen context." },
+      createdAt: new Date().toISOString(),
+    };
+    setBusyAction("ask_feed");
+    try {
+      await client.postControlIntent(event);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  if (!restoreDone) {
+    return <StatusScreen title="Restoring session" detail="Checking Feed Host policy and saved TinyCloud session." />;
   }
 
-  // Every route except Connect requires a session. Send unauthenticated deep
-  // links back to Connect rather than rendering a page with no session.
-  const needsSession = route.kind !== "connect";
-  if (needsSession && !session) {
+  if (!session) {
     return (
-      <ConnectPage
-        session={session}
-        delegation={delegation}
-        onSession={onSession}
-        onReGrant={reGrantAgent}
-        agentConnecting={agentConnecting}
-        agentError={agentError}
-        restoreError={restoreError}
-      />
+      <StatusScreen title="TinyFeed" detail="Private Feed Host client for Feed v1.">
+        <button className="primary" onClick={() => void connect()}>Sign in with OpenKey</button>
+        {signInError && <p className="error">{signInError}</p>}
+      </StatusScreen>
     );
   }
 
   return (
-    <>
-      {route.kind === "connect" && (
-        <ConnectPage
-          session={session}
-          delegation={delegation}
-          onSession={onSession}
-          onReGrant={reGrantAgent}
-          agentConnecting={agentConnecting}
-          agentError={agentError}
-          restoreError={restoreError}
-        />
+    <div className="app-shell">
+      <header className="topbar">
+        <div>
+          <h1>Feed</h1>
+          <p>{FEED_HOST_URL}</p>
+        </div>
+        <div className="topbar-actions">
+          <span className="identity">{shortAddress(session.address)}</span>
+          <button onClick={() => void loadFeed()}>Refresh</button>
+          <button onClick={() => void sendAskFeed()} disabled={busyAction === "ask_feed"}>Ask Feed</button>
+          <button onClick={() => void disconnect()}>Sign out</button>
+        </div>
+      </header>
+
+      {loadState === "loading" && <div className="notice">Loading Feed Host projections...</div>}
+      {delegationState === "loading" && <div className="notice">Creating Feed Host delegation...</div>}
+      {loadState === "error" && (
+        <div className="notice error">
+          <strong>Feed Host unavailable.</strong>
+          <span>{loadError}</span>
+        </div>
       )}
-      {route.kind === "feed" && session && (
-        <FeedPage
-          session={session}
-          hidden={hidden}
-          onHide={hideCard}
-          onSignOut={onSignOut}
-          refreshKey={feedRefreshKey}
-          ensureDelegation={ensureAgentDelegation}
-          onFeedRefresh={bumpFeedRefresh}
-          agentError={agentError}
-          sessionError={restoreError}
-        />
-      )}
-      {route.kind === "article" && session && (
-        <ArticlePage slug={route.slug} session={session} onHide={hideCard} />
-      )}
-      {route.kind === "agents" && session && (
-        <AgentsPage
-          delegation={delegation}
-          runs={runs}
-          ensureDelegation={ensureAgentDelegation}
-          onReGrant={reGrantAgent}
-          onForget={forgetDelegation}
-          agentConnecting={agentConnecting}
-          agentError={agentError}
-          onRunsChange={setRuns}
-          onFeedRefresh={bumpFeedRefresh}
-        />
-      )}
-      {route.kind === "preferences" && session && (
-        <PreferencesPage session={session} />
+      {loadState === "ready" && items.length === 0 && (
+        <div className="empty">
+          <h2>No projected artifacts</h2>
+          <p>The Feed Host returned an empty projection set. Generate or enable a package to populate the feed.</p>
+        </div>
       )}
 
-      <div role="status" aria-live="polite">
-        {undo && (
-          <div
-            className="undo-toast"
-            onMouseEnter={pauseUndoTimer}
-            onMouseLeave={resumeUndoTimer}
-            onFocus={pauseUndoTimer}
-            onBlur={resumeUndoTimer}
-          >
-            <span className="undo-toast-text">Removed from feed</span>
-            <button type="button" className="quiet-link" onClick={undoHide}>
-              Undo
-            </button>
-          </div>
-        )}
-      </div>
-    </>
+      <main className="feed-list">
+        {items.map((item) => (
+          <FeedCard
+            key={item.projection.artifactId}
+            item={item}
+            busyAction={busyAction}
+            onFeedback={sendFeedback}
+          />
+        ))}
+      </main>
+    </div>
   );
+}
+
+function FeedCard({
+  item,
+  busyAction,
+  onFeedback,
+}: {
+  item: FeedItem;
+  busyAction: string | null;
+  onFeedback: (projection: FeedArtifactProjection, signal: FeedbackEvent["signal"]) => Promise<void>;
+}) {
+  const artifact = item.artifact;
+  return (
+    <article className={item.projection.disposition === "hidden" ? "feed-card hidden-card" : "feed-card"}>
+      <div className="card-meta">
+        <span>{artifact?.artifactType ?? "artifact"}</span>
+        <span>{projectionLabel(item.projection)}</span>
+      </div>
+      <h2>{artifact?.title ?? item.projection.artifactId}</h2>
+      {artifact?.summary && <p className="summary">{artifact.summary}</p>}
+      <pre>{bodyPreview(artifact)}</pre>
+      {item.error && <p className="error">Hydration failed: {item.error}</p>}
+      <dl className="provenance">
+        <div>
+          <dt>Package</dt>
+          <dd>{artifact?.producedBy.packageId ?? item.projection.packageId}</dd>
+        </div>
+        <div>
+          <dt>Freshness</dt>
+          <dd>{artifact?.freshness.label ?? item.projection.freshnessLabel}</dd>
+        </div>
+        <div>
+          <dt>Source</dt>
+          <dd>{item.projection.sourceFingerprint}</dd>
+        </div>
+      </dl>
+      <div className="card-actions">
+        {(["save", "hide", "helpful", "unhelpful", "show_fewer"] as const).map((signal) => (
+          <button
+            key={signal}
+            disabled={busyAction === `${item.projection.artifactId}:${signal}`}
+            onClick={() => void onFeedback(item.projection, signal)}
+          >
+            {signal.replace("_", " ")}
+          </button>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function StatusScreen({
+  title,
+  detail,
+  children,
+}: {
+  title: string;
+  detail: string;
+  children?: ReactNode;
+}) {
+  return (
+    <main className="status-screen">
+      <h1>{title}</h1>
+      <p>{detail}</p>
+      {children}
+    </main>
+  );
+}
+
+function formatHostError(error: unknown): string {
+  if (error instanceof FeedV1HostError) return `${error.status}: ${error.body || error.message}`;
+  return error instanceof Error ? error.message : String(error);
 }

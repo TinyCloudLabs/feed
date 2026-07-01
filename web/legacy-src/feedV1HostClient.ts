@@ -1,0 +1,102 @@
+import type {
+  ControlIntentEvent,
+  FeedArtifact,
+  FeedArtifactProjection,
+  FeedbackEvent,
+} from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+
+export type FeedV1Page = {
+  items: FeedArtifactProjection[];
+  nextCursor?: string;
+};
+
+export type ArtifactProvenance = Pick<FeedArtifact, "artifactId" | "sourceRefs" | "producedBy" | "freshness" | "idempotency">;
+
+export type FeedV1HostClientOptions = {
+  baseUrl: string;
+  token?: string;
+  fetchImpl?: typeof fetch;
+};
+
+export class FeedV1HostError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: string,
+  ) {
+    super(message);
+    this.name = "FeedV1HostError";
+  }
+}
+
+function normalizeBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, "");
+  if (!trimmed) throw new Error("Feed Host baseUrl is required");
+  return trimmed;
+}
+
+function encodePath(value: string): string {
+  return encodeURIComponent(value);
+}
+
+export class FeedV1HostClient {
+  private readonly baseUrl: string;
+  private readonly fetchImpl: typeof fetch;
+  private readonly token?: string;
+
+  constructor(options: FeedV1HostClientOptions) {
+    this.baseUrl = normalizeBaseUrl(options.baseUrl);
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.token = options.token;
+  }
+
+  async listFeed(input: { limit?: number; cursor?: string } = {}): Promise<FeedV1Page> {
+    const params = new URLSearchParams();
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    if (input.cursor) params.set("cursor", input.cursor);
+    return this.request<FeedV1Page>(`/feed${params.size ? `?${params}` : ""}`);
+  }
+
+  async getArtifact(artifactId: string): Promise<FeedArtifact> {
+    return this.request<FeedArtifact>(`/artifacts/${encodePath(artifactId)}`);
+  }
+
+  async getProvenance(artifactId: string): Promise<ArtifactProvenance> {
+    return this.request<ArtifactProvenance>(`/artifacts/${encodePath(artifactId)}/provenance`);
+  }
+
+  async postFeedback(event: FeedbackEvent): Promise<{ accepted: true; eventId: string }> {
+    return this.request<{ accepted: true; eventId: string }>("/feedback", {
+      method: "POST",
+      body: JSON.stringify(event),
+    });
+  }
+
+  async postControlIntent(event: ControlIntentEvent): Promise<{ accepted: true; eventId: string }> {
+    return this.request<{ accepted: true; eventId: string }>("/control-intents", {
+      method: "POST",
+      body: JSON.stringify(event),
+    });
+  }
+
+  eventsUrl(): string {
+    return `${this.baseUrl}/feed/events`;
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const headers = new Headers(init.headers);
+    headers.set("accept", "application/json");
+    if (init.body !== undefined && !headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
+    if (this.token) headers.set("authorization", `Bearer ${this.token}`);
+
+    const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new FeedV1HostError(`Feed Host request failed: ${res.status}`, res.status, text);
+    }
+    if (!text) return undefined as T;
+    return JSON.parse(text) as T;
+  }
+}
