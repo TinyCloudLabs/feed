@@ -5,6 +5,7 @@ const TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae78
 const TEST_ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const TEST_ACTOR_ID = `did:pkh:eip155:1:${TEST_ADDRESS}`;
 const TEST_WALLET_NAME = "TinyCloud Test Wallet";
+const FEED_HOST_URL = `http://127.0.0.1:${process.env.FEED_SMOKE_HOST_PORT ?? "8787"}`;
 const ETHERS_UMD_PATH = fileURLToPath(
   new URL("../../node_modules/ethers/dist/ethers.umd.min.js", import.meta.url),
 );
@@ -106,7 +107,7 @@ test("signs in through OpenKey external wallet", async ({ page }) => {
   await page.getByRole("button", { name: "Ask Feed" }).click();
   await expect
     .poll(async () => {
-      const response = await page.request.get("http://127.0.0.1:8787/admin/state", {
+      const response = await page.request.get(`${FEED_HOST_URL}/admin/state`, {
         headers: { "x-feed-actor-id": TEST_ACTOR_ID },
       });
       const state = await response.json();
