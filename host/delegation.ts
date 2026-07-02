@@ -3,6 +3,7 @@ import {
   principalDidEquals,
   TinyCloudNode,
   type DelegatedAccess,
+  type Manifest,
   type PortableDelegation,
 } from "@tinycloud/node-sdk";
 import {
@@ -63,6 +64,7 @@ export type AcceptedFeedDelegation = {
 };
 
 export type ActivatedFeedDelegation = AcceptedFeedDelegation & {
+  expiresAt: string;
   portableDelegation: PortableDelegation;
   access: DelegatedAccess;
 };
@@ -98,10 +100,35 @@ export function createFeedHostPolicy(delegateDID: string): FeedHostDelegationPol
   };
 }
 
+const FEED_HOST_SPACE_PREFIX = "feed-host";
+
+function feedHostNodeManifest(spaceName: string): Manifest {
+  return {
+    manifest_version: 1,
+    app_id: "xyz.tinycloud.feed.host",
+    name: "Feed Host",
+    defaults: false,
+    permissions: [
+      {
+        service: "tinycloud.kv",
+        space: spaceName,
+        path: "delegations/",
+        actions: ["get", "put", "del", "list", "metadata"],
+        skipPrefix: true,
+      },
+    ],
+  };
+}
+
 export function createFeedHostNode(input: { privateKey?: string; host?: string }): TinyCloudNode {
   return new TinyCloudNode({
     ...(input.privateKey ? { privateKey: input.privateKey } : {}),
     ...(input.host ? { host: input.host } : {}),
+    prefix: FEED_HOST_SPACE_PREFIX,
+    autoCreateSpace: true,
+    enablePublicSpace: false,
+    includeAccountRegistryPermissions: false,
+    manifest: feedHostNodeManifest(FEED_HOST_SPACE_PREFIX),
   });
 }
 
@@ -109,7 +136,7 @@ export function validateFeedHostDelegation(input: {
   serializedDelegation: string;
   expectedDelegateDID: string;
   now?: Date;
-}): AcceptedFeedDelegation & { portableDelegation: PortableDelegation } {
+}): AcceptedFeedDelegation & { expiresAt: string; portableDelegation: PortableDelegation } {
   let delegation: DelegationLike;
   try {
     delegation = deserializeDelegation(input.serializedDelegation) as DelegationLike;
@@ -145,6 +172,7 @@ export function validateFeedHostDelegation(input: {
   return {
     actorId: signedOwnerAddress(grants) ?? delegation.ownerAddress ?? "",
     acceptedAt: new Date().toISOString(),
+    expiresAt: expiry.toISOString(),
     resources: acceptedResources,
     portableDelegation: delegation,
   };
