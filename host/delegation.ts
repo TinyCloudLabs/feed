@@ -5,6 +5,11 @@ import {
   type DelegatedAccess,
   type PortableDelegation,
 } from "@tinycloud/node-sdk";
+import {
+  FEED_V1_ARTIFACT_DOC_PREFIX,
+  FEED_V1_ARTIFACTS_INDEX_DB_PATH,
+  FEED_V1_FEED_INDEX_DB_PATH,
+} from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
 
 export const FEED_HOST_SQL_ACTIONS = [
   "tinycloud.sql/read",
@@ -18,9 +23,12 @@ export const FEED_HOST_KV_ACTIONS = [
   "tinycloud.kv/list",
 ] as const;
 
-export const FEED_HOST_ARTIFACTS_DB_PATH = "xyz.tinycloud.feed.v1/artifacts_index";
-export const FEED_HOST_FEED_DB_PATH = "xyz.tinycloud.feed.v1/feed_index";
-export const FEED_HOST_ARTIFACT_DOC_PREFIX = "xyz.tinycloud.feed.v1/artifacts";
+// Canonical spec split: Artifacts SQL/KV live under xyz.tinycloud.artifacts,
+// Feed SQL under xyz.tinycloud.feed. Sourced from the Artifactory shared
+// contracts so the delegation policy and minted delegations stay in lockstep.
+export const FEED_HOST_ARTIFACTS_DB_PATH = FEED_V1_ARTIFACTS_INDEX_DB_PATH;
+export const FEED_HOST_FEED_DB_PATH = FEED_V1_FEED_INDEX_DB_PATH;
+export const FEED_HOST_ARTIFACT_DOC_PREFIX = FEED_V1_ARTIFACT_DOC_PREFIX;
 
 export const FEED_HOST_DELEGATION_RESOURCES = [
   {
