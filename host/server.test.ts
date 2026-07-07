@@ -104,6 +104,33 @@ describe("Feed Host server", () => {
     expect(state.generationRequests).toBe(1);
   });
 
+  test("binds delegations to the validated actor identity", async () => {
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const response = await fetch(`${runtime.url}/delegations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        actorId: "did:pkh:eip155:1:0x0000000000000000000000000000000000000001",
+        serializedDelegation: "xyz.tinycloud.artifacts/index",
+      }),
+    });
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      error: {
+        code: "actor_mismatch",
+        message: "actorId does not match the delegation owner identity",
+      },
+    });
+  });
+
   test("persists accepted delegations and restores actors across restarts", async () => {
     const store = fakeDelegationStore();
     const serverOptions = () => ({

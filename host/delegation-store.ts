@@ -1,4 +1,5 @@
 import type { TinyCloudNode } from "@tinycloud/node-sdk";
+import { normalizeActorId } from "./delegation.ts";
 
 export type StoredFeedDelegationResource = {
   path: string;
@@ -79,7 +80,7 @@ function keyFor(actorId: string): string {
   if (!actorId || actorId.includes("/") || actorId.includes("\\") || actorId.includes("..")) {
     throw new Error("invalid actor id for delegation store");
   }
-  return `delegations/${actorId}`;
+  return `delegations/${normalizeActorId(actorId)}`;
 }
 
 function isStoredRecord(value: unknown): value is StoredFeedDelegationRecord {

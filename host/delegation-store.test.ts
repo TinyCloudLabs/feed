@@ -56,10 +56,12 @@ describe("FeedHostDelegationStore", () => {
     const store = new FeedHostDelegationStore(node);
 
     await store.save(record());
-    expect([...data.keys()]).toEqual([`delegations/${ACTOR_ID}`]);
+    // Keys use the normalized actor id so did:pkh address casing never forks records.
+    expect([...data.keys()]).toEqual([`delegations/${ACTOR_ID.toLowerCase()}`]);
 
     const loaded = await store.load(ACTOR_ID);
     expect(loaded).toEqual(record());
+    expect(await store.load(ACTOR_ID.toLowerCase())).toEqual(record());
     expect(signIns()).toBe(1);
 
     await store.remove(ACTOR_ID);
@@ -72,7 +74,7 @@ describe("FeedHostDelegationStore", () => {
 
     expect(await store.load(ACTOR_ID)).toBeNull();
 
-    data.set(`delegations/${ACTOR_ID}`, { serialized: "legacy-shape" });
+    data.set(`delegations/${ACTOR_ID.toLowerCase()}`, { serialized: "legacy-shape" });
     expect(await store.load(ACTOR_ID)).toBeNull();
   });
 
