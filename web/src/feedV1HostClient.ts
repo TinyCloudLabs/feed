@@ -59,7 +59,7 @@ export class FeedV1HostClient {
   }
 
   async submitDelegation(submission: FeedHostDelegationSubmission): Promise<FeedHostDelegationReceipt> {
-    return this.request<FeedHostDelegationReceipt>("/delegations", {
+    return this.request<FeedHostDelegationReceipt>("/api/delegations", {
       method: "POST",
       body: JSON.stringify(submission),
     });

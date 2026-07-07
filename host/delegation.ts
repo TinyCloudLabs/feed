@@ -33,6 +33,7 @@ export const FEED_HOST_KV_ACTIONS = [
 // contracts so the delegation policy and minted delegations stay in lockstep.
 export const FEED_HOST_ARTIFACTS_DB_PATH = FEED_V1_ARTIFACTS_INDEX_DB_PATH;
 export const FEED_HOST_FEED_DB_PATH = FEED_V1_FEED_INDEX_DB_PATH;
+export const FEED_HOST_FEED_SETTINGS_PREFIX = "xyz.tinycloud.feed/settings";
 export const FEED_HOST_ARTIFACT_DOC_PREFIX = FEED_V1_ARTIFACT_DOC_PREFIX;
 
 export const FEED_HOST_DELEGATION_RESOURCES = [
@@ -47,6 +48,12 @@ export const FEED_HOST_DELEGATION_RESOURCES = [
     serviceShort: "sql",
     path: FEED_HOST_FEED_DB_PATH,
     actions: [...FEED_HOST_SQL_ACTIONS],
+  },
+  {
+    service: "tinycloud.kv",
+    serviceShort: "kv",
+    path: FEED_HOST_FEED_SETTINGS_PREFIX,
+    actions: [...FEED_HOST_KV_ACTIONS],
   },
   {
     service: "tinycloud.kv",
@@ -102,7 +109,7 @@ type DelegationLike = PortableDelegation & {
 export class FeedDelegationError extends Error {
   constructor(
     message: string,
-    readonly code: "malformed" | "wrong_delegatee" | "expired" | "insufficient_policy" | "actor_mismatch",
+    readonly code: "malformed" | "wrong_delegatee" | "expired" | "insufficient_policy" | "actor_mismatch" | "delegation_stale",
   ) {
     super(message);
     this.name = "FeedDelegationError";

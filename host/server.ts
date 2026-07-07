@@ -1,5 +1,13 @@
 import type { DelegatedAccess, TinyCloudNode } from "@tinycloud/node-sdk";
-import type { ControlIntentEvent, FeedbackEvent } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type {
+  ControlIntentEvent,
+  FeedbackEvent,
+} from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import {
+  buildOpenApiDocument,
+  buildServerInfo,
+  createPolicyHash,
+} from "./logic.ts";
 import {
   activateFeedHostDelegation,
   actorIdsMatch,
@@ -11,8 +19,8 @@ import {
   FEED_HOST_FEED_DB_PATH,
   hasCompleteFeedHostDelegation,
   normalizeActorId,
-  type ActivatedFeedDelegation,
   type AcceptedFeedDelegation,
+  type ActivatedFeedDelegation,
   type FeedHostDelegationPolicy,
 } from "./delegation.ts";
 import {
@@ -21,7 +29,11 @@ import {
 } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
 import { seedDefaultFeed } from "./seed.ts";
-import { FeedHostStorage, type FeedHostActorStorage } from "./storage.ts";
+import {
+  FeedHostError,
+  FeedHostStorage,
+  type FeedHostActorStorage,
+} from "./storage.ts";
 
 type JsonBody = Record<string, unknown>;
 type FeedbackRequestBody = Omit<FeedbackEvent, "actorId"> & { actorId?: string };
@@ -54,32 +66,53 @@ type ActorState = AcceptedFeedDelegation & {
   accessByResource: Map<string, DelegatedAccess>;
   storageAccess?: FeedHostActorStorage;
   ready?: Promise<void>;
+  expiresAt: string;
 };
 
 type FeedHostContext = {
   storage: FeedHostStorage;
   policy: FeedHostDelegationPolicy;
+  policyHash: string;
+  serverInfo: ReturnType<typeof buildServerInfo>;
   actors: Map<string, ActorState>;
   activateDelegation: NonNullable<FeedHostServerOptions["activateDelegation"]>;
   seedOnStart: boolean;
   delegationStore: FeedHostDelegationStore | null;
 };
 
-const JSON_HEADERS = {
-  "content-type": "application/json",
+const PUBLIC_PATHS = new Set([
+  "/health",
+  "/delegation-policy",
+  "/api/server-info",
+  "/api/openapi.json",
+]);
+
+const CORS_HEADERS = {
   "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,OPTIONS",
-  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id",
+  "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
+  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, If-None-Match, Last-Event-ID",
+};
+
+const JSON_HEADERS = {
+  ...CORS_HEADERS,
+  "content-type": "application/json",
+};
+
+const SSE_HEADERS = {
+  ...CORS_HEADERS,
+  "content-type": "text/event-stream",
+  "cache-control": "no-cache, no-transform",
+  connection: "keep-alive",
+  "x-accel-buffering": "no",
 };
 
 export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const storage = options.storage ?? new FeedHostStorage();
   const hostNode =
     options.hostNode ?? createFeedHostNode({ privateKey: options.hostPrivateKey, host: options.tinycloudHost });
-  // With a stable host key the node signs into its own TinyCloud space so the
-  // delegate DID is the stable did:pkh identity (and the delegation store can
-  // write to the host's KV space). Without a key the host keeps its generated
-  // session DID and nothing is persisted.
+  // A stable host key lets the host re-activate persisted delegations after
+  // restart. Without one, the host can still serve a live session but cannot
+  // restore old delegates from its KV store.
   const hostReady: Promise<void> = options.hostPrivateKey ? hostNode.signIn() : Promise.resolve();
   hostReady.catch((error) => {
     console.error("Feed Host TinyCloud sign-in failed:", error instanceof Error ? error.message : error);
@@ -92,8 +125,6 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         serializedDelegation: input.serializedDelegation,
         expectedDelegateDID: input.expectedDelegateDID,
       }));
-  // Persisting delegations only makes sense with a stable host identity: a
-  // generated session DID cannot reactivate delegations after a restart.
   const delegationStore =
     options.delegationStore !== undefined
       ? options.delegationStore
@@ -102,11 +133,15 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         : null;
   const actors = new Map<string, ActorState>();
   let context: FeedHostContext | null = null;
+
   const getContext = async (): Promise<FeedHostContext> => {
     await hostReady;
+    const policy = createFeedHostPolicy(hostNode.did);
     context ??= {
       storage,
-      policy: createFeedHostPolicy(hostNode.did),
+      policy,
+      policyHash: createPolicyHash(policy),
+      serverInfo: buildServerInfo(policy),
       actors,
       activateDelegation,
       seedOnStart: options.seedOnStart !== false,
@@ -118,20 +153,23 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const server = Bun.serve({
     port: options.port,
     hostname: options.hostname,
-    // Requests fan out to the upstream TinyCloud node and can exceed Bun's
-    // default 10s idle timeout, which would drop the socket mid-request.
+    // TinyCloud round-trips can exceed Bun's default idle timeout.
     idleTimeout: 120,
     async fetch(request) {
+      if (request.method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: CORS_HEADERS });
+      }
+
+      const url = new URL(request.url);
+      const publicRoute = PUBLIC_PATHS.has(url.pathname);
+      if (!publicRoute && !authorized(request, options.token)) {
+        return jsonError(401, "unauthorized", "missing or invalid bearer token");
+      }
+
       try {
-        if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: JSON_HEADERS });
-        if (!authorized(request, options.token)) return json({ error: { code: "unauthorized", message: "missing or invalid bearer token" } }, 401);
         return await route(request, await getContext());
       } catch (error) {
-        if (error instanceof FeedDelegationError) {
-          return json({ error: { code: error.code, message: error.message } }, error.code === "actor_mismatch" ? 400 : 403);
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        return json({ error: { code: "internal_error", message } }, 500);
+        return mapError(error, url.pathname);
       }
     },
   });
@@ -152,14 +190,18 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
 }
 
 async function route(request: Request, context: FeedHostContext): Promise<Response> {
-  const { storage, policy, actors, activateDelegation, seedOnStart } = context;
+  const { storage, policy, policyHash, serverInfo, actors, activateDelegation, seedOnStart, delegationStore } = context;
   const url = new URL(request.url);
+
   if (request.method === "GET" && url.pathname === "/health") {
     return json({
       ok: true,
+      serviceReady: true,
+      authorityReady: actors.size > 0,
       schema: "tinycloud.sql/schema",
       storage: "tinycloud",
       delegateDID: policy.delegateDID,
+      policyHash,
       actors: actors.size,
     });
   }
@@ -168,97 +210,213 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     return json(policy);
   }
 
-  if (request.method === "POST" && url.pathname === "/delegations") {
-    const body = await requireBody<{ actorId?: string; serializedDelegation: string }>(request, [
-      "serializedDelegation",
-    ]);
-    const accepted = await activateDelegation({
-      serializedDelegation: body.serializedDelegation,
-      expectedDelegateDID: policy.delegateDID,
-    });
-    // Delegations bind to the owner identity signed into the delegation
-    // (accepted.actorId). A payload actorId can only confirm that identity —
-    // never rebind the delegation to another actor namespace.
-    if (body.actorId !== undefined && (typeof body.actorId !== "string" || !actorIdsMatch(body.actorId, accepted.actorId))) {
-      throw new FeedDelegationError("actorId does not match the delegation owner identity", "actor_mismatch");
+  if (request.method === "GET" && url.pathname === "/api/server-info") {
+    const etag = quotedEtag(policyHash);
+    if (etagMatches(request.headers.get("if-none-match"), etag)) {
+      return new Response(null, { status: 304, headers: { ...CORS_HEADERS, etag } });
     }
-    const actorKey = normalizeActorId(accepted.actorId);
+    return json(serverInfo, 200, { etag, "cache-control": "public, max-age=60, must-revalidate" });
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/openapi.json") {
+    return json(buildOpenApiDocument(serverInfo));
+  }
+
+  if (request.method === "GET" && url.pathname === "/api/delegations/status") {
+    const actorId = requireRequestActorId(request);
+    return json(await readDelegationStatus(context, actorId));
+  }
+
+  if (request.method === "DELETE" && url.pathname === "/api/delegations") {
+    const actorId = requireRequestActorId(request);
+    await removeDelegation(context, actorId);
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/delegations") {
+    const body = await readJsonObject(request, "invalid_delegation", "delegation body must be JSON");
+    const serializedDelegation = readString(body, "serializedDelegation", "invalid_delegation", "serializedDelegation is required");
+    const payloadActorId = optionalString(body.actorId);
+    const activated = await activateDelegation({
+      serializedDelegation,
+      expectedDelegateDID: policy.delegateDID,
+    }).catch((error) => {
+      if (error instanceof FeedDelegationError) {
+        if (error.code === "malformed") throw new FeedHostError(error.message, 400, "invalid_delegation");
+        if (error.code === "expired" || error.code === "delegation_stale") {
+          throw new FeedHostError(error.message, 409, "delegation_stale");
+        }
+        if (error.code === "wrong_delegatee" || error.code === "insufficient_policy" || error.code === "actor_mismatch") {
+          throw new FeedHostError(error.message, 403, "denied");
+        }
+      }
+      throw error;
+    });
+    if (payloadActorId && !actorIdsMatch(payloadActorId, activated.actorId)) {
+      throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
+    }
+
+    const actorKey = normalizeActorId(activated.actorId);
     const existing = actors.get(actorKey);
-    const resources = [...new Set([...(existing?.resources ?? []), ...accepted.resources])];
+    const resources = [...new Set([...(existing?.resources ?? []), ...activated.resources])];
     const accessByResource = new Map(existing?.accessByResource);
-    for (const resource of accepted.resources) accessByResource.set(resource, accepted.access);
+    for (const resource of activated.resources) accessByResource.set(resource, activated.access);
     const state: ActorState = {
-      actorId: accepted.actorId,
-      acceptedAt: accepted.acceptedAt,
+      actorId: activated.actorId,
+      acceptedAt: activated.acceptedAt,
+      expiresAt: activated.expiresAt,
       resources,
       accessByResource,
       storageAccess: existing?.storageAccess,
       ready: existing?.ready,
     };
     actors.set(actorKey, state);
-    if (context.delegationStore) {
-      await persistAcceptedDelegation(context.delegationStore, policy, actorKey, {
-        serializedDelegation: body.serializedDelegation,
-        resources: accepted.resources,
-        acceptedAt: accepted.acceptedAt,
-        expiresAt: accepted.expiresAt,
+    if (delegationStore) {
+      await persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
+        serializedDelegation,
+        resources: activated.resources,
+        acceptedAt: activated.acceptedAt,
+        expiresAt: activated.expiresAt,
       });
     }
     if (hasCompleteFeedHostDelegation(state)) await ensureActorReady(storage, state, seedOnStart);
-    return json({ accepted: true, actorId: accepted.actorId, resources });
+    return json({
+      accepted: true,
+      actorId: activated.actorId,
+      resources,
+      policyHash,
+      status: hasCompleteFeedHostDelegation(state) ? "active" : "activation_pending",
+    });
   }
 
   if (request.method === "GET" && url.pathname === "/admin/state") {
-    const actor = await requireActorReady(request, context);
+    const actor = await requireCompleteActor(request, context);
     return json(await storage.debugState(actorStorage(actor)));
   }
 
   if (request.method === "POST" && url.pathname === "/admin/seed") {
-    const actor = await requireActorReady(request, { ...context, seedOnStart: false });
+    const actor = await requireCompleteActor(request, { ...context, seedOnStart: false });
     await seedDefaultFeed(storage, actorStorage(actor));
+    await storage.reconcileFeedProjection(actorStorage(actor));
     return json({ ok: true, state: await storage.debugState(actorStorage(actor)) });
   }
 
   if (request.method === "GET" && url.pathname === "/feed") {
-    const actor = await requireActorReady(request, context);
-    const limit = Number(url.searchParams.get("limit") ?? "40");
+    const actor = await requireCompleteActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
-    if (!Number.isFinite(limit)) return json({ error: { code: "bad_request", message: "limit must be a number" } }, 400);
+    if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
+      throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
+    }
     return json(await storage.listFeed(actorStorage(actor), { limit, cursor }));
+  }
+
+  if (request.method === "GET" && url.pathname === "/feed/events") {
+    const actor = await requireCompleteActor(request, context);
+    const body = await storage.listFeedEvents(actorStorage(actor), optionalString(request.headers.get("last-event-id")));
+    return new Response(body, { status: 200, headers: SSE_HEADERS });
   }
 
   const artifactMatch = url.pathname.match(/^\/artifacts\/([^/]+)(\/provenance)?$/);
   if (request.method === "GET" && artifactMatch) {
-    const actor = await requireActorReady(request, context);
+    const actor = await requireCompleteActor(request, context);
     const artifactId = decodeURIComponent(artifactMatch[1]);
-    const body = artifactMatch[2]
-      ? await storage.getProvenance(actorStorage(actor), artifactId)
-      : await storage.getArtifact(actorStorage(actor), artifactId);
-    if (!body) return json({ error: { code: "not_found", message: `artifact not found: ${artifactId}` } }, 404);
-    return json(body);
+    const result = await storage.readArtifact(actorStorage(actor), artifactId);
+    if (result.kind === "not_found") {
+      return json({ error: { code: "not_found", message: `artifact not found: ${artifactId}` } }, 404);
+    }
+    if (result.kind === "hydration_failed") {
+      return json({ error: { code: "hydration_failed", message: `artifact hydration failed: ${artifactId}` } }, 424);
+    }
+    if (artifactMatch[2]) {
+      return json({
+        artifactId: result.artifact.artifactId,
+        sourceRefs: result.artifact.sourceRefs,
+        producedBy: result.artifact.producedBy,
+        freshness: result.artifact.freshness,
+        idempotency: result.artifact.idempotency,
+      });
+    }
+    return json(result.artifact);
+  }
+
+  if (request.method === "GET" && url.pathname === "/preferences") {
+    const actor = await requireCompleteActor(request, context);
+    const scope = optionalString(url.searchParams.get("scope")) ?? undefined;
+    const profile = await storage.readPreferenceProfile(actorStorage(actor), scope);
+    return json({ profile });
+  }
+
+  if (request.method === "PUT" && url.pathname === "/preferences") {
+    const body = await readJsonObject(request, "invalid_preferences", "preference body must be JSON");
+    const actorId = requireRequestActorId(request);
+    const bodyActorId = optionalString(body.actorId);
+    if (body.actorId !== undefined && (!bodyActorId || !actorIdsMatch(bodyActorId, actorId))) {
+      throw new FeedHostError("actorId does not match the request actor", 403, "actor_mismatch");
+    }
+    const actor = await requireDelegationAndReady(context, actorId);
+    const scope = optionalString(body.scope) ?? undefined;
+    const expectedVersion = optionalNumber(body.expectedVersion);
+    const patch = optionalObject(body.patch);
+    const reset = optionalBoolean(body.reset);
+    const record = await storage.putPreferenceProfile(actorStorage(actor), {
+      actorId,
+      scope,
+      expectedVersion,
+      patch: patch as never,
+      reset,
+      updatedAt: typeof body.updatedAt === "string" ? body.updatedAt : undefined,
+    });
+    return json({ profile: record });
+  }
+
+  if (request.method === "GET" && url.pathname === "/generation-requests") {
+    const actor = await requireCompleteActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
+    const items = await storage.listGenerationRequests(actorStorage(actor), limit);
+    return json({ items: items.map(normalizeGenerationRequestRecord) });
+  }
+
+  if (request.method === "GET" && url.pathname === "/control-intents") {
+    const actor = await requireCompleteActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
+    const items = await storage.listControlIntents(actorStorage(actor), limit);
+    return json({ items: items.map(normalizeControlIntentRecord) });
   }
 
   if (request.method === "POST" && url.pathname === "/feedback") {
-    const event = await requireBody<FeedbackRequestBody>(request, ["eventId", "artifactId", "readerNonce", "signal", "createdAt"]);
-    requirePayloadActorMatchesHeader(request, event.actorId);
-    const actor = await requireActorReady(request, context);
-    await storage.recordFeedback(actorStorage(actor), { ...event, actorId: actor.actorId });
-    return json({ accepted: true, eventId: event.eventId });
+    const body = await readJsonObject(request, "invalid_feedback", "feedback body must be JSON");
+    const actorId = resolveRequestActorId(request, body.actorId);
+    const actor = await requireDelegationAndReady(context, actorId);
+    const event = normalizeFeedbackEvent(body, actorId);
+    const result = await storage.recordFeedback(actorStorage(actor), event);
+    return json(
+      {
+        accepted: true,
+        eventId: result.eventId,
+        duplicate: result.duplicate,
+        status: result.status,
+      },
+      200,
+    );
   }
 
   if (request.method === "POST" && url.pathname === "/control-intents") {
-    const event = await requireBody<ControlIntentRequestBody>(request, [
-      "eventId",
-      "readerNonce",
-      "intentKind",
-      "status",
-      "targetRef",
-      "createdAt",
-    ]);
-    requirePayloadActorMatchesHeader(request, event.actorId);
-    const actor = await requireActorReady(request, context);
-    await storage.recordControlIntent(actorStorage(actor), { ...event, actorId: actor.actorId });
-    return json({ accepted: true, eventId: event.eventId });
+    const body = await readJsonObject(request, "invalid_intent", "control intent body must be JSON");
+    const actorId = resolveRequestActorId(request, body.actorId);
+    const actor = await requireDelegationAndReady(context, actorId);
+    const event = normalizeControlIntentEvent(body, actorId);
+    const result = await storage.recordControlIntent(actorStorage(actor), event);
+    return json(
+      {
+        accepted: true,
+        eventId: result.eventId,
+        duplicate: result.duplicate,
+        status: result.status,
+        requestId: result.requestId,
+      },
+      result.status === "accepted" ? 202 : 200,
+    );
   }
 
   return json({ error: { code: "not_found", message: `${request.method} ${url.pathname}` } }, 404);
@@ -269,18 +427,25 @@ function authorized(request: Request, token: string | undefined): boolean {
   return request.headers.get("authorization") === `Bearer ${token}`;
 }
 
-async function requireActorReady(
-  request: Request,
-  context: FeedHostContext,
-  actorId = request.headers.get("x-feed-actor-id") ?? "",
-): Promise<ActorState> {
+async function requireCompleteActor(request: Request, context: FeedHostContext): Promise<ActorState> {
+  const actorId = requireRequestActorId(request);
+  return requireDelegationAndReady(context, actorId);
+}
+
+async function requireDelegationAndReady(context: FeedHostContext, actorId: string): Promise<ActorState> {
   const actor = await requireDelegation(context, actorId);
   await ensureActorReady(context.storage, actor, context.seedOnStart);
   return actor;
 }
 
+function requireRequestActorId(request: Request): string {
+  const actorId = request.headers.get("x-feed-actor-id");
+  if (!actorId) throw new FeedHostError("missing delegated actor", 401, "unauthorized");
+  return actorId;
+}
+
 async function requireDelegation(context: FeedHostContext, actorId: string): Promise<ActorState> {
-  if (!actorId) throw new FeedDelegationError("missing delegated actor", "malformed");
+  if (!actorId) throw new FeedHostError("missing delegated actor", 401, "unauthorized");
   const actorKey = normalizeActorId(actorId);
   let delegation = context.actors.get(actorKey);
   if (!hasCompleteFeedHostDelegation(delegation) && context.delegationStore) {
@@ -292,22 +457,18 @@ async function requireDelegation(context: FeedHostContext, actorId: string): Pro
   return delegation;
 }
 
-function requirePayloadActorMatchesHeader(request: Request, payloadActorId?: string): void {
-  const headerActorId = request.headers.get("x-feed-actor-id");
-  if (headerActorId && payloadActorId !== undefined && !actorIdsMatch(headerActorId, payloadActorId)) {
-    throw new FeedDelegationError("payload actorId does not match the request actor", "actor_mismatch");
-  }
-}
-
 async function persistAcceptedDelegation(
   store: FeedHostDelegationStore,
   policy: FeedHostDelegationPolicy,
+  policyHash: string,
   actorId: string,
   accepted: { serializedDelegation: string; resources: string[]; acceptedAt: string; expiresAt: string },
 ): Promise<void> {
   const existing = await store.load(actorId);
   const prior =
-    existing && existing.delegateDID === policy.delegateDID ? liveDelegationResources(existing) : [];
+    existing && existing.delegateDID === policy.delegateDID && (existing.policyHash ?? policyHash) === policyHash
+      ? liveDelegationResources(existing)
+      : [];
   const kept = prior.filter((resource) => !accepted.resources.includes(resource.path));
   const added = accepted.resources.map((path) => ({
     path,
@@ -315,7 +476,95 @@ async function persistAcceptedDelegation(
     acceptedAt: accepted.acceptedAt,
     expiresAt: accepted.expiresAt,
   }));
-  await store.save({ actorId, delegateDID: policy.delegateDID, resources: [...kept, ...added] });
+  await store.save({ actorId, delegateDID: policy.delegateDID, resources: [...kept, ...added], policyHash });
+}
+
+async function removeDelegation(context: FeedHostContext, actorId: string): Promise<void> {
+  const actorKey = normalizeActorId(actorId);
+  context.actors.delete(actorKey);
+  if (context.delegationStore) {
+    await context.delegationStore.remove(actorKey);
+  }
+}
+
+async function readDelegationStatus(
+  context: FeedHostContext,
+  actorId: string,
+): Promise<{
+  actorId: string;
+  delegateDID: string;
+  policyHash: string;
+  currentPolicyHash: string;
+  state: "missing" | "active" | "partial" | "expired" | "stale";
+  complete: boolean;
+  resources: Array<{ path: string; acceptedAt: string; expiresAt: string }>;
+}> {
+  const actorKey = normalizeActorId(actorId);
+  const liveActor = context.actors.get(actorKey);
+  if (hasCompleteFeedHostDelegation(liveActor)) {
+    return {
+      actorId: liveActor.actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "active",
+      complete: true,
+      resources: liveActor.resources.map((path) => ({
+        path,
+        acceptedAt: liveActor.acceptedAt,
+        expiresAt: liveActor.expiresAt,
+      })),
+    };
+  }
+
+  if (!context.delegationStore) {
+    return {
+      actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "missing",
+      complete: false,
+      resources: [],
+    };
+  }
+
+  const stored = await context.delegationStore.load(actorKey);
+  if (!stored) {
+    return {
+      actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "missing",
+      complete: false,
+      resources: [],
+    };
+  }
+
+  const liveResources = liveDelegationResources(stored).map((resource) => ({
+    path: resource.path,
+    acceptedAt: resource.acceptedAt,
+    expiresAt: resource.expiresAt,
+  }));
+  const complete = liveResources.length === stored.resources.length && liveResources.length > 0 && stored.policyHash === context.policyHash;
+  const state =
+    stored.policyHash && stored.policyHash !== context.policyHash
+      ? "stale"
+      : liveResources.length === 0
+        ? "expired"
+        : complete
+          ? "active"
+          : "partial";
+  return {
+    actorId: stored.actorId,
+    delegateDID: stored.delegateDID,
+    policyHash: stored.policyHash ?? context.policyHash,
+    currentPolicyHash: context.policyHash,
+    state,
+    complete,
+    resources: liveResources,
+  };
 }
 
 async function restoreActorFromStore(
@@ -326,6 +575,9 @@ async function restoreActorFromStore(
   if (!store) return null;
   const stored = await store.load(actorKey);
   if (!stored) return null;
+  if (stored.policyHash && stored.policyHash !== context.policyHash) {
+    throw new FeedDelegationError("stored delegation policy hash is stale", "delegation_stale");
+  }
   if (stored.delegateDID !== context.policy.delegateDID) {
     await store.remove(actorKey);
     return null;
@@ -336,7 +588,7 @@ async function restoreActorFromStore(
     return null;
   }
   if (live.length !== stored.resources.length) {
-    await store.save({ ...stored, resources: live });
+    await store.save({ ...stored, resources: live, policyHash: stored.policyHash ?? context.policyHash });
   }
   try {
     const accessByResource = new Map<string, DelegatedAccess>();
@@ -348,8 +600,6 @@ async function restoreActorFromStore(
         serializedDelegation: resource.serializedDelegation,
         expectedDelegateDID: context.policy.delegateDID,
       });
-      // Persisted records must still bind to the identity signed into the
-      // delegation; a record stored under another actor's key is pruned.
       if (!actorIdsMatch(accepted.actorId, actorKey)) {
         throw new FeedDelegationError("stored delegation owner does not match actor", "actor_mismatch");
       }
@@ -361,16 +611,13 @@ async function restoreActorFromStore(
     const state: ActorState = {
       actorId,
       acceptedAt,
+      expiresAt: live[0]?.expiresAt ?? new Date().toISOString(),
       resources: [...new Set(resources)],
       accessByResource,
     };
     context.actors.set(actorKey, state);
     return state;
   } catch (error) {
-    // A persisted delegation the host can no longer accept (expired,
-    // re-minted for another DID, malformed, owned by a different actor) is
-    // pruned so the actor is asked to delegate again. Transient activation
-    // failures propagate.
     if (error instanceof FeedDelegationError) {
       await store.remove(actorKey);
       return null;
@@ -387,14 +634,11 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
   if (!artifacts || !feed || !documents) {
     throw new FeedDelegationError("Feed Host delegation is missing activated TinyCloud access", "insufficient_policy");
   }
-  const legacyArtifacts = actor.accessByResource.get(LEGACY_FEED_DB_PATH);
-  const legacyInteractions = actor.accessByResource.get(LEGACY_INTERACTIONS_DB_PATH);
   actor.storageAccess = {
+    actorId: actor.actorId,
     artifacts,
     feed,
     documents,
-    ...(legacyArtifacts ? { legacyArtifacts } : {}),
-    ...(legacyInteractions ? { legacyInteractions } : {}),
   };
   return actor.storageAccess;
 }
@@ -403,31 +647,319 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
   if (!actor.ready) {
     actor.ready = (async () => {
       const access = actorStorage(actor);
-      const migration = await storage.bootstrapSchema(access);
-      const legacyDataPresent = migration.legacyArtifacts > 0 || migration.legacyInteractions > 0;
-      if (seedOnStart && !legacyDataPresent && !(await storage.hasArtifacts(access))) await seedDefaultFeed(storage, access);
+      await storage.bootstrapSchema(access);
+      if (seedOnStart && !(await storage.hasArtifacts(access))) {
+        await seedDefaultFeed(storage, access);
+      }
+      await storage.reconcileFeedProjection(access);
     })();
   }
   await actor.ready;
 }
 
-async function requireBody<T extends JsonBody>(request: Request, fields: string[]): Promise<T> {
+async function readJsonObject(request: Request, code: string, message: string): Promise<Record<string, unknown>> {
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    throw new Error("request body must be JSON");
+    throw new FeedHostError(message, 400, code);
   }
-  if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error("request body must be an object");
-  const record = body as JsonBody;
-  for (const field of fields) {
-    if (typeof record[field] !== "string" || record[field] === "") throw new Error(`${field} is required`);
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new FeedHostError(message, 400, code);
   }
-  return record as T;
+  return body as Record<string, unknown>;
 }
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
+function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string): FeedbackEvent {
+  return {
+    eventId: readString(body, "eventId", "invalid_feedback", "eventId is required"),
+    artifactId: readString(body, "artifactId", "invalid_feedback", "artifactId is required"),
+    actorId,
+    readerNonce: readString(body, "readerNonce", "invalid_feedback", "readerNonce is required"),
+    signal: readSignal(body.signal),
+    payload: body.payload,
+    payloadHash: optionalString(body.payloadHash) ?? undefined,
+    createdAt: readString(body, "createdAt", "invalid_feedback", "createdAt is required"),
+  };
+}
+
+function normalizeControlIntentEvent(body: Record<string, unknown>, actorId: string): ControlIntentEvent {
+  return {
+    eventId: readString(body, "eventId", "invalid_intent", "eventId is required"),
+    actorId,
+    readerNonce: readString(body, "readerNonce", "invalid_intent", "readerNonce is required"),
+    intentKind: readControlIntentKind(body.intentKind),
+    status: typeof body.status === "string" && body.status.trim() !== "" ? body.status : "accepted",
+    targetRef: readString(body, "targetRef", "invalid_intent", "targetRef is required"),
+    payload: body.payload,
+    payloadHash: optionalString(body.payloadHash) ?? undefined,
+    createdAt: readString(body, "createdAt", "invalid_intent", "createdAt is required"),
+  };
+}
+
+function normalizeControlIntentRecord(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    eventId: stringField(row, "eventId") ?? stringField(row, "event_id"),
+    readerNonce: stringField(row, "readerNonce") ?? stringField(row, "reader_nonce"),
+    actorId: stringField(row, "actorId") ?? stringField(row, "actor_id"),
+    intentKind: stringField(row, "intentKind") ?? stringField(row, "intent_kind"),
+    status: stringField(row, "status"),
+    targetRef: stringField(row, "targetRef") ?? stringField(row, "target_ref"),
+    payloadHash: stringField(row, "payloadHash") ?? stringField(row, "payload_hash") ?? null,
+    payload: parseMaybeJson(stringField(row, "payloadJson") ?? stringField(row, "payload_json")),
+    createdAt: stringField(row, "createdAt") ?? stringField(row, "created_at"),
+  };
+}
+
+function normalizeGenerationRequestRecord(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    requestId: stringField(row, "requestId") ?? stringField(row, "request_id"),
+    readerNonce: stringField(row, "readerNonce") ?? stringField(row, "reader_nonce"),
+    actorId: stringField(row, "actorId") ?? stringField(row, "actor_id"),
+    status: stringField(row, "status"),
+    scope: parseMaybeJson(stringField(row, "scopeJson") ?? stringField(row, "scope_json")) ?? {},
+    packageId: stringField(row, "packageId") ?? stringField(row, "package_id") ?? null,
+    dedupeKey: stringField(row, "dedupeKey") ?? stringField(row, "dedupe_key") ?? null,
+    prompt: stringField(row, "prompt") ?? null,
+    expiresAt: stringField(row, "expiresAt") ?? stringField(row, "expires_at"),
+    createdAt: stringField(row, "createdAt") ?? stringField(row, "created_at"),
+    updatedAt: stringField(row, "updatedAt") ?? stringField(row, "updated_at"),
+  };
+}
+
+function parseMaybeJson(value: string | undefined): unknown {
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function readString(body: Record<string, unknown>, key: string, code: string, message: string): string {
+  const value = body[key];
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new FeedHostError(message, 400, code);
+  }
+  return value;
+}
+
+function readSignal(value: unknown): FeedbackEvent["signal"] {
+  if (
+    value === "save" ||
+    value === "unsave" ||
+    value === "hide" ||
+    value === "unhide" ||
+    value === "helpful" ||
+    value === "unhelpful" ||
+    value === "show_fewer" ||
+    value === "text_note"
+  ) {
+    return value;
+  }
+  throw new FeedHostError("signal is required", 400, "invalid_feedback");
+}
+
+function readControlIntentKind(value: unknown): ControlIntentEvent["intentKind"] {
+  if (
+    value === "enable_package" ||
+    value === "pause_package" ||
+    value === "disable_package" ||
+    value === "tune_package" ||
+    value === "reset_package" ||
+    value === "ask_feed" ||
+    value === "set_artifact_visibility" ||
+    value === "set_saved" ||
+    value === "adjust_preference" ||
+    value === "set_cadence" ||
+    value === "generate_new_request" ||
+    value === "safe_package_setting_update" ||
+    value === "reset_preferences" ||
+    value === "candidate_package_proposal"
+  ) {
+    return value;
+  }
+  throw new FeedHostError("intentKind is required", 400, "invalid_intent");
+}
+
+function stringField(body: Record<string, unknown>, key: string): string | undefined {
+  const value = body[key];
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalBoolean(value: unknown): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function optionalObject(value: unknown): JsonBody | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value as JsonBody;
+}
+
+function parseLimit(value: string | null): number {
+  if (value === null || value === "") return 40;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new FeedHostError("limit must be a number", 400, "bad_request");
+  return Math.max(1, Math.min(Math.trunc(parsed), 100));
+}
+
+function json(body: unknown, status = 200, headers: Record<string, string> = {}): Response {
+  return new Response(JSON.stringify(body), { status, headers: { ...JSON_HEADERS, ...headers } });
+}
+
+function jsonError(status: number, code: string, message: string): Response {
+  return json({ error: { code, message } }, status);
+}
+
+function mapError(error: unknown, pathname: string): Response {
+  if (error instanceof FeedHostError) {
+    return json(
+      {
+        error: {
+          code: error.code,
+          message: error.message,
+          ...(error.details ? { details: error.details } : {}),
+        },
+      },
+      error.status,
+    );
+  }
+
+  if (error instanceof FeedDelegationError) {
+    if (error.code === "delegation_stale") {
+      return json({ error: { code: "delegation_stale", message: error.message } }, 409);
+    }
+    if (error.code === "expired") {
+      return json({ error: { code: "delegation_stale", message: error.message } }, 409);
+    }
+    if (error.code === "malformed") {
+      return json({ error: { code: "invalid_delegation", message: error.message } }, 400);
+    }
+    if (error.code === "actor_mismatch") {
+      return json({ error: { code: "actor_mismatch", message: error.message } }, 403);
+    }
+    if (error.code === "wrong_delegatee" || error.code === "insufficient_policy") {
+      return json({ error: { code: "denied", message: error.message } }, 403);
+    }
+    return json({ error: { code: error.code, message: error.message } }, 403);
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (pathname === "/api/server-info" || pathname === "/api/openapi.json" || pathname === "/delegation-policy" || pathname === "/health") {
+    return json({ error: { code: "unavailable", message } }, 503);
+  }
+  return json({ error: { code: "internal_error", message } }, 500);
+}
+
+function etagMatches(headerValue: string | null, etag: string): boolean {
+  if (!headerValue) return false;
+  return headerValue
+    .split(",")
+    .map((value) => value.trim())
+    .some((value) => value === etag || value === `W/${etag}`);
+}
+
+function quotedEtag(value: string): string {
+  return `"${value}"`;
+}
+
+async function readDelegationStatus(
+  context: FeedHostContext,
+  actorId: string,
+): Promise<{
+  actorId: string;
+  delegateDID: string;
+  policyHash: string;
+  currentPolicyHash: string;
+  state: "missing" | "active" | "partial" | "expired" | "stale";
+  complete: boolean;
+  resources: Array<{ path: string; acceptedAt: string; expiresAt: string }>;
+}> {
+  const actorKey = normalizeActorId(actorId);
+  const liveActor = context.actors.get(actorKey);
+  if (hasCompleteFeedHostDelegation(liveActor)) {
+    return {
+      actorId: liveActor.actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "active",
+      complete: true,
+      resources: liveActor.resources.map((path) => ({
+        path,
+        acceptedAt: liveActor.acceptedAt,
+        expiresAt: liveActor.expiresAt,
+      })),
+    };
+  }
+
+  if (!context.delegationStore) {
+    return {
+      actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "missing",
+      complete: false,
+      resources: [],
+    };
+  }
+
+  const stored = await context.delegationStore.load(actorKey);
+  if (!stored) {
+    return {
+      actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "missing",
+      complete: false,
+      resources: [],
+    };
+  }
+
+  const liveResources = liveDelegationResources(stored).map((resource) => ({
+    path: resource.path,
+    acceptedAt: resource.acceptedAt,
+    expiresAt: resource.expiresAt,
+  }));
+  const complete =
+    liveResources.length > 0 &&
+    liveResources.length === stored.resources.length &&
+    (stored.policyHash ?? context.policyHash) === context.policyHash;
+  const state =
+    stored.policyHash && stored.policyHash !== context.policyHash
+      ? "stale"
+      : liveResources.length === 0
+        ? "expired"
+        : complete
+          ? "active"
+          : "partial";
+  return {
+    actorId: stored.actorId,
+    delegateDID: stored.delegateDID,
+    policyHash: stored.policyHash ?? context.policyHash,
+    currentPolicyHash: context.policyHash,
+    state,
+    complete,
+    resources: liveResources,
+  };
+}
+
+function resolveRequestActorId(request: Request, bodyActorId: unknown): string {
+  const headerActorId = requireRequestActorId(request);
+  if (typeof bodyActorId === "string" && bodyActorId.trim() !== "" && !actorIdsMatch(headerActorId, bodyActorId)) {
+    throw new FeedDelegationError("payload actorId does not match the request actor", "actor_mismatch");
+  }
+  return headerActorId;
 }
 
 function optionsFromEnv(): FeedHostServerOptions {
