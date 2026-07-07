@@ -11,11 +11,15 @@ import {
   type ActivatedFeedDelegation,
   type FeedHostDelegationPolicy,
 } from "./delegation.ts";
+import { FeedHostDelegationStore } from "./delegation-store.ts";
 import { SEEDED_ARTIFACT_ID } from "./seed.ts";
 import type { FeedHostActorStorage, FeedHostStorage } from "./storage.ts";
 import { startFeedHost, type FeedHostRuntime } from "./server.ts";
 
 const ACTOR_ID = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+// Stable host identity used for restart coverage. In production this comes
+// from FEED_HOST_PRIVATE_KEY: the host signs in and its did:pkh stays stable.
+const HOST_DID = "did:pkh:eip155:1:0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 
 let runtime: FeedHostRuntime | null = null;
 
@@ -40,6 +44,11 @@ describe("Feed Host server", () => {
 
     const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
     expect(policy.resources.map((resource) => resource.path)).toEqual(FEED_HOST_DELEGATION_RESOURCES.map((resource) => resource.path));
+    expect(policy.resources.map((resource) => resource.path)).toEqual([
+      "xyz.tinycloud.artifacts/index",
+      "xyz.tinycloud.feed/index",
+      "xyz.tinycloud.artifacts/artifacts",
+    ]);
     for (const resource of policy.resources) {
       await postJson(`${runtime.url}/delegations`, {
         actorId: ACTOR_ID,
@@ -93,6 +102,75 @@ describe("Feed Host server", () => {
     expect(state.feedback).toBe(1);
     expect(state.controlIntents).toBe(1);
     expect(state.generationRequests).toBe(1);
+  });
+
+  test("persists accepted delegations and restores actors across restarts", async () => {
+    const store = fakeDelegationStore();
+    const serverOptions = () => ({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      hostNode: fakeHostNode(HOST_DID),
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }: { serializedDelegation: string }) =>
+        fakeActivatedDelegation(serializedDelegation),
+    });
+
+    runtime = startFeedHost(serverOptions());
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    for (const resource of policy.resources) {
+      await postJson(`${runtime.url}/delegations`, {
+        actorId: ACTOR_ID,
+        serializedDelegation: resource.path,
+      });
+    }
+    const stored = await store.load(ACTOR_ID);
+    expect(stored?.delegateDID).toBe(policy.delegateDID);
+    expect(stored?.resources.map((resource) => resource.path).sort()).toEqual(
+      policy.resources.map((resource) => resource.path).sort(),
+    );
+    runtime.stop();
+
+    // Same stable host key and same store, fresh process state: the actor
+    // must work without resubmitting delegations.
+    runtime = startFeedHost(serverOptions());
+    const restartedPolicy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    expect(restartedPolicy.delegateDID).toBe(policy.delegateDID);
+    const feed = await getJson<{ items: { artifactId: string }[] }>(`${runtime.url}/feed?limit=10`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(feed.items).toHaveLength(1);
+    expect(feed.items[0].artifactId).toBe(SEEDED_ARTIFACT_ID);
+  });
+
+  test("prunes expired persisted delegations and requires re-delegation", async () => {
+    const store = fakeDelegationStore();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      hostNode: fakeHostNode(HOST_DID),
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const past = new Date(Date.now() - 60 * 1000).toISOString();
+    await store.save({
+      actorId: ACTOR_ID,
+      delegateDID: policy.delegateDID,
+      resources: policy.resources.map((resource) => ({
+        path: resource.path,
+        serializedDelegation: resource.path,
+        acceptedAt: past,
+        expiresAt: past,
+      })),
+    });
+
+    const blocked = await fetch(`${runtime.url}/feed?limit=10`, { headers: { "x-feed-actor-id": ACTOR_ID } });
+    expect(blocked.status).toBe(403);
+    expect(await store.load(ACTOR_ID)).toBeNull();
   });
 });
 
@@ -187,10 +265,39 @@ function fakeActivatedDelegation(resource: string): ActivatedFeedDelegation {
   return {
     actorId: ACTOR_ID,
     acceptedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     resources: [resource],
     portableDelegation: {} as ActivatedFeedDelegation["portableDelegation"],
     access: { resource } as unknown as ActivatedFeedDelegation["access"],
   };
+}
+
+function fakeHostNode(did: string): NonNullable<Parameters<typeof startFeedHost>[0]["hostNode"]> {
+  return { did, signIn: async () => {} } as unknown as NonNullable<
+    Parameters<typeof startFeedHost>[0]["hostNode"]
+  >;
+}
+
+function fakeDelegationStore(): FeedHostDelegationStore {
+  const data = new Map<string, unknown>();
+  const node = {
+    signIn: async () => ({}),
+    kv: {
+      put: async (key: string, value: unknown) => {
+        data.set(key, value);
+        return { ok: true, data: undefined };
+      },
+      get: async (key: string) =>
+        data.has(key)
+          ? { ok: true, data: { data: data.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: `not found: ${key}` } },
+      delete: async (key: string) => {
+        data.delete(key);
+        return { ok: true, data: undefined };
+      },
+    },
+  } as unknown as ConstructorParameters<typeof FeedHostDelegationStore>[0];
+  return new FeedHostDelegationStore(node);
 }
 
 async function getJson<T>(url: string, headers: HeadersInit = {}): Promise<T> {

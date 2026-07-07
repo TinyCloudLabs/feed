@@ -3,8 +3,14 @@ import {
   principalDidEquals,
   TinyCloudNode,
   type DelegatedAccess,
+  type Manifest,
   type PortableDelegation,
 } from "@tinycloud/node-sdk";
+import {
+  FEED_V1_ARTIFACT_DOC_PREFIX,
+  FEED_V1_ARTIFACTS_INDEX_DB_PATH,
+  FEED_V1_FEED_INDEX_DB_PATH,
+} from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
 
 export const FEED_HOST_SQL_ACTIONS = [
   "tinycloud.sql/read",
@@ -18,9 +24,12 @@ export const FEED_HOST_KV_ACTIONS = [
   "tinycloud.kv/list",
 ] as const;
 
-export const FEED_HOST_ARTIFACTS_DB_PATH = "xyz.tinycloud.feed.v1/artifacts_index";
-export const FEED_HOST_FEED_DB_PATH = "xyz.tinycloud.feed.v1/feed_index";
-export const FEED_HOST_ARTIFACT_DOC_PREFIX = "xyz.tinycloud.feed.v1/artifacts";
+// Canonical spec split: Artifacts SQL/KV live under xyz.tinycloud.artifacts,
+// Feed SQL under xyz.tinycloud.feed. Sourced from the Artifactory shared
+// contracts so the delegation policy and minted delegations stay in lockstep.
+export const FEED_HOST_ARTIFACTS_DB_PATH = FEED_V1_ARTIFACTS_INDEX_DB_PATH;
+export const FEED_HOST_FEED_DB_PATH = FEED_V1_FEED_INDEX_DB_PATH;
+export const FEED_HOST_ARTIFACT_DOC_PREFIX = FEED_V1_ARTIFACT_DOC_PREFIX;
 
 export const FEED_HOST_DELEGATION_RESOURCES = [
   {
@@ -55,6 +64,7 @@ export type AcceptedFeedDelegation = {
 };
 
 export type ActivatedFeedDelegation = AcceptedFeedDelegation & {
+  expiresAt: string;
   portableDelegation: PortableDelegation;
   access: DelegatedAccess;
 };
@@ -90,10 +100,35 @@ export function createFeedHostPolicy(delegateDID: string): FeedHostDelegationPol
   };
 }
 
+const FEED_HOST_SPACE_PREFIX = "feed-host";
+
+function feedHostNodeManifest(spaceName: string): Manifest {
+  return {
+    manifest_version: 1,
+    app_id: "xyz.tinycloud.feed.host",
+    name: "Feed Host",
+    defaults: false,
+    permissions: [
+      {
+        service: "tinycloud.kv",
+        space: spaceName,
+        path: "delegations/",
+        actions: ["get", "put", "del", "list", "metadata"],
+        skipPrefix: true,
+      },
+    ],
+  };
+}
+
 export function createFeedHostNode(input: { privateKey?: string; host?: string }): TinyCloudNode {
   return new TinyCloudNode({
     ...(input.privateKey ? { privateKey: input.privateKey } : {}),
     ...(input.host ? { host: input.host } : {}),
+    prefix: FEED_HOST_SPACE_PREFIX,
+    autoCreateSpace: true,
+    enablePublicSpace: false,
+    includeAccountRegistryPermissions: false,
+    manifest: feedHostNodeManifest(FEED_HOST_SPACE_PREFIX),
   });
 }
 
@@ -101,7 +136,7 @@ export function validateFeedHostDelegation(input: {
   serializedDelegation: string;
   expectedDelegateDID: string;
   now?: Date;
-}): AcceptedFeedDelegation & { portableDelegation: PortableDelegation } {
+}): AcceptedFeedDelegation & { expiresAt: string; portableDelegation: PortableDelegation } {
   let delegation: DelegationLike;
   try {
     delegation = deserializeDelegation(input.serializedDelegation) as DelegationLike;
@@ -137,6 +172,7 @@ export function validateFeedHostDelegation(input: {
   return {
     actorId: signedOwnerAddress(grants) ?? delegation.ownerAddress ?? "",
     acceptedAt: new Date().toISOString(),
+    expiresAt: expiry.toISOString(),
     resources: acceptedResources,
     portableDelegation: delegation,
   };

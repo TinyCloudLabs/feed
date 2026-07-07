@@ -54,8 +54,14 @@ rejected until the host has accepted the complete Feed v1 SQL/KV delegation set
 for the actor.
 
 For local development, the Feed Host can use a generated session DID. Hosted
-deployments should set `FEED_HOST_PRIVATE_KEY` so the delegate DID is stable
-across restarts and users do not have to re-mint delegations unexpectedly.
+deployments should set `FEED_HOST_PRIVATE_KEY` (the env var only — never commit
+key material). With a stable key the host signs into its own TinyCloud space at
+startup, so the delegate DID is the stable `did:pkh` identity, and every
+accepted delegation is persisted to the host's own TinyCloud KV space under
+`delegations/{actorId}`. After a restart the host reactivates persisted
+delegations lazily on the actor's first request (pruning expired ones), so
+actors keep working without re-submitting delegations. Without a key the host
+keeps its generated session DID and accepted delegations live in memory only.
 
 ## Commands
 
@@ -74,4 +80,6 @@ bun run build
 OpenKey external-wallet flow with an injected Ethereum test key, matching the
 Secret Manager E2E approach. The test signs in, mints/submits Feed Host
 delegations, hydrates the seeded feed item, posts feedback, and persists an Ask
-Feed control intent.
+Feed control intent. Set `FEED_SMOKE_HOST_PORT` / `FEED_SMOKE_WEB_PORT` to run
+the smoke stack on alternate ports when the defaults (8787/4199) are held by
+live dev services.
