@@ -86,11 +86,21 @@ type DelegationLike = PortableDelegation & {
 export class FeedDelegationError extends Error {
   constructor(
     message: string,
-    readonly code: "malformed" | "wrong_delegatee" | "expired" | "insufficient_policy",
+    readonly code: "malformed" | "wrong_delegatee" | "expired" | "insufficient_policy" | "actor_mismatch",
   ) {
     super(message);
     this.name = "FeedDelegationError";
   }
+}
+
+// Actor ids are did:pkh identities whose embedded eip155 address is
+// case-insensitive, so all map/store keys use the normalized form.
+export function normalizeActorId(actorId: string): string {
+  return actorId.toLowerCase();
+}
+
+export function actorIdsMatch(a: string, b: string): boolean {
+  return normalizeActorId(a) === normalizeActorId(b);
 }
 
 export function createFeedHostPolicy(delegateDID: string): FeedHostDelegationPolicy {
@@ -169,8 +179,16 @@ export function validateFeedHostDelegation(input: {
     throw new FeedDelegationError("delegation is missing a required Feed Host resource", "insufficient_policy");
   }
 
+  // The actor identity is derived from the signed delegation itself — never
+  // from caller-supplied request fields — so a delegation can only bind to
+  // the namespace of the owner who actually minted it.
+  const actorId = signedOwnerDid(grants) ?? ownerDidFromDelegation(delegation);
+  if (!actorId) {
+    throw new FeedDelegationError("delegation carries no owner identity to bind an actor", "malformed");
+  }
+
   return {
-    actorId: signedOwnerAddress(grants) ?? delegation.ownerAddress ?? "",
+    actorId,
     acceptedAt: new Date().toISOString(),
     expiresAt: expiry.toISOString(),
     resources: acceptedResources,
@@ -276,10 +294,18 @@ function serviceForActions(actions: string[]): string {
   throw new FeedDelegationError("SDK delegation has mixed or unknown action services", "malformed");
 }
 
-function signedOwnerAddress(grants: SignedGrant[]): string | null {
+function signedOwnerDid(grants: SignedGrant[]): string | null {
   for (const grant of grants) {
-    const match = grant.space.match(/^tinycloud:pkh:eip155:\d+:(0x[a-fA-F0-9]+):/);
-    if (match) return match[1];
+    const match = grant.space.match(/^tinycloud:pkh:(eip155:\d+:0x[a-fA-F0-9]{40}):/);
+    if (match) return `did:pkh:${match[1]}`;
   }
   return null;
+}
+
+function ownerDidFromDelegation(delegation: DelegationLike): string | null {
+  if (typeof delegation.ownerAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(delegation.ownerAddress)) {
+    return null;
+  }
+  if (typeof delegation.chainId !== "number" || !Number.isInteger(delegation.chainId)) return null;
+  return `did:pkh:eip155:${delegation.chainId}:${delegation.ownerAddress}`;
 }

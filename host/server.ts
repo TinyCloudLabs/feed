@@ -2,6 +2,7 @@ import type { DelegatedAccess, TinyCloudNode } from "@tinycloud/node-sdk";
 import type { ControlIntentEvent, FeedbackEvent } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import {
   activateFeedHostDelegation,
+  actorIdsMatch,
   createFeedHostNode,
   createFeedHostPolicy,
   FeedDelegationError,
@@ -9,6 +10,7 @@ import {
   FEED_HOST_ARTIFACTS_DB_PATH,
   FEED_HOST_FEED_DB_PATH,
   hasCompleteFeedHostDelegation,
+  normalizeActorId,
   type ActivatedFeedDelegation,
   type AcceptedFeedDelegation,
   type FeedHostDelegationPolicy,
@@ -161,29 +163,35 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   }
 
   if (request.method === "POST" && url.pathname === "/delegations") {
-    const body = await requireBody<{ actorId: string; serializedDelegation: string }>(request, [
-      "actorId",
+    const body = await requireBody<{ actorId?: string; serializedDelegation: string }>(request, [
       "serializedDelegation",
     ]);
     const accepted = await activateDelegation({
       serializedDelegation: body.serializedDelegation,
       expectedDelegateDID: policy.delegateDID,
     });
-    const existing = actors.get(body.actorId);
+    // Delegations bind to the owner identity signed into the delegation
+    // (accepted.actorId). A payload actorId can only confirm that identity —
+    // never rebind the delegation to another actor namespace.
+    if (body.actorId !== undefined && (typeof body.actorId !== "string" || !actorIdsMatch(body.actorId, accepted.actorId))) {
+      throw new FeedDelegationError("actorId does not match the delegation owner identity", "actor_mismatch");
+    }
+    const actorKey = normalizeActorId(accepted.actorId);
+    const existing = actors.get(actorKey);
     const resources = [...new Set([...(existing?.resources ?? []), ...accepted.resources])];
     const accessByResource = new Map(existing?.accessByResource);
     for (const resource of accepted.resources) accessByResource.set(resource, accepted.access);
     const state: ActorState = {
-      actorId: body.actorId,
+      actorId: accepted.actorId,
       acceptedAt: accepted.acceptedAt,
       resources,
       accessByResource,
       storageAccess: existing?.storageAccess,
       ready: existing?.ready,
     };
-    actors.set(body.actorId, state);
+    actors.set(actorKey, state);
     if (context.delegationStore) {
-      await persistAcceptedDelegation(context.delegationStore, policy, body.actorId, {
+      await persistAcceptedDelegation(context.delegationStore, policy, actorKey, {
         serializedDelegation: body.serializedDelegation,
         resources: accepted.resources,
         acceptedAt: accepted.acceptedAt,
@@ -191,7 +199,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       });
     }
     if (hasCompleteFeedHostDelegation(state)) await ensureActorReady(storage, state, seedOnStart);
-    return json({ accepted: true, actorId: body.actorId, resources });
+    return json({ accepted: true, actorId: accepted.actorId, resources });
   }
 
   if (request.method === "GET" && url.pathname === "/admin/state") {
@@ -226,6 +234,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "POST" && url.pathname === "/feedback") {
     const event = await requireBody<FeedbackEvent>(request, ["eventId", "artifactId", "actorId", "readerNonce", "signal", "createdAt"]);
+    requirePayloadActorMatchesHeader(request, event.actorId);
     const actor = await requireActorReady(request, context, event.actorId);
     await storage.recordFeedback(actorStorage(actor), event);
     return json({ accepted: true, eventId: event.eventId });
@@ -241,6 +250,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       "targetRef",
       "createdAt",
     ]);
+    requirePayloadActorMatchesHeader(request, event.actorId);
     const actor = await requireActorReady(request, context, event.actorId);
     await storage.recordControlIntent(actorStorage(actor), event);
     return json({ accepted: true, eventId: event.eventId });
@@ -266,14 +276,22 @@ async function requireActorReady(
 
 async function requireDelegation(context: FeedHostContext, actorId: string): Promise<ActorState> {
   if (!actorId) throw new FeedDelegationError("missing delegated actor", "malformed");
-  let delegation = context.actors.get(actorId);
+  const actorKey = normalizeActorId(actorId);
+  let delegation = context.actors.get(actorKey);
   if (!hasCompleteFeedHostDelegation(delegation) && context.delegationStore) {
-    delegation = (await restoreActorFromStore(context, actorId)) ?? delegation;
+    delegation = (await restoreActorFromStore(context, actorKey)) ?? delegation;
   }
   if (!hasCompleteFeedHostDelegation(delegation)) {
     throw new FeedDelegationError("Feed Host has no complete accepted delegation for actor", "insufficient_policy");
   }
   return delegation;
+}
+
+function requirePayloadActorMatchesHeader(request: Request, payloadActorId: string): void {
+  const headerActorId = request.headers.get("x-feed-actor-id");
+  if (headerActorId && !actorIdsMatch(headerActorId, payloadActorId)) {
+    throw new FeedDelegationError("payload actorId does not match the request actor", "actor_mismatch");
+  }
 }
 
 async function persistAcceptedDelegation(
@@ -297,19 +315,19 @@ async function persistAcceptedDelegation(
 
 async function restoreActorFromStore(
   context: FeedHostContext,
-  actorId: string,
+  actorKey: string,
 ): Promise<ActorState | null> {
   const store = context.delegationStore;
   if (!store) return null;
-  const stored = await store.load(actorId);
+  const stored = await store.load(actorKey);
   if (!stored) return null;
   if (stored.delegateDID !== context.policy.delegateDID) {
-    await store.remove(actorId);
+    await store.remove(actorKey);
     return null;
   }
   const live = liveDelegationResources(stored);
   if (live.length === 0) {
-    await store.remove(actorId);
+    await store.remove(actorKey);
     return null;
   }
   if (live.length !== stored.resources.length) {
@@ -318,14 +336,21 @@ async function restoreActorFromStore(
   try {
     const accessByResource = new Map<string, DelegatedAccess>();
     const resources: string[] = [];
+    let actorId = actorKey;
     let acceptedAt = new Date().toISOString();
     for (const resource of live) {
       const accepted = await context.activateDelegation({
         serializedDelegation: resource.serializedDelegation,
         expectedDelegateDID: context.policy.delegateDID,
       });
+      // Persisted records must still bind to the identity signed into the
+      // delegation; a record stored under another actor's key is pruned.
+      if (!actorIdsMatch(accepted.actorId, actorKey)) {
+        throw new FeedDelegationError("stored delegation owner does not match actor", "actor_mismatch");
+      }
       for (const path of accepted.resources) accessByResource.set(path, accepted.access);
       resources.push(...accepted.resources);
+      actorId = accepted.actorId;
       acceptedAt = accepted.acceptedAt;
     }
     const state: ActorState = {
@@ -334,14 +359,15 @@ async function restoreActorFromStore(
       resources: [...new Set(resources)],
       accessByResource,
     };
-    context.actors.set(actorId, state);
+    context.actors.set(actorKey, state);
     return state;
   } catch (error) {
     // A persisted delegation the host can no longer accept (expired,
-    // re-minted for another DID, malformed) is pruned so the actor is asked
-    // to delegate again. Transient activation failures propagate.
+    // re-minted for another DID, malformed, owned by a different actor) is
+    // pruned so the actor is asked to delegate again. Transient activation
+    // failures propagate.
     if (error instanceof FeedDelegationError) {
-      await store.remove(actorId);
+      await store.remove(actorKey);
       return null;
     }
     throw error;
