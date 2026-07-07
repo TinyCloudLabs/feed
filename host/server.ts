@@ -110,6 +110,9 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const server = Bun.serve({
     port: options.port,
     hostname: options.hostname,
+    // Requests fan out to the upstream TinyCloud node and can exceed Bun's
+    // default 10s idle timeout, which would drop the socket mid-request.
+    idleTimeout: 120,
     async fetch(request) {
       try {
         if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: JSON_HEADERS });

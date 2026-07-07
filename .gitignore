@@ -6,3 +6,4 @@ transcripts/
 *.local
 .env
 .DS_Store
+test-results/
