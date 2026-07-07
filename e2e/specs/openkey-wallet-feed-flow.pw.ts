@@ -107,17 +107,23 @@ test("signs in through OpenKey external wallet", async ({ page }) => {
   await page.getByRole("button", { name: "Ask Feed" }).click();
   await expect
     .poll(async () => {
-      const response = await page.request.get(`${FEED_HOST_URL}/admin/state`, {
-        headers: { "x-feed-actor-id": TEST_ACTOR_ID },
-      });
-      const state = await response.json();
-      return (
-        state.artifacts >= 1 &&
-        state.projections >= 1 &&
-        state.feedback >= 1 &&
-        state.controlIntents >= 1 &&
-        state.generationRequests >= 1
-      );
+      // Transient connection drops against the live-node-backed host should
+      // retry within the poll window instead of failing the smoke run.
+      try {
+        const response = await page.request.get(`${FEED_HOST_URL}/admin/state`, {
+          headers: { "x-feed-actor-id": TEST_ACTOR_ID },
+        });
+        const state = await response.json();
+        return (
+          state.artifacts >= 1 &&
+          state.projections >= 1 &&
+          state.feedback >= 1 &&
+          state.controlIntents >= 1 &&
+          state.generationRequests >= 1
+        );
+      } catch {
+        return false;
+      }
     })
     .toBe(true);
 });

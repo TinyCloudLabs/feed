@@ -78,10 +78,11 @@ export class FeedHostStorage {
   }
 
   async insertSeedRows(actor: FeedHostActorStorage, dbName: FeedV1SqlResourceName, rows: SqlSeedRow[]): Promise<void> {
-    const db = this.db(actor, dbName);
-    for (const row of rows) {
-      await execute(db, insertSql(row), Object.values(row.values).map(sqlValue));
-    }
+    if (rows.length === 0) return;
+    await batch(
+      this.db(actor, dbName),
+      rows.map((row) => ({ sql: insertSql(row), params: Object.values(row.values).map(sqlValue) })),
+    );
   }
 
   async writeArtifactDocument(actor: FeedHostActorStorage, artifact: FeedArtifact): Promise<void> {
@@ -226,13 +227,14 @@ export class FeedHostStorage {
     controlIntents: number;
     generationRequests: number;
   }> {
-    return {
-      artifacts: await count(this.db(actor, "artifacts_index"), "artifact_index"),
-      projections: await count(this.db(actor, "feed_index"), "feed_artifact_projection"),
-      feedback: await count(this.db(actor, "feed_index"), "feedback_event"),
-      controlIntents: await count(this.db(actor, "feed_index"), "control_intent_event"),
-      generationRequests: await count(this.db(actor, "feed_index"), "generation_request"),
-    };
+    const [artifacts, projections, feedback, controlIntents, generationRequests] = await Promise.all([
+      count(this.db(actor, "artifacts_index"), "artifact_index"),
+      count(this.db(actor, "feed_index"), "feed_artifact_projection"),
+      count(this.db(actor, "feed_index"), "feedback_event"),
+      count(this.db(actor, "feed_index"), "control_intent_event"),
+      count(this.db(actor, "feed_index"), "generation_request"),
+    ]);
+    return { artifacts, projections, feedback, controlIntents, generationRequests };
   }
 
   private db(actor: FeedHostActorStorage, dbName: FeedV1SqlResourceName): IDatabaseHandle {
@@ -255,10 +257,24 @@ async function applyMigrations(
   };
   if (candidate.migrations?.apply) {
     const result = await candidate.migrations.apply(input).catch((error) => ({ ok: false, error }));
-    return result.ok ? { ok: true } : { ok: false, error: result.error };
+    if (result.ok) return { ok: true };
+    if (!multiResourceInvocationUnsupported(resultError(result))) {
+      return { ok: false, error: result.error };
+    }
   }
 
+  // Hosted delegated sessions lack invokeAny, and migrations.apply always
+  // batches schema DDL with its write-action bookkeeping insert. Retry with
+  // plain per-migration batches: feed migrations are all DDL, so each batch
+  // resolves to the single tinycloud.sql/schema action.
   for (const migration of input.migrations) {
+    const batched = await db
+      .batch(migration.sql.map((sql) => ({ sql })))
+      .catch((error) => ({ ok: false as const, error }));
+    if (batched.ok) continue;
+    if (!multiResourceInvocationUnsupported(resultError(batched))) {
+      return { ok: false, error: batched.error };
+    }
     for (const sql of migration.sql) {
       const result = await db.execute(sql).catch((error) => ({ ok: false as const, error }));
       if (!result.ok) return { ok: false, error: result.error };
@@ -275,11 +291,6 @@ async function queryRows<T extends Record<string, unknown>>(
   const result = await db.query<T>(sql, params);
   if (!result.ok) throw new Error(`TinyCloud SQL query failed: ${resultError(result)}`);
   return responseRows<T>(result.data);
-}
-
-async function execute(db: IDatabaseHandle, sql: string, params: SqlValue[] = []): Promise<void> {
-  const result = await db.execute(sql, params);
-  if (!result.ok) throw new Error(`TinyCloud SQL execute failed: ${resultError(result)}`);
 }
 
 async function batch(db: IDatabaseHandle, statements: SqlStatement[]): Promise<void> {
@@ -366,4 +377,8 @@ function resultError(result: unknown): string {
   if (error?.code) return String(error.code);
   if (result instanceof Error) return result.message;
   return String(result);
+}
+
+function multiResourceInvocationUnsupported(message: string): boolean {
+  return message.includes("does not support multi-resource invocations");
 }
