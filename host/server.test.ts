@@ -17,6 +17,8 @@ import {
   reconcileFeedProjections,
   renderFeedEventStream,
   summarizeFeedbackEvents,
+  FEED_HOST_PREFERENCES_SCOPE,
+  sanitizePreferenceValue,
   type FeedPreferenceProfileRecord,
   type FeedPreferenceValue,
   type FeedProjectionState,
@@ -119,6 +121,11 @@ describe("Feed Host server", () => {
         "/generation-requests",
       ].sort(),
     );
+    const feedEventsPath = openApi.paths["/feed/events"] as {
+      get?: { parameters?: Array<{ name?: string }>; responses?: Record<string, { content?: Record<string, unknown> }> };
+    };
+    expect(feedEventsPath.get?.responses?.["200"]?.content?.["text/event-stream"]).toBeDefined();
+    expect(feedEventsPath.get?.parameters?.some((parameter) => parameter.name === "Last-Event-ID")).toBe(true);
   });
 
   test("exposes delegation status and deletion for a fully activated actor", async () => {
@@ -166,6 +173,43 @@ describe("Feed Host server", () => {
       headers: { "x-feed-actor-id": ACTOR_ID },
     });
     expect(blockedFeed.status).toBe(403);
+  });
+
+  test("rejects expired live delegations after their expiresAt passes", async () => {
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation, 1000),
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const activeStatus = await getJson<{ state: string; complete: boolean }>(`${runtime.url}/api/delegations/status`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(activeStatus.state).toBe("active");
+    expect(activeStatus.complete).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    const expiredStatus = await getJson<{ state: string; complete: boolean }>(`${runtime.url}/api/delegations/status`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(expiredStatus.state).toBe("expired");
+    expect(expiredStatus.complete).toBe(false);
+
+    const blockedFeed = await fetch(`${runtime.url}/feed?limit=10`, {
+      headers: { "x-feed-actor-id": ACTOR_ID },
+    });
+    expect(blockedFeed.status).toBe(409);
+    expect(await blockedFeed.json()).toEqual({
+      error: {
+        code: "delegation_stale",
+        message: "accepted delegation has expired",
+      },
+    });
   });
 
   test("applies preferences to ranking and rejects stale preference versions", async () => {
@@ -231,6 +275,7 @@ describe("Feed Host server", () => {
           packagePriority: {
             "follow-up": 4,
           },
+          unexpected: "drop-me",
         },
       },
       { "x-feed-actor-id": ACTOR_ID },
@@ -239,6 +284,25 @@ describe("Feed Host server", () => {
     const updatedProfile = (await updated.json()) as { profile: FeedPreferenceProfileRecord };
     expect(updatedProfile.profile.version).toBe(1);
     expect(updatedProfile.profile.value.packagePriority?.["follow-up"]).toBe(4);
+    expect("unexpected" in updatedProfile.profile.value).toBe(false);
+
+    const invalidScope = await putJson(
+      `${runtime.url}/preferences`,
+      {
+        scope: "package:forbidden",
+        expectedVersion: 1,
+        patch: {},
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+    expect(invalidScope.status).toBe(400);
+    expect(await invalidScope.json()).toEqual({
+      error: {
+        code: "invalid_preferences",
+        message: "preference scope is not allowlisted",
+      },
+    });
+
     const after = await getJson<{ items: Array<{ artifactId: string }> }>(`${runtime.url}/feed?limit=10`, {
       "x-feed-actor-id": ACTOR_ID,
     });
@@ -266,6 +330,50 @@ describe("Feed Host server", () => {
         },
       },
     });
+  });
+
+  test("rejects payload-supplied preference scopes on control intents", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const intent = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        eventId: "intent-scope-test-001",
+        readerNonce: "intent-scope-nonce-001",
+        intentKind: "safe_package_setting_update",
+        status: "accepted",
+        targetRef: "package:scope-target",
+        payload: {
+          scope: "package:other-target",
+          value: { paused: true },
+        },
+        createdAt: "2026-06-29T12:06:30.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+
+    expect(intent.status).toBe(400);
+    expect(await intent.json()).toEqual({
+      error: {
+        code: "invalid_intent",
+        message: "preference scope is not allowlisted",
+      },
+    });
+
+    const rejectedProfile = await getJson<{ profile: FeedPreferenceProfileRecord | null }>(
+      `${runtime.url}/preferences?scope=package:scope-target`,
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+    expect(rejectedProfile.profile).toBeNull();
   });
 
   test("records feedback, control intents, generation requests, and SSE projection events", async () => {
@@ -305,6 +413,34 @@ describe("Feed Host server", () => {
       { "x-feed-actor-id": ACTOR_ID },
     );
     expect(updatedFeed.items[0].disposition).toBe("saved");
+    const noteText = `${"note-".repeat(240)}trailing`;
+    const noteFeedback = await postJson(
+      `${runtime.url}/feedback`,
+      {
+        eventId: "feedback-test-002",
+        artifactId: SEEDED_ARTIFACT_ID,
+        actorId: ACTOR_ID,
+        readerNonce: "feedback-nonce-002",
+        signal: "text_note",
+        payload: {
+          note: noteText,
+          ignored: "drop-me",
+        },
+        createdAt: "2026-06-29T12:05:30.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+    expect(noteFeedback.status).toBe(200);
+    expect(await noteFeedback.json()).toEqual({
+      accepted: true,
+      eventId: "feedback-test-002",
+      duplicate: false,
+      status: "applied",
+    });
+    const storedNoteEvent = (storage as unknown as { feedbackEvents: FeedbackEvent[] }).feedbackEvents.find(
+      (event) => event.readerNonce === "feedback-nonce-002",
+    );
+    expect(storedNoteEvent?.payload).toEqual({ note: noteText.slice(0, 1024) });
     const intent = await postJson(
       `${runtime.url}/control-intents`,
       {
@@ -386,7 +522,6 @@ describe("Feed Host server", () => {
         finishedAt: "2026-06-29T12:10:00.000Z",
       },
     );
-
     const resumedResponse = await fetch(`${runtime.url}/feed/events`, {
       headers: {
         "x-feed-actor-id": ACTOR_ID,
@@ -662,7 +797,7 @@ class FakeFeedHostStorage {
     actor: FeedHostActorStorage,
     scope: string = "presentation",
   ): Promise<FeedPreferenceProfileRecord | null> {
-    return this.preferenceProfiles.get(preferenceKey(actor.actorId, scope)) ?? null;
+    return this.preferenceProfiles.get(preferenceKey(actor.actorId, normalizePreferenceScope(scope))) ?? null;
   }
 
   async listPreferenceProfiles(actor: FeedHostActorStorage): Promise<FeedPreferenceProfileRecord[]> {
@@ -682,7 +817,7 @@ class FakeFeedHostStorage {
       actorId: string;
     },
   ): Promise<FeedPreferenceProfileRecord> {
-    const scope = input.scope ?? "presentation";
+    const scope = normalizePreferenceScope(input.scope);
     const key = preferenceKey(actor.actorId, scope);
     const current = this.preferenceProfiles.get(key);
     const currentVersion = current?.version ?? 0;
@@ -694,9 +829,9 @@ class FakeFeedHostStorage {
       throw new FeedHostError("preference version conflict", 409, "version_conflict", { currentVersion });
     }
 
-    const base = current?.value ?? (scope === "presentation" ? defaultFeedPreferences() : {});
+    const base = current?.value ?? (scope === FEED_HOST_PREFERENCES_SCOPE ? defaultFeedPreferences() : {});
     const value = input.reset
-      ? scope === "presentation"
+      ? scope === FEED_HOST_PREFERENCES_SCOPE
         ? defaultFeedPreferences()
         : {}
       : mergePreferencePatch(base, input.patch ?? {});
@@ -777,34 +912,91 @@ class FakeFeedHostStorage {
     }
 
     const payloadHash = event.payloadHash ?? hashJson(event.payload ?? null);
+    const payload = plainObject(event.payload);
+    let status = normalizedKind === "generate_new_request" ? "accepted" : "applied";
+    let requestId: string | undefined;
+
+    switch (normalizedKind) {
+      case "set_artifact_visibility":
+      case "set_saved": {
+        const projection = this.projections.get(event.targetRef);
+        if (projection) {
+          const desiredDisposition =
+            normalizedKind === "set_saved"
+              ? payload?.saved === false || payload?.state === "unsaved"
+                ? "default"
+                : "saved"
+              : payload?.visibility === "hidden" || payload?.hidden === true || payload?.state === "hidden"
+                ? "hidden"
+                : "default";
+          this.projections.set(event.targetRef, {
+            ...projection,
+            disposition: desiredDisposition,
+          });
+        }
+        break;
+      }
+      case "adjust_preference":
+      case "set_cadence":
+      case "safe_package_setting_update":
+      case "candidate_package_proposal":
+      case "enable_package":
+      case "pause_package":
+      case "disable_package":
+      case "tune_package":
+      case "reset_package":
+      case "reset_preferences": {
+        const scope = preferenceScopeForIntent(normalizedKind, payload, event.targetRef);
+        const key = preferenceKey(event.actorId, scope);
+        const current = this.preferenceProfiles.get(key);
+        const currentVersion = current?.version ?? 0;
+        const value =
+          normalizedKind === "reset_preferences" || normalizedKind === "reset_package"
+            ? scope === FEED_HOST_PREFERENCES_SCOPE
+              ? defaultFeedPreferences()
+              : {}
+            : mergePreferencePatch(current?.value ?? (scope === FEED_HOST_PREFERENCES_SCOPE ? defaultFeedPreferences() : {}), controlIntentPreferencePatch(normalizedKind, payload, event.targetRef));
+        this.preferenceProfiles.set(key, {
+          profileId: key,
+          actorId: event.actorId,
+          scope,
+          value,
+          version: currentVersion + 1,
+          updatedAt: event.createdAt,
+        });
+        status = normalizedKind === "candidate_package_proposal" ? "accepted" : "applied";
+        break;
+      }
+      case "generate_new_request": {
+        const request = buildGenerationRequestRecord({
+          actorId: event.actorId,
+          readerNonce: event.readerNonce,
+          eventId: event.eventId,
+          createdAt: event.createdAt,
+          payload: event.payload,
+          targetRef: event.targetRef,
+          payloadHash,
+        });
+        this.generationRequests.unshift(request);
+        requestId = request.request_id;
+        status = "accepted";
+        break;
+      }
+    }
+
     const row: StoredControlIntentRow = {
       event_id: event.eventId,
       reader_nonce: event.readerNonce,
       actor_id: event.actorId,
       intent_kind: normalizedKind,
-      status: normalizedKind === "generate_new_request" ? "accepted" : "applied",
+      status,
       target_ref: event.targetRef,
       payload_hash: payloadHash,
       payload_json: event.payload === undefined ? null : JSON.stringify(event.payload),
       created_at: event.createdAt,
     };
     this.controlIntents.unshift(row);
-
-    if (normalizedKind === "generate_new_request") {
-      const request = buildGenerationRequestRecord({
-        actorId: event.actorId,
-        readerNonce: event.readerNonce,
-        eventId: event.eventId,
-        createdAt: event.createdAt,
-        payload: event.payload,
-        targetRef: event.targetRef,
-        payloadHash,
-      });
-      this.generationRequests.unshift(request);
-      return { eventId: event.eventId, duplicate: false, status: "accepted", requestId: request.request_id };
-    }
-
-    return { eventId: event.eventId, duplicate: false, status: row.status };
+    return { eventId: event.eventId, duplicate: false, status: row.status, requestId };
   }
 
   async listControlIntents(_actor: FeedHostActorStorage, limit = 100): Promise<StoredControlIntentRow[]> {
@@ -964,11 +1156,11 @@ type StoredGenerationRequestRow = {
   updated_at: string;
 };
 
-function fakeActivatedDelegation(resource: string): ActivatedFeedDelegation {
+function fakeActivatedDelegation(resource: string, expiresInMs = 60 * 60 * 1000): ActivatedFeedDelegation {
   return {
     actorId: ACTOR_ID,
     acceptedAt: new Date().toISOString(),
-    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
     resources: [resource],
     portableDelegation: {} as ActivatedFeedDelegation["portableDelegation"],
     access: { resource } as unknown as ActivatedFeedDelegation["access"],
@@ -1105,33 +1297,108 @@ function preferenceKey(actorId: string, scope: string): string {
   return `${actorId.toLowerCase()}:${scope}`;
 }
 
+function normalizePreferenceScope(scope?: string): string {
+  const value = scope ?? FEED_HOST_PREFERENCES_SCOPE;
+  if (value === FEED_HOST_PREFERENCES_SCOPE) return value;
+  if (/^package:[^/\\]+$/.test(value)) return value;
+  throw new FeedHostError("preference scope is not allowlisted", 400, "invalid_preferences");
+}
+
 function mergePreferencePatch(base: FeedPreferenceValue, patch: FeedPreferenceValue): FeedPreferenceValue {
+  const sanitizedBase = sanitizePreferenceValue(base);
+  const sanitizedPatch = sanitizePreferenceValue(patch);
   const next: FeedPreferenceValue = {
-    ...base,
-    packagePriority: { ...(base.packagePriority ?? {}) },
-    typePriority: { ...(base.typePriority ?? {}) },
-    sourcePriority: { ...(base.sourcePriority ?? {}) },
-    savedArtifactIds: [...(base.savedArtifactIds ?? [])],
-    hiddenArtifactIds: [...(base.hiddenArtifactIds ?? [])],
-    packageDisabled: [...(base.packageDisabled ?? [])],
-    typeSuppressed: [...(base.typeSuppressed ?? [])],
-    showFewerPackageIds: { ...(base.showFewerPackageIds ?? {}) },
+    ...sanitizedBase,
+    packagePriority: { ...(sanitizedBase.packagePriority ?? {}) },
+    typePriority: { ...(sanitizedBase.typePriority ?? {}) },
+    sourcePriority: { ...(sanitizedBase.sourcePriority ?? {}) },
+    savedArtifactIds: [...(sanitizedBase.savedArtifactIds ?? [])],
+    hiddenArtifactIds: [...(sanitizedBase.hiddenArtifactIds ?? [])],
+    packageDisabled: [...(sanitizedBase.packageDisabled ?? [])],
+    typeSuppressed: [...(sanitizedBase.typeSuppressed ?? [])],
+    showFewerPackageIds: { ...(sanitizedBase.showFewerPackageIds ?? {}) },
   };
-  if (patch.packagePriority) next.packagePriority = { ...(next.packagePriority ?? {}), ...patch.packagePriority };
-  if (patch.typePriority) next.typePriority = { ...(next.typePriority ?? {}), ...patch.typePriority };
-  if (patch.sourcePriority) next.sourcePriority = { ...(next.sourcePriority ?? {}), ...patch.sourcePriority };
-  if (patch.savedArtifactIds) next.savedArtifactIds = uniqueStrings([...(next.savedArtifactIds ?? []), ...patch.savedArtifactIds]);
-  if (patch.hiddenArtifactIds) next.hiddenArtifactIds = uniqueStrings([...(next.hiddenArtifactIds ?? []), ...patch.hiddenArtifactIds]);
-  if (patch.packageDisabled) next.packageDisabled = uniqueStrings([...(next.packageDisabled ?? []), ...patch.packageDisabled]);
-  if (patch.typeSuppressed) next.typeSuppressed = uniqueStrings([...(next.typeSuppressed ?? []), ...patch.typeSuppressed]);
-  if (patch.showFewerPackageIds) next.showFewerPackageIds = { ...(next.showFewerPackageIds ?? {}), ...patch.showFewerPackageIds };
-  if (typeof patch.cooldownMinutes === "number") next.cooldownMinutes = patch.cooldownMinutes;
-  if (typeof patch.diversityWindow === "number") next.diversityWindow = patch.diversityWindow;
-  if (typeof patch.priority === "number") next.priority = patch.priority;
-  if (typeof patch.paused === "boolean") next.paused = patch.paused;
-  if (typeof patch.disabled === "boolean") next.disabled = patch.disabled;
-  if (patch.cadence === "more" || patch.cadence === "normal" || patch.cadence === "less") next.cadence = patch.cadence;
+  if (sanitizedPatch.packagePriority) next.packagePriority = { ...(next.packagePriority ?? {}), ...sanitizedPatch.packagePriority };
+  if (sanitizedPatch.typePriority) next.typePriority = { ...(next.typePriority ?? {}), ...sanitizedPatch.typePriority };
+  if (sanitizedPatch.sourcePriority) next.sourcePriority = { ...(next.sourcePriority ?? {}), ...sanitizedPatch.sourcePriority };
+  if (sanitizedPatch.savedArtifactIds) next.savedArtifactIds = uniqueStrings([...(next.savedArtifactIds ?? []), ...sanitizedPatch.savedArtifactIds]);
+  if (sanitizedPatch.hiddenArtifactIds) next.hiddenArtifactIds = uniqueStrings([...(next.hiddenArtifactIds ?? []), ...sanitizedPatch.hiddenArtifactIds]);
+  if (sanitizedPatch.packageDisabled) next.packageDisabled = uniqueStrings([...(next.packageDisabled ?? []), ...sanitizedPatch.packageDisabled]);
+  if (sanitizedPatch.typeSuppressed) next.typeSuppressed = uniqueStrings([...(next.typeSuppressed ?? []), ...sanitizedPatch.typeSuppressed]);
+  if (sanitizedPatch.showFewerPackageIds) next.showFewerPackageIds = { ...(next.showFewerPackageIds ?? {}), ...sanitizedPatch.showFewerPackageIds };
+  if (typeof sanitizedPatch.cooldownMinutes === "number") next.cooldownMinutes = sanitizedPatch.cooldownMinutes;
+  if (typeof sanitizedPatch.diversityWindow === "number") next.diversityWindow = sanitizedPatch.diversityWindow;
+  if (typeof sanitizedPatch.priority === "number") next.priority = sanitizedPatch.priority;
+  if (typeof sanitizedPatch.paused === "boolean") next.paused = sanitizedPatch.paused;
+  if (typeof sanitizedPatch.disabled === "boolean") next.disabled = sanitizedPatch.disabled;
+  if (sanitizedPatch.cadence === "more" || sanitizedPatch.cadence === "normal" || sanitizedPatch.cadence === "less") next.cadence = sanitizedPatch.cadence;
   return next;
+}
+
+function preferenceScopeForIntent(
+  kind: ControlIntentEvent["intentKind"],
+  payload: Record<string, unknown> | undefined,
+  targetRef: string,
+): string {
+  const expectedScope =
+    kind === "safe_package_setting_update" ||
+    kind === "candidate_package_proposal" ||
+    kind === "enable_package" ||
+    kind === "pause_package" ||
+    kind === "disable_package" ||
+    kind === "tune_package" ||
+    kind === "reset_package"
+      ? `package:${packageIdFromTarget(targetRef) ?? targetRef}`
+      : FEED_HOST_PREFERENCES_SCOPE;
+
+  if (typeof payload?.scope === "string" && payload.scope.trim() !== "" && payload.scope !== expectedScope) {
+    throw new FeedHostError("preference scope is not allowlisted", 400, "invalid_intent");
+  }
+
+  return expectedScope;
+}
+
+function controlIntentPreferencePatch(
+  kind: ControlIntentEvent["intentKind"],
+  payload: Record<string, unknown> | undefined,
+  targetRef: string,
+): FeedPreferenceValue {
+  const patch = plainObject(payload?.value) ?? plainObject(payload?.settings) ?? payload ?? {};
+  switch (kind) {
+    case "set_cadence": {
+      const cadence =
+        typeof payload?.cadence === "string" ? payload.cadence : typeof patch.cadence === "string" ? patch.cadence : undefined;
+      const packageId = packageIdFromTarget(targetRef);
+      const showFewerPackageIds = packageId ? { [packageId]: cadence === "less" ? 1 : cadence === "more" ? 0 : 0 } : undefined;
+      return sanitizePreferenceValue({
+        cadence: cadence === "more" || cadence === "normal" || cadence === "less" ? cadence : undefined,
+        showFewerPackageIds,
+      });
+    }
+    case "enable_package":
+      return { paused: false, disabled: false };
+    case "pause_package":
+      return { paused: true };
+    case "disable_package":
+      return { disabled: true };
+    case "reset_package":
+      return {};
+    case "candidate_package_proposal":
+      return sanitizePreferenceValue({ ...patch, disabled: true });
+    case "safe_package_setting_update":
+    case "tune_package":
+    case "adjust_preference":
+    case "reset_preferences":
+      return sanitizePreferenceValue(patch);
+    default:
+      return sanitizePreferenceValue(patch);
+  }
+}
+
+function packageIdFromTarget(targetRef: string): string | undefined {
+  const normalized = targetRef.startsWith("package:") ? targetRef.slice("package:".length) : targetRef;
+  if (normalized.trim() === "" || normalized.includes("/") || normalized.includes("\\")) return undefined;
+  return normalized;
 }
 
 function buildGenerationRequestRecord(input: {

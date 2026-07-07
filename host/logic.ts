@@ -547,7 +547,17 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
         get: { responses: { 200: { description: "feed", content: jsonResponse } } },
       },
       "/feed/events": {
-        get: { responses: { 200: { description: "sse", content: sseResponse } } },
+        get: {
+          parameters: [
+            {
+              name: "Last-Event-ID",
+              in: "header",
+              required: false,
+              schema: { type: "string" },
+            },
+          ],
+          responses: { 200: { description: "sse", content: sseResponse } },
+        },
       },
       "/artifacts/{artifactId}": {
         get: { responses: { 200: { description: "artifact", content: jsonResponse } } },
@@ -606,7 +616,7 @@ function stringify(value: unknown): string {
   }
 }
 
-function sanitizePreferenceValue(value: FeedPreferenceValue): FeedPreferenceValue {
+export function sanitizePreferenceValue(value: FeedPreferenceValue): FeedPreferenceValue {
   const sanitized: FeedPreferenceValue = {};
   if (value.packagePriority) sanitized.packagePriority = stringNumberMap(value.packagePriority);
   if (value.typePriority) sanitized.typePriority = stringNumberMap(value.typePriority);
@@ -622,11 +632,6 @@ function sanitizePreferenceValue(value: FeedPreferenceValue): FeedPreferenceValu
   if (typeof value.paused === "boolean") sanitized.paused = value.paused;
   if (typeof value.disabled === "boolean") sanitized.disabled = value.disabled;
   if (value.cadence === "more" || value.cadence === "normal" || value.cadence === "less") sanitized.cadence = value.cadence;
-  for (const [key, entry] of Object.entries(value)) {
-    if (sanitized[key] !== undefined) continue;
-    if (entry === undefined) continue;
-    sanitized[key] = entry;
-  }
   return sanitized;
 }
 
@@ -648,11 +653,6 @@ function mergePreferenceValue(base: FeedPreferenceValue, patch: FeedPreferenceVa
   if (sanitized.paused !== undefined) base.paused = sanitized.paused;
   if (sanitized.disabled !== undefined) base.disabled = sanitized.disabled;
   if (sanitized.cadence !== undefined) base.cadence = sanitized.cadence;
-  for (const [key, entry] of Object.entries(sanitized)) {
-    if (entry === undefined) continue;
-    if (key in base) continue;
-    base[key] = entry;
-  }
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

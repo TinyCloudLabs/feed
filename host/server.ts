@@ -7,6 +7,7 @@ import {
   buildOpenApiDocument,
   buildServerInfo,
   createPolicyHash,
+  FEED_HOST_PREFERENCES_SCOPE,
 } from "./logic.ts";
 import {
   activateFeedHostDelegation,
@@ -97,6 +98,8 @@ const JSON_HEADERS = {
   ...CORS_HEADERS,
   "content-type": "application/json",
 };
+
+const FEEDBACK_NOTE_MAX_CHARS = 1024;
 
 const SSE_HEADERS = {
   ...CORS_HEADERS,
@@ -356,6 +359,9 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     }
     const actor = await requireDelegationAndReady(context, actorId);
     const scope = optionalString(body.scope) ?? undefined;
+    if (scope !== undefined && scope !== FEED_HOST_PREFERENCES_SCOPE) {
+      throw new FeedHostError("preference scope is not allowlisted", 400, "invalid_preferences");
+    }
     const expectedVersion = optionalNumber(body.expectedVersion);
     const patch = optionalObject(body.patch);
     const reset = optionalBoolean(body.reset);
@@ -448,6 +454,9 @@ async function requireDelegation(context: FeedHostContext, actorId: string): Pro
   if (!actorId) throw new FeedHostError("missing delegated actor", 401, "unauthorized");
   const actorKey = normalizeActorId(actorId);
   let delegation = context.actors.get(actorKey);
+  if (delegation && isDelegationExpired(delegation)) {
+    throw new FeedDelegationError("accepted delegation has expired", "expired");
+  }
   if (!hasCompleteFeedHostDelegation(delegation) && context.delegationStore) {
     delegation = (await restoreActorFromStore(context, actorKey)) ?? delegation;
   }
@@ -501,7 +510,7 @@ async function readDelegationStatus(
 }> {
   const actorKey = normalizeActorId(actorId);
   const liveActor = context.actors.get(actorKey);
-  if (hasCompleteFeedHostDelegation(liveActor)) {
+  if (liveActor && hasCompleteFeedHostDelegation(liveActor) && !isDelegationExpired(liveActor)) {
     return {
       actorId: liveActor.actorId,
       delegateDID: context.policy.delegateDID,
@@ -509,6 +518,22 @@ async function readDelegationStatus(
       currentPolicyHash: context.policyHash,
       state: "active",
       complete: true,
+      resources: liveActor.resources.map((path) => ({
+        path,
+        acceptedAt: liveActor.acceptedAt,
+        expiresAt: liveActor.expiresAt,
+      })),
+    };
+  }
+
+  if (liveActor && isDelegationExpired(liveActor)) {
+    return {
+      actorId: liveActor.actorId,
+      delegateDID: context.policy.delegateDID,
+      policyHash: context.policyHash,
+      currentPolicyHash: context.policyHash,
+      state: "expired",
+      complete: false,
       resources: liveActor.resources.map((path) => ({
         path,
         acceptedAt: liveActor.acceptedAt,
@@ -671,14 +696,14 @@ async function readJsonObject(request: Request, code: string, message: string): 
 }
 
 function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string): FeedbackEvent {
+  const signal = readSignal(body.signal);
   return {
     eventId: readString(body, "eventId", "invalid_feedback", "eventId is required"),
     artifactId: readString(body, "artifactId", "invalid_feedback", "artifactId is required"),
     actorId,
     readerNonce: readString(body, "readerNonce", "invalid_feedback", "readerNonce is required"),
-    signal: readSignal(body.signal),
-    payload: body.payload,
-    payloadHash: optionalString(body.payloadHash) ?? undefined,
+    signal,
+    payload: sanitizeFeedbackPayload(signal, body.payload),
     createdAt: readString(body, "createdAt", "invalid_feedback", "createdAt is required"),
   };
 }
@@ -758,6 +783,29 @@ function readSignal(value: unknown): FeedbackEvent["signal"] {
     return value;
   }
   throw new FeedHostError("signal is required", 400, "invalid_feedback");
+}
+
+function sanitizeFeedbackPayload(signal: FeedbackEvent["signal"], payload: unknown): unknown {
+  if (signal !== "text_note") return undefined;
+  const note = extractFeedbackNote(payload);
+  if (!note) {
+    throw new FeedHostError("note is required for text_note feedback", 400, "invalid_feedback");
+  }
+  return { note };
+}
+
+function extractFeedbackNote(payload: unknown): string | undefined {
+  let candidate: unknown;
+  if (typeof payload === "string") {
+    candidate = payload;
+  } else if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+    const record = payload as Record<string, unknown>;
+    candidate = typeof record.note === "string" ? record.note : typeof record.text === "string" ? record.text : undefined;
+  }
+  if (typeof candidate !== "string") return undefined;
+  const trimmed = candidate.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, FEEDBACK_NOTE_MAX_CHARS);
 }
 
 function readControlIntentKind(value: unknown): ControlIntentEvent["intentKind"] {
@@ -871,87 +919,9 @@ function quotedEtag(value: string): string {
   return `"${value}"`;
 }
 
-async function readDelegationStatus(
-  context: FeedHostContext,
-  actorId: string,
-): Promise<{
-  actorId: string;
-  delegateDID: string;
-  policyHash: string;
-  currentPolicyHash: string;
-  state: "missing" | "active" | "partial" | "expired" | "stale";
-  complete: boolean;
-  resources: Array<{ path: string; acceptedAt: string; expiresAt: string }>;
-}> {
-  const actorKey = normalizeActorId(actorId);
-  const liveActor = context.actors.get(actorKey);
-  if (hasCompleteFeedHostDelegation(liveActor)) {
-    return {
-      actorId: liveActor.actorId,
-      delegateDID: context.policy.delegateDID,
-      policyHash: context.policyHash,
-      currentPolicyHash: context.policyHash,
-      state: "active",
-      complete: true,
-      resources: liveActor.resources.map((path) => ({
-        path,
-        acceptedAt: liveActor.acceptedAt,
-        expiresAt: liveActor.expiresAt,
-      })),
-    };
-  }
-
-  if (!context.delegationStore) {
-    return {
-      actorId,
-      delegateDID: context.policy.delegateDID,
-      policyHash: context.policyHash,
-      currentPolicyHash: context.policyHash,
-      state: "missing",
-      complete: false,
-      resources: [],
-    };
-  }
-
-  const stored = await context.delegationStore.load(actorKey);
-  if (!stored) {
-    return {
-      actorId,
-      delegateDID: context.policy.delegateDID,
-      policyHash: context.policyHash,
-      currentPolicyHash: context.policyHash,
-      state: "missing",
-      complete: false,
-      resources: [],
-    };
-  }
-
-  const liveResources = liveDelegationResources(stored).map((resource) => ({
-    path: resource.path,
-    acceptedAt: resource.acceptedAt,
-    expiresAt: resource.expiresAt,
-  }));
-  const complete =
-    liveResources.length > 0 &&
-    liveResources.length === stored.resources.length &&
-    (stored.policyHash ?? context.policyHash) === context.policyHash;
-  const state =
-    stored.policyHash && stored.policyHash !== context.policyHash
-      ? "stale"
-      : liveResources.length === 0
-        ? "expired"
-        : complete
-          ? "active"
-          : "partial";
-  return {
-    actorId: stored.actorId,
-    delegateDID: stored.delegateDID,
-    policyHash: stored.policyHash ?? context.policyHash,
-    currentPolicyHash: context.policyHash,
-    state,
-    complete,
-    resources: liveResources,
-  };
+function isDelegationExpired(actor: Pick<ActorState, "expiresAt">): boolean {
+  const expiry = Date.parse(actor.expiresAt);
+  return !Number.isFinite(expiry) || expiry <= Date.now();
 }
 
 function resolveRequestActorId(request: Request, bodyActorId: unknown): string {

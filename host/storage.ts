@@ -45,6 +45,7 @@ import {
   reconcileFeedProjections,
   renderFeedEventStream,
   summarizeFeedbackEvents,
+  sanitizePreferenceValue,
   FEED_HOST_PREFERENCES_SCOPE,
 } from "./logic.ts";
 
@@ -272,7 +273,7 @@ export class FeedHostStorage {
     actor: FeedHostActorStorage,
     scope: string = FEED_HOST_PREFERENCES_SCOPE,
   ): Promise<FeedPreferenceProfileRecord | null> {
-    return this.readPreferenceProfileByActor(actor, actor.actorId, scope);
+    return this.readPreferenceProfileByActor(actor, actor.actorId, normalizePreferenceScope(scope));
   }
 
   async listPreferenceProfiles(actor: FeedHostActorStorage): Promise<FeedPreferenceProfileRecord[]> {
@@ -295,7 +296,7 @@ export class FeedHostStorage {
       actorId: string;
     },
   ): Promise<FeedPreferenceProfileRecord> {
-    const scope = input.scope ?? FEED_HOST_PREFERENCES_SCOPE;
+    const scope = normalizePreferenceScope(input.scope);
     const normalizedActorId = normalizeActorId(input.actorId);
     const now = input.updatedAt ?? new Date().toISOString();
     const current = await this.readPreferenceProfileByActor(actor, normalizedActorId, scope);
@@ -553,24 +554,6 @@ export class FeedHostStorage {
         ORDER BY created_at ASC`,
       [normalizeActorId(actor.actorId)],
     );
-  }
-
-  private async readWorkflowRuns(
-    actor: FeedHostActorStorage,
-  ): Promise<Array<{ runId: string; packageId: string; status: string; startedAt: string; finishedAt?: string | null }>> {
-    const rows = await queryRows<{ run_id: string; package_id: string; status: string; started_at: string; finished_at: string | null }>(
-      this.db(actor, "artifacts_index"),
-      `SELECT run_id, package_id, status, started_at, finished_at
-         FROM workflow_run_index
-        ORDER BY started_at DESC`,
-    );
-    return rows.map((row) => ({
-      runId: row.run_id,
-      packageId: row.package_id,
-      status: row.status,
-      startedAt: row.started_at,
-      finishedAt: row.finished_at,
-    }));
   }
 
   private async readArtifactDocument(
@@ -938,16 +921,17 @@ function defaultPreferenceValue(): FeedPreferenceValue {
 }
 
 function mergePreferencePatch(base: FeedPreferenceValue, patch: FeedPreferenceValue): FeedPreferenceValue {
+  const sanitizedBase = sanitizePreferenceValue(base);
   const next: FeedPreferenceValue = {
-    ...base,
-    packagePriority: { ...(base.packagePriority ?? {}) },
-    typePriority: { ...(base.typePriority ?? {}) },
-    sourcePriority: { ...(base.sourcePriority ?? {}) },
-    savedArtifactIds: [...(base.savedArtifactIds ?? [])],
-    hiddenArtifactIds: [...(base.hiddenArtifactIds ?? [])],
-    packageDisabled: [...(base.packageDisabled ?? [])],
-    typeSuppressed: [...(base.typeSuppressed ?? [])],
-    showFewerPackageIds: { ...(base.showFewerPackageIds ?? {}) },
+    ...sanitizedBase,
+    packagePriority: { ...(sanitizedBase.packagePriority ?? {}) },
+    typePriority: { ...(sanitizedBase.typePriority ?? {}) },
+    sourcePriority: { ...(sanitizedBase.sourcePriority ?? {}) },
+    savedArtifactIds: [...(sanitizedBase.savedArtifactIds ?? [])],
+    hiddenArtifactIds: [...(sanitizedBase.hiddenArtifactIds ?? [])],
+    packageDisabled: [...(sanitizedBase.packageDisabled ?? [])],
+    typeSuppressed: [...(sanitizedBase.typeSuppressed ?? [])],
+    showFewerPackageIds: { ...(sanitizedBase.showFewerPackageIds ?? {}) },
   };
   if (patch.packagePriority) next.packagePriority = { ...(next.packagePriority ?? {}), ...stringNumberMap(patch.packagePriority) };
   if (patch.typePriority) next.typePriority = { ...(next.typePriority ?? {}), ...stringNumberMap(patch.typePriority) };
@@ -963,11 +947,6 @@ function mergePreferencePatch(base: FeedPreferenceValue, patch: FeedPreferenceVa
   if (typeof patch.paused === "boolean") next.paused = patch.paused;
   if (typeof patch.disabled === "boolean") next.disabled = patch.disabled;
   if (patch.cadence === "more" || patch.cadence === "normal" || patch.cadence === "less") next.cadence = patch.cadence;
-  for (const [key, value] of Object.entries(patch)) {
-    if (value === undefined) continue;
-    if (key in next) continue;
-    next[key] = value;
-  }
   return next;
 }
 
@@ -1004,8 +983,7 @@ function preferenceScopeForIntent(
   payload: Record<string, unknown> | undefined,
   targetRef: string,
 ): string {
-  if (typeof payload?.scope === "string" && payload.scope.trim() !== "") return payload.scope;
-  if (
+  const expectedScope =
     kind === "safe_package_setting_update" ||
     kind === "candidate_package_proposal" ||
     kind === "enable_package" ||
@@ -1013,10 +991,14 @@ function preferenceScopeForIntent(
     kind === "disable_package" ||
     kind === "tune_package" ||
     kind === "reset_package"
-  ) {
-    return `package:${targetRef}`;
+      ? `package:${packageIdFromTarget(targetRef) ?? targetRef}`
+      : FEED_HOST_PREFERENCES_SCOPE;
+
+  if (typeof payload?.scope === "string" && payload.scope.trim() !== "" && payload.scope !== expectedScope) {
+    throw new FeedHostError("preference scope is not allowlisted", 400, "invalid_intent");
   }
-  return FEED_HOST_PREFERENCES_SCOPE;
+
+  return expectedScope;
 }
 
 function controlIntentPreferencePatch(
@@ -1029,7 +1011,7 @@ function controlIntentPreferencePatch(
     case "set_cadence": {
       const cadence =
         typeof payload?.cadence === "string" ? payload.cadence : typeof patch.cadence === "string" ? patch.cadence : undefined;
-      const packageId = packageIdFromTarget(targetRef, payload);
+      const packageId = packageIdFromTarget(targetRef);
       const showFewerPackageIds = packageId ? { [packageId]: cadence === "less" ? 1 : cadence === "more" ? 0 : 0 } : undefined;
       return {
         cadence: cadence === "more" || cadence === "normal" || cadence === "less" ? cadence : undefined,
@@ -1099,18 +1081,20 @@ function sanitizePreferencePatch(patch: Record<string, unknown>): FeedPreference
   if (typeof patch.paused === "boolean") result.paused = patch.paused;
   if (typeof patch.disabled === "boolean") result.disabled = patch.disabled;
   if (patch.cadence === "more" || patch.cadence === "normal" || patch.cadence === "less") result.cadence = patch.cadence;
-  for (const [key, value] of Object.entries(patch)) {
-    if (value === undefined) continue;
-    if (key in result) continue;
-    result[key] = value;
-  }
   return result;
 }
 
-function packageIdFromTarget(targetRef: string, payload: Record<string, unknown> | undefined): string | undefined {
-  if (typeof payload?.packageId === "string" && payload.packageId.trim() !== "") return payload.packageId;
-  if (targetRef.startsWith("package:")) return targetRef.slice("package:".length);
-  return targetRef.includes("/") ? undefined : targetRef;
+function packageIdFromTarget(targetRef: string): string | undefined {
+  const normalized = targetRef.startsWith("package:") ? targetRef.slice("package:".length) : targetRef;
+  if (normalized.trim() === "" || normalized.includes("/") || normalized.includes("\\")) return undefined;
+  return normalized;
+}
+
+function normalizePreferenceScope(scope?: string): string {
+  const value = scope ?? FEED_HOST_PREFERENCES_SCOPE;
+  if (value === FEED_HOST_PREFERENCES_SCOPE) return value;
+  if (/^package:[^/\\]+$/.test(value)) return value;
+  throw new FeedHostError("preference scope is not allowlisted", 400, "invalid_preferences");
 }
 
 function projectionStateFromRow(row: ProjectionRow): FeedProjectionState {
