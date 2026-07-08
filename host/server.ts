@@ -15,6 +15,10 @@ import {
   type AcceptedFeedDelegation,
   type FeedHostDelegationPolicy,
 } from "./delegation.ts";
+import {
+  LEGACY_FEED_DB_PATH,
+  LEGACY_INTERACTIONS_DB_PATH,
+} from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import { FeedHostStorage, type FeedHostActorStorage } from "./storage.ts";
@@ -382,7 +386,15 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
   if (!artifacts || !feed || !documents) {
     throw new FeedDelegationError("Feed Host delegation is missing activated TinyCloud access", "insufficient_policy");
   }
-  actor.storageAccess = { artifacts, feed, documents };
+  const legacyArtifacts = actor.accessByResource.get(LEGACY_FEED_DB_PATH);
+  const legacyInteractions = actor.accessByResource.get(LEGACY_INTERACTIONS_DB_PATH);
+  actor.storageAccess = {
+    artifacts,
+    feed,
+    documents,
+    ...(legacyArtifacts ? { legacyArtifacts } : {}),
+    ...(legacyInteractions ? { legacyInteractions } : {}),
+  };
   return actor.storageAccess;
 }
 
@@ -390,8 +402,9 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
   if (!actor.ready) {
     actor.ready = (async () => {
       const access = actorStorage(actor);
-      await storage.bootstrapSchema(access);
-      if (seedOnStart && !(await storage.hasArtifacts(access))) await seedDefaultFeed(storage, access);
+      const migration = await storage.bootstrapSchema(access);
+      const legacyDataPresent = migration.legacyArtifacts > 0 || migration.legacyInteractions > 0;
+      if (seedOnStart && !legacyDataPresent && !(await storage.hasArtifacts(access))) await seedDefaultFeed(storage, access);
     })();
   }
   await actor.ready;
