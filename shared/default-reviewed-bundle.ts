@@ -10,7 +10,8 @@ export const DEFAULT_REVIEWED_BUNDLE = {
   artifactSummary: "A deterministic stub artifact from the reviewed bundle.",
   artifactBodyText: "The reviewed bundle should emit one grounded stub artifact.",
   disclosure: {
-    userCopy: "Reads bounded Listen excerpts and emits a single reviewed stub artifact.",
+    userCopy:
+      "Reads bounded Listen excerpts, stores artifacts and feedback in TinyCloud, and emits a single reviewed stub artifact with no third-party writes or user-world mutation.",
     credentialOwner: "none" as const,
     providerClass: "none" as const,
     egressClass: "none" as const,
@@ -41,4 +42,3 @@ export const DEFAULT_REVIEWED_BUNDLE = {
     quoteLineRefs: ["0"],
   },
 } as const;
-

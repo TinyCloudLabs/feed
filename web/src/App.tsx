@@ -7,6 +7,8 @@ import type {
 import { DEFAULT_REVIEWED_BUNDLE } from "../../shared/default-reviewed-bundle.ts";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
+  loadFirstRunApproval,
+  saveFirstRunApproval,
   restoreSession,
   signIn,
   signOut,
@@ -21,6 +23,13 @@ type LoadState = "idle" | "loading" | "ready" | "error";
 type BundleState = "idle" | "needs_approval" | "starting" | "running" | "error";
 
 const FEED_EVENTS_RETRY_MS = 5000;
+const FEED_HOST_ORIGIN = (() => {
+  try {
+    return new URL(FEED_HOST_URL).origin;
+  } catch {
+    return FEED_HOST_URL;
+  }
+})();
 
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
@@ -28,26 +37,6 @@ function shortAddress(value: string): string {
 
 function newNonce(): string {
   return crypto.randomUUID();
-}
-
-function firstRunApprovalKey(actorId: string): string {
-  return `feed:v1:firstRunApproved:${actorId}:${DEFAULT_REVIEWED_BUNDLE.packageId}`;
-}
-
-function hasFirstRunApproval(actorId: string): boolean {
-  try {
-    return localStorage.getItem(firstRunApprovalKey(actorId)) === "true";
-  } catch {
-    return false;
-  }
-}
-
-function markFirstRunApproval(actorId: string): void {
-  try {
-    localStorage.setItem(firstRunApprovalKey(actorId), "true");
-  } catch {
-    // Approval persistence is best-effort.
-  }
 }
 
 export function App() {
@@ -136,8 +125,35 @@ export function App() {
       setBundleError(null);
       setLoadError(null);
       try {
+        const approval = rememberApproval
+          ? await saveFirstRunApproval({
+              actorId: session.readerDid,
+              hostOrigin: FEED_HOST_ORIGIN,
+            })
+          : null;
         await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
-        if (rememberApproval) markFirstRunApproval(session.readerDid);
+        if (approval) {
+          try {
+            await client.postControlIntent({
+              eventId: crypto.randomUUID(),
+              actorId: session.readerDid,
+              readerNonce: newNonce(),
+              intentKind: "enable_package",
+              status: "accepted",
+              targetRef: DEFAULT_REVIEWED_BUNDLE.packageId,
+              payload: {
+                approval,
+                hostOrigin: FEED_HOST_ORIGIN,
+                bundleDigest: DEFAULT_REVIEWED_BUNDLE.digest,
+              },
+              createdAt: approval.approvedAt,
+            });
+          } catch (error) {
+            // The consent record is durable in TinyCloud KV; the host-side
+            // audit intent is best-effort.
+            console.warn("Feed Host enable_package control intent was not recorded.", error);
+          }
+        }
         setBundleState("running");
         await loadFeed();
       } catch (error) {
@@ -160,14 +176,24 @@ export function App() {
 
   useEffect(() => {
     if (!session || !policy) return;
-    if (hasFirstRunApproval(session.readerDid)) {
-      void startBundle({ rememberApproval: false });
-      return;
-    }
-    setBundleState("needs_approval");
     setBundleError(null);
     setLoadState("idle");
     setLoadError(null);
+    let cancelled = false;
+    const bootstrapBundle = async () => {
+      setBundleState("idle");
+      const approval = await loadFirstRunApproval({ actorId: session.readerDid, hostOrigin: FEED_HOST_ORIGIN });
+      if (cancelled) return;
+      if (approval) {
+        void startBundle({ rememberApproval: false });
+        return;
+      }
+      setBundleState("needs_approval");
+    };
+    void bootstrapBundle();
+    return () => {
+      cancelled = true;
+    };
   }, [policy, session, startBundle]);
 
   useEffect(() => {
@@ -181,6 +207,9 @@ export function App() {
       try {
         const snapshot = await client.getFeedEvents();
         if (cancelled) return;
+        // A transient poll failure should clear as soon as the next snapshot succeeds.
+        setLoadState((current) => (current === "error" ? "ready" : current));
+        setLoadError(null);
         const signature = snapshot.text.trim();
         if (signature !== lastSignature) {
           lastSignature = signature;
@@ -331,7 +360,7 @@ export function App() {
 
         {bundleState === "error" && (
           <BundleFailurePanel
-            error={bundleError ?? "The default bundle could not be started."}
+            error={bundleError ?? "The default bundle could not be approved or started."}
             onRetry={() => void startBundle({ rememberApproval: true })}
           />
         )}
@@ -381,6 +410,10 @@ function FirstRunApprovalPanel({
         <p className="panel-kicker">First run</p>
         <h2 id="first-run-approval-title">Approve the default bundle before Feed starts.</h2>
         <p>{bundle.disclosure.userCopy}</p>
+        <p>
+          Approval is stored in your TinyCloud space for {FEED_HOST_ORIGIN} and this bundle digest, not in browser
+          storage. If the host origin or digest changes, Feed will ask again.
+        </p>
       </div>
       <dl className="bundle-details">
         <div>
@@ -388,20 +421,40 @@ function FirstRunApprovalPanel({
           <dd>{bundle.displayName}</dd>
         </div>
         <div>
-          <dt>Artifact</dt>
+          <dt>Bundle digest</dt>
+          <dd>{bundle.digest}</dd>
+        </div>
+        <div>
+          <dt>Feed Host</dt>
+          <dd>{FEED_HOST_ORIGIN}</dd>
+        </div>
+        <div>
+          <dt>Artifact type</dt>
           <dd>{bundle.artifactType}</dd>
         </div>
         <div>
-          <dt>Runtime</dt>
+          <dt>Runtime class</dt>
           <dd>{bundle.runtime.runtimeClass}</dd>
+        </div>
+        <div>
+          <dt>Runtime provider</dt>
+          <dd>{bundle.disclosure.providerClass}</dd>
         </div>
         <div>
           <dt>Credentials</dt>
           <dd>{bundle.disclosure.credentialOwner}</dd>
         </div>
         <div>
-          <dt>Egress</dt>
+          <dt>Egress class</dt>
           <dd>{bundle.disclosure.egressClass}</dd>
+        </div>
+        <div>
+          <dt>Storage</dt>
+          <dd>TinyCloud Feed and Artifacts state</dd>
+        </div>
+        <div>
+          <dt>Boundary</dt>
+          <dd>No third-party writes or user-world mutation</dd>
         </div>
         <div>
           <dt>Model calls</dt>
@@ -475,7 +528,7 @@ function BundleFailurePanel({ error, onRetry }: { error: string; onRetry: () => 
   return (
     <section className="panel failure-panel" role="alert">
       <p className="panel-kicker">Bundle start failed</p>
-      <h2>We could not start the default bundle.</h2>
+      <h2>We could not approve or start the default bundle.</h2>
       <p>{error}</p>
       <div className="panel-actions">
         <button className="primary" onClick={onRetry}>
