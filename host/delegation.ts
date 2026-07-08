@@ -11,6 +11,10 @@ import {
   FEED_V1_ARTIFACTS_INDEX_DB_PATH,
   FEED_V1_FEED_INDEX_DB_PATH,
 } from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
+import {
+  LEGACY_FEED_DB_PATH,
+  LEGACY_INTERACTIONS_DB_PATH,
+} from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 
 export const FEED_HOST_SQL_ACTIONS = [
   "tinycloud.sql/read",
@@ -49,6 +53,18 @@ export const FEED_HOST_DELEGATION_RESOURCES = [
     serviceShort: "kv",
     path: FEED_HOST_ARTIFACT_DOC_PREFIX,
     actions: [...FEED_HOST_KV_ACTIONS],
+  },
+  {
+    service: "tinycloud.sql",
+    serviceShort: "sql",
+    path: LEGACY_FEED_DB_PATH,
+    actions: ["tinycloud.sql/read"],
+  },
+  {
+    service: "tinycloud.sql",
+    serviceShort: "sql",
+    path: LEGACY_INTERACTIONS_DB_PATH,
+    actions: ["tinycloud.sql/read"],
   },
 ] as const;
 

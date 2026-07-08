@@ -14,7 +14,12 @@ const MULTI_RESOURCE_ERROR = {
 
 type DbLog = { applies: number; batches: Array<Array<{ sql: string }>>; executes: string[] };
 
-function makeActor(options: { batchFails?: boolean } = {}): {
+type LegacyFixture = {
+  artifacts: Record<string, unknown>[];
+  interactions: Record<string, unknown>[];
+};
+
+function makeActor(options: { batchFails?: boolean; legacyRows?: LegacyFixture } = {}): {
   actor: FeedHostActorStorage;
   logs: Map<string, DbLog>;
 } {
@@ -42,12 +47,31 @@ function makeActor(options: { batchFails?: boolean } = {}): {
     };
   }
 
+  function makeLegacyDb(kind: "artifact" | "interaction", rows: Record<string, unknown>[]) {
+    return {
+      query: async () => ({
+        ok: true,
+        data: {
+          columns: rows.length > 0 ? Object.keys(rows[0]!) : [],
+          rows,
+          rowCount: rows.length,
+        },
+      }),
+    };
+  }
+
   const artifactDb = makeDb(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedDb = makeDb(FEED_HOST_FEED_DB_PATH);
   const actor = {
     artifacts: { sql: { db: (path: string) => (path === FEED_HOST_ARTIFACTS_DB_PATH ? artifactDb : feedDb) } },
     feed: { sql: { db: (path: string) => (path === FEED_HOST_FEED_DB_PATH ? feedDb : artifactDb) } },
     documents: { kv: { put: async () => ({ ok: true }) } },
+    ...(options.legacyRows
+      ? {
+          legacyArtifacts: { sql: { db: () => makeLegacyDb("artifact", options.legacyRows?.artifacts ?? []) } },
+          legacyInteractions: { sql: { db: () => makeLegacyDb("interaction", options.legacyRows?.interactions ?? []) } },
+        }
+      : {}),
   } as unknown as FeedHostActorStorage;
 
   return { actor, logs };
@@ -101,6 +125,52 @@ test("invokes the legacy migration hook once per actor during bootstrap", async 
   await storage.bootstrapSchema(actor);
 
   expect(migrateCalls).toBe(1);
+});
+
+test("bootstraps legacy rows when the actor can read the old SQL resources", async () => {
+  const { actor, logs } = makeActor({
+    legacyRows: {
+      artifacts: [
+        {
+          id: "legacy-card-1",
+          type: "article",
+          render_type: "article",
+          slug: "legacy-card-1",
+          headline: "Legacy headline",
+          body_md: "Legacy body.",
+          source_transcripts: JSON.stringify(["listen-1"]),
+          raw_artifact: JSON.stringify({
+            producer: { run_id: "run-legacy-1" },
+          }),
+          generated_at: "2026-06-01T10:00:00.000Z",
+          published_at: "2026-06-01T11:00:00.000Z",
+          publisher_did: "did:pkh:eip155:1:0x1234567890abcdef1234567890abcdef12345678",
+          schema_version: 1,
+        },
+      ],
+      interactions: [],
+    },
+  });
+
+  const storage = new FeedHostStorage();
+  const summary = await storage.bootstrapSchema(actor);
+
+  expect(summary.legacyArtifacts).toBe(1);
+  expect(summary.migratedArtifacts).toBe(1);
+  expect(summary.migratedArtifactDocs).toBe(1);
+  expect(summary.migratedArtifactRows).toBe(1);
+  expect(summary.migratedFeedRows).toBe(1);
+  expect(summary.skippedArtifacts).toBe(0);
+  expect(summary.skippedInteractions).toBe(0);
+
+  const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
+  const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
+  expect(artifactLog?.batches.length).toBe(2);
+  expect(feedLog?.batches.length).toBe(2);
+  expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
+  expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
+  expect(artifactLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO artifact_index");
+  expect(feedLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_artifact_projection");
 });
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {

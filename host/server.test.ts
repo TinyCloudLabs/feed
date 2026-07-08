@@ -49,6 +49,8 @@ describe("Feed Host server", () => {
       "xyz.tinycloud.artifacts/index",
       "xyz.tinycloud.feed/index",
       "xyz.tinycloud.artifacts/artifacts",
+      "xyz.tinycloud.artifacts/feed",
+      "xyz.tinycloud.artifacts/interactions",
     ]);
     for (const resource of policy.resources) {
       await postJson(`${runtime.url}/delegations`, {
