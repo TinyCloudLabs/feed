@@ -7,93 +7,71 @@ import type {
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { buildGreenfieldSeed } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import type { FeedHostActorStorage, FeedHostStorage } from "./storage.ts";
+import { FEED_HOST_ARTIFACT_DOC_PREFIX } from "./delegation.ts";
+import { DEFAULT_REVIEWED_BUNDLE } from "../shared/default-reviewed-bundle.ts";
 
-export const SEEDED_ARTIFACT_ID = "run-seed-001:insight-card-001";
-
-const NOW = "2026-06-29T12:00:00.000Z";
-const SOURCE: TranscriptSourceRef = {
-  sourceRefId: "listen:seed:fundraising-loop",
-  sourceKind: "listen_conversation",
-  sourceId: "conversation-seed-001",
-  observedPath: "sql_transcript_json",
-  observedHash: "sha256:feed-v1-seed-source",
-  observedAt: NOW,
-  quoteLineRefs: ["L12-L18", "L41-L47"],
-};
-
-const DISCLOSURE = {
-  userCopy: "Generated from your recent Listen context using Feed-hosted OpenAI credentials.",
-  credentialOwner: "feed_hosted" as const,
-  providerClass: "first_party" as const,
-  egressClass: "model_provider" as const,
-};
+export const SEEDED_ARTIFACT_ID = DEFAULT_REVIEWED_BUNDLE.artifactId;
 
 export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostActorStorage): Promise<void> {
   const pkg: FeedWorkflowPackage = {
     schemaVersion: "feed.workflow_package.v1",
-    packageId: "extract-insights",
-    displayName: "Extract Insights",
-    version: "1.0.0",
-    digest: "sha256:seed-package-extract-insights",
-    manifestKey: "skills/extract-insights/SKILL.md",
-    workflowRef: "smithers://feed/extract-insights",
-    workflowDigest: "sha256:seed-workflow-extract-insights",
+    packageId: DEFAULT_REVIEWED_BUNDLE.packageId,
+    displayName: DEFAULT_REVIEWED_BUNDLE.displayName,
+    version: DEFAULT_REVIEWED_BUNDLE.version,
+    digest: DEFAULT_REVIEWED_BUNDLE.digest,
+    manifestKey: "fixtures/default-reviewed-bundle/skill.toml",
+    workflowRef: "workflows/default-reviewed-bundle.stub.json",
+    workflowDigest: DEFAULT_REVIEWED_BUNDLE.workflowDigest,
     admissionState: "reviewed_first_party",
-    disclosure: DISCLOSURE,
+    disclosure: DEFAULT_REVIEWED_BUNDLE.disclosure,
   };
 
   const artifact: FeedArtifact = {
     schemaVersion: "feed.artifact.v1",
     artifactId: SEEDED_ARTIFACT_ID,
-    artifactType: "insight_card",
+    artifactType: DEFAULT_REVIEWED_BUNDLE.artifactType,
     renderShape: "short_form",
-    title: "Practice Fish First",
-    summary: "A seed artifact showing how Feed Host projections hydrate through the new Feed v1 contract.",
+    title: DEFAULT_REVIEWED_BUNDLE.artifactTitle,
+    summary: DEFAULT_REVIEWED_BUNDLE.artifactSummary,
     body: {
-      markdown:
-        "Run the fundraising workflow against low-stakes targets first. Each pass should debug the software, the story, and the handoff between agents before higher-stakes investor conversations.",
-      bullets: [
-        "Feed Host owns projection and feedback persistence.",
-        "Artifacts remain contract-shaped documents addressed by doc keys.",
-        "Control intents become durable generation requests.",
-      ],
+      text: DEFAULT_REVIEWED_BUNDLE.artifactBodyText,
     },
-    sourceRefs: [SOURCE],
+    sourceRefs: [DEFAULT_REVIEWED_BUNDLE.sourceRef as TranscriptSourceRef],
     producedBy: {
       packageId: pkg.packageId,
       packageVersion: pkg.version,
       packageDigest: pkg.digest,
-      runId: "run-seed-001",
-      runtimeClass: "feed_hosted",
-      providerClass: "first_party",
-      credentialOwner: "feed_hosted",
-      egressClass: "model_provider",
-      disclosure: DISCLOSURE,
+      runId: "run-reviewed-bundle",
+      runtimeClass: DEFAULT_REVIEWED_BUNDLE.runtime.runtimeClass,
+      providerClass: DEFAULT_REVIEWED_BUNDLE.runtime.providerClass,
+      credentialOwner: DEFAULT_REVIEWED_BUNDLE.disclosure.credentialOwner,
+      egressClass: DEFAULT_REVIEWED_BUNDLE.runtime.egressClass,
+      disclosure: DEFAULT_REVIEWED_BUNDLE.disclosure,
     },
     freshness: {
       label: "fresh",
-      asOf: NOW,
-      lastCheckedAt: NOW,
+      asOf: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
+      lastCheckedAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
     },
     idempotency: {
-      sourceFingerprint: "sha256:seed-source-fingerprint",
-      artifactFingerprint: "sha256:seed-artifact-fingerprint",
-      dedupeKey: "feed-v1-seed:practice-fish-first",
+      sourceFingerprint: "sha256:feed-default-source",
+      artifactFingerprint: "sha256:feed-default-artifact",
+      dedupeKey: "feed-v1-default-reviewed-bundle",
     },
     storage: {
-      docKey: "seed/run-seed-001/insight-card-001.json",
+      docKey: `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${SEEDED_ARTIFACT_ID}.json`,
     },
-    createdAt: NOW,
-    updatedAt: NOW,
+    createdAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
+    updatedAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
   };
 
   const projection: FeedArtifactProjection = {
     artifactId: artifact.artifactId,
-    rankScore: 0.92,
+    rankScore: 0.96,
     disposition: "default",
     visibility: "ranked",
     freshnessLabel: artifact.freshness.label,
-    reasonCodes: ["seeded", "recent_listen_context", "default_internal_skill"],
+    reasonCodes: ["default_reviewed_bundle", "first_run", "stub_runtime"],
     packageId: pkg.packageId,
     sourceFingerprint: artifact.idempotency.sourceFingerprint,
     publishedAt: artifact.createdAt,
@@ -102,16 +80,16 @@ export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostA
 
   const run: FeedWorkflowRun = {
     schemaVersion: "feed.workflow_run.v1",
-    runId: artifact.producedBy.runId,
+    runId: "run-reviewed-bundle",
     packageId: pkg.packageId,
     packageDigest: pkg.digest,
     status: "published",
-    sourceRefs: [SOURCE],
+    sourceRefs: [DEFAULT_REVIEWED_BUNDLE.sourceRef as TranscriptSourceRef],
     publishedArtifactIds: [artifact.artifactId],
     droppedCandidates: [],
-    spend: { budgetId: "feed-hosted-seed", amount: 0, currency: "USD" },
-    startedAt: NOW,
-    finishedAt: NOW,
+    spend: { budgetId: "default-reviewed-bundle", amount: 0, currency: "USD" },
+    startedAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
+    finishedAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
   };
 
   const seed = buildGreenfieldSeed({ pkg, run, artifact, projection });

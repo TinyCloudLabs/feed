@@ -1,14 +1,25 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { fileURLToPath } from "node:url";
+import { Wallet } from "ethers";
 
-const TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-const TEST_ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-const TEST_ACTOR_ID = `did:pkh:eip155:1:${TEST_ADDRESS}`;
 const TEST_WALLET_NAME = "TinyCloud Test Wallet";
 const FEED_HOST_URL = `http://127.0.0.1:${process.env.FEED_SMOKE_HOST_PORT ?? "8787"}`;
-const ETHERS_UMD_PATH = fileURLToPath(
-  new URL("../../node_modules/ethers/dist/ethers.umd.min.js", import.meta.url),
-);
+const ETHERS_UMD_PATH = fileURLToPath(new URL("../../node_modules/ethers/dist/ethers.umd.min.js", import.meta.url));
+
+type TestWallet = {
+  privateKey: string;
+  address: string;
+  actorId: string;
+};
+
+function createTestWallet(): TestWallet {
+  const wallet = Wallet.createRandom();
+  return {
+    privateKey: wallet.privateKey,
+    address: wallet.address,
+    actorId: `did:pkh:eip155:1:${wallet.address}`,
+  };
+}
 
 function exposeTestShadowRoots() {
   return () => {
@@ -78,16 +89,17 @@ function mockBrowserWalletProvider() {
   };
 }
 
-test("signs in through OpenKey external wallet", async ({ page }) => {
+async function installWallet(page: Page, wallet: TestWallet): Promise<void> {
   await page.addInitScript(exposeTestShadowRoots());
   await page.addInitScript({ path: ETHERS_UMD_PATH });
   await page.addInitScript(mockBrowserWalletProvider(), {
-    address: TEST_ADDRESS,
-    privateKey: TEST_PRIVATE_KEY,
+    address: wallet.address,
+    privateKey: wallet.privateKey,
     walletName: TEST_WALLET_NAME,
   });
+}
 
-  await page.goto("/");
+async function signInWithWallet(page: Page, wallet: TestWallet): Promise<void> {
   await page.getByRole("button", { name: /sign in with openkey/i }).click();
   await page
     .frameLocator('iframe[src*="openkey.so/widget/embed/connect"]')
@@ -95,44 +107,120 @@ test("signs in through OpenKey external wallet", async ({ page }) => {
     .click();
   await expect(page.getByText(TEST_WALLET_NAME)).toBeVisible();
   await page.getByText(TEST_WALLET_NAME).click();
+  await page.getByRole("button", { name: /create tinycloud space/i }).click({ timeout: 15000 }).catch(() => undefined);
   await expect.poll(() => page.evaluate(() => (window as any).__walletRequests), { timeout: 60000 }).toContain("personal_sign");
-  await expect(page.getByRole("heading", { name: "Feed" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Feed", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Practice Fish First" })).toBeVisible({ timeout: 120000 });
+  await expect(page.getByRole("heading", { name: /approve the default bundle before feed starts/i })).toBeVisible();
+  await expect(page.getByRole("button", { name: /approve and start/i })).toBeVisible();
+}
 
-  // The shared test actor persists feed state on the live node across smoke
-  // runs, so hide the first still-visible card and assert the delta instead of
-  // assuming a single-card greenfield feed.
-  const hiddenCards = page.locator("article.hidden-card");
-  const hiddenBefore = await hiddenCards.count();
-  await page
-    .locator("article.feed-card:not(.hidden-card)")
-    .first()
-    .getByRole("button", { name: "hide" })
-    .click();
-  await expect(hiddenCards).toHaveCount(hiddenBefore + 1);
+test("first-run approval starts the default bundle and streams the stub artifact", async ({ page }) => {
+  const wallet = createTestWallet();
+  const actorId = wallet.actorId;
+  await installWallet(page, wallet);
 
-  await page.getByRole("button", { name: "Ask Feed" }).click();
+  let feedRequests = 0;
+  await page.route(/\/feed(\?.*)?$/, async (route) => {
+    feedRequests += 1;
+    if (feedRequests === 1) {
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: [], nextCursor: undefined }),
+      });
+      return;
+    }
+    await route.fallback();
+  });
+
+  await page.goto("/");
+  await signInWithWallet(page, wallet);
+
+  await page.getByRole("button", { name: /approve and start/i }).click();
+  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Check again" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Reviewed stub artifact" })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByText("The reviewed bundle should emit one grounded stub artifact.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "hide" })).toBeVisible();
+
   await expect
     .poll(async () => {
-      // Transient connection drops against the live-node-backed host should
-      // retry within the poll window instead of failing the smoke run.
       try {
         const response = await page.request.get(`${FEED_HOST_URL}/admin/state`, {
-          headers: { "x-feed-actor-id": TEST_ACTOR_ID },
+          headers: { "x-feed-actor-id": actorId },
         });
         const state = await response.json();
-        return (
-          state.artifacts >= 1 &&
-          state.projections >= 1 &&
-          state.feedback >= 1 &&
-          state.controlIntents >= 1 &&
-          state.generationRequests >= 1
-        );
+        return state.artifacts >= 1 && state.projections >= 1;
       } catch {
         return false;
       }
     })
     .toBe(true);
+});
+
+test("first-run failure state only clears after a successful reload", async ({ page }) => {
+  const wallet = createTestWallet();
+  await installWallet(page, wallet);
+
+  let feedRequests = 0;
+  let releaseRetryResponse: (() => void) | undefined;
+  const retryResponse = new Promise<void>((resolve) => {
+    releaseRetryResponse = resolve;
+  });
+  await page.route(/\/feed(\?.*)?$/, async (route) => {
+    feedRequests += 1;
+    if (feedRequests === 2) {
+      await route.fulfill({
+        status: 503,
+        headers: { "content-type": "text/plain" },
+        body: "bundle offline",
+      });
+      return;
+    }
+    if (feedRequests === 3) {
+      await retryResponse;
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: [] }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items: [] }),
+    });
+  });
+
+  await page.route(/\/feed\/events(\?.*)?$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      body: "",
+    });
+  });
+
+  await page.goto("/");
+  await signInWithWallet(page, wallet);
+  await page.getByRole("button", { name: /approve and start/i }).click();
+
+  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible();
+
+  await page.getByRole("button", { name: /check again/i }).click();
+  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toHaveCount(0);
+
+  await page.waitForTimeout(6500);
+  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
+  expect(feedRequests).toBe(2);
+
+  await page.getByRole("button", { name: "Retry" }).click();
+  await expect.poll(() => feedRequests).toBe(3);
+  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
+  releaseRetryResponse?.();
+  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible({ timeout: 60000 });
+  expect(feedRequests).toBe(3);
 });

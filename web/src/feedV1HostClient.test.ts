@@ -67,6 +67,27 @@ describe("FeedV1HostClient", () => {
     expect(bodies).toEqual([feedback, intent]);
   });
 
+  test("polls the feed-events SSE snapshot with actor headers", async () => {
+    const calls: string[] = [];
+    const client = new FeedV1HostClient({
+      baseUrl: "https://feed.example.test",
+      actorId: "did:pkh:eip155:1:0xabc",
+      fetchImpl: async (input, init) => {
+        calls.push(String(input));
+        expect((init?.headers as Headers).get("accept")).toBe("text/event-stream");
+        expect((init?.headers as Headers).get("x-feed-actor-id")).toBe("did:pkh:eip155:1:0xabc");
+        return new Response("retry: 5000\n\nid: projection:one:2026-06-29T12:00:00.000Z\nevent: projection-updated\ndata: {}\n\n", {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+
+    const snapshot = await client.getFeedEvents();
+    expect(snapshot.text).toContain("projection-updated");
+    expect(calls).toEqual(["https://feed.example.test/feed/events"]);
+  });
+
   test("fetches delegation policy and submits portable delegation", async () => {
     const calls: { url: string; body?: unknown }[] = [];
     const client = new FeedV1HostClient({
