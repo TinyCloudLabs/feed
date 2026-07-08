@@ -7,6 +7,7 @@ import type {
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { buildGreenfieldSeed } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import type { FeedHostActorStorage, FeedHostStorage } from "./storage.ts";
+import { FEED_HOST_ARTIFACT_DOC_PREFIX } from "./delegation.ts";
 import { DEFAULT_REVIEWED_BUNDLE } from "../shared/default-reviewed-bundle.ts";
 
 export const SEEDED_ARTIFACT_ID = DEFAULT_REVIEWED_BUNDLE.artifactId;
@@ -58,7 +59,7 @@ export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostA
       dedupeKey: "feed-v1-default-reviewed-bundle",
     },
     storage: {
-      docKey: `${SEEDED_ARTIFACT_ID}.json`,
+      docKey: `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${SEEDED_ARTIFACT_ID}.json`,
     },
     createdAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
     updatedAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,

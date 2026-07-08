@@ -165,6 +165,10 @@ test("first-run failure state only clears after a successful reload", async ({ p
   await installWallet(page, wallet);
 
   let feedRequests = 0;
+  let releaseRetryResponse: (() => void) | undefined;
+  const retryResponse = new Promise<void>((resolve) => {
+    releaseRetryResponse = resolve;
+  });
   await page.route(/\/feed(\?.*)?$/, async (route) => {
     feedRequests += 1;
     if (feedRequests === 2) {
@@ -172,6 +176,15 @@ test("first-run failure state only clears after a successful reload", async ({ p
         status: 503,
         headers: { "content-type": "text/plain" },
         body: "bundle offline",
+      });
+      return;
+    }
+    if (feedRequests === 3) {
+      await retryResponse;
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ items: [] }),
       });
       return;
     }
@@ -205,6 +218,9 @@ test("first-run failure state only clears after a successful reload", async ({ p
   expect(feedRequests).toBe(2);
 
   await page.getByRole("button", { name: "Retry" }).click();
+  await expect.poll(() => feedRequests).toBe(3);
+  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
+  releaseRetryResponse?.();
   await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible({ timeout: 60000 });
   expect(feedRequests).toBe(3);
 });

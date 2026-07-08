@@ -324,9 +324,16 @@ function emptyMigrationSummary(): FeedV1MigrationSummary {
 
 test("seeds the reviewed artifact at the canonical artifacts/{artifactId}.json KV path", async () => {
   const documentKeys: string[] = [];
+  const seedRows: Array<{ dbName: string; rows: Array<{ table: string; values: Record<string, string | number | null> }> }> = [];
   const hostStorage = new FeedHostStorage();
   const storage = {
-    insertSeedRows: async () => undefined,
+    insertSeedRows: async (
+      _actor: FeedHostActorStorage,
+      dbName: string,
+      rows: Array<{ table: string; values: Record<string, string | number | null> }>,
+    ) => {
+      seedRows.push({ dbName, rows });
+    },
     writeArtifactDocument: async (actor: FeedHostActorStorage, artifact: FeedArtifact) =>
       hostStorage.writeArtifactDocument(actor, artifact),
   } as unknown as FeedHostStorage;
@@ -343,5 +350,10 @@ test("seeds the reviewed artifact at the canonical artifacts/{artifactId}.json K
 
   await seedDefaultFeed(storage, actor);
 
+  expect(
+    seedRows
+      .find(({ dbName }) => dbName === "artifacts_index")
+      ?.rows.find((row) => row.table === "artifact_index")?.values.doc_key,
+  ).toBe(`xyz.tinycloud.artifacts/artifacts/${SEEDED_ARTIFACT_ID}.json`);
   expect(documentKeys).toEqual([`xyz.tinycloud.artifacts/artifacts/${SEEDED_ARTIFACT_ID}.json`]);
 });

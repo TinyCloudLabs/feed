@@ -84,7 +84,6 @@ export function App() {
     if (!session || feedLoadInFlight.current) return;
     feedLoadInFlight.current = true;
     setLoadState("loading");
-    setLoadError(null);
     try {
       const page = await client.listFeed({ limit: 40 });
       const hydrated = await Promise.all(
@@ -99,6 +98,7 @@ export function App() {
         }),
       );
       setItems(sortedFeed(hydrated));
+      setLoadError(null);
       setLoadState("ready");
     } catch (error) {
       setLoadState("error");
@@ -362,7 +362,7 @@ export function App() {
           />
         )}
 
-        {bundleState === "running" && loadState === "loading" && (
+        {bundleState === "running" && loadState === "loading" && loadError === null && (
           <NoticePanel
             tone="info"
             title="Loading Feed Host projections"
@@ -370,11 +370,11 @@ export function App() {
           />
         )}
 
-        {bundleState === "running" && loadState === "error" && (
+        {bundleState === "running" && loadError !== null && (
           <FeedFailurePanel error={loadError ?? "The feed could not be loaded."} onRetry={() => void loadFeed()} />
         )}
 
-        {bundleState === "running" && loadState !== "error" && items.length === 0 && (
+        {bundleState === "running" && loadState === "ready" && loadError === null && items.length === 0 && (
           <EmptyFeedPanel onRetry={() => void loadFeed()} />
         )}
 
