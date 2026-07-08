@@ -12,7 +12,7 @@
     "host": "bun run host/server.ts",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "bun test web/src host",
+    "test": "bun test --preload ./host/no-spend-setup.ts web/src host",
     "test:e2e": "playwright test",
     "test:smoke": "playwright test e2e/specs/openkey-wallet-feed-flow.pw.ts",
     "typecheck": "tsc --noEmit"
