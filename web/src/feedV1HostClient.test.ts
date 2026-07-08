@@ -91,7 +91,7 @@ describe("FeedV1HostClient", () => {
     expect(calls).toEqual([
       { url: "https://feed.example.test/delegation-policy", body: undefined },
       {
-        url: "https://feed.example.test/delegations",
+        url: "https://feed.example.test/api/delegations",
         body: { actorId: "did:pkh:reader", serializedDelegation: "{\"delegateDID\":\"did:key:feed-host\"}" },
       },
     ]);

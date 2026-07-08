@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_FEED_DB_PATH } from "./delegation.ts";
+import { expect, spyOn, test } from "bun:test";
+import { FEED_HOST_ARTIFACT_DOC_PREFIX, FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_FEED_DB_PATH } from "./delegation.ts";
 import type { FeedHostActorStorage } from "./storage.ts";
 import { FeedHostStorage } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
@@ -110,6 +110,137 @@ test("falls back to statement-by-statement execution when batches cannot mix act
   expect(artifactLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
 });
+
+test("hydrates corrupt artifact docs defensively and audits invalid fixtures", async () => {
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const storage = new FeedHostStorage();
+    const malformed = {
+      artifact_id: "malformed-artifact",
+      artifact_type: "insight_card",
+      package_id: "pkg-malformed",
+      source_fingerprint: "sha256:malformed",
+      doc_key: "seed/malformed.json",
+      published_at: "2026-06-29T12:00:00.000Z",
+      updated_at: "2026-06-29T12:00:00.000Z",
+    } as const;
+    const schemaMismatch = {
+      artifact_id: "schema-mismatch-artifact",
+      artifact_type: "insight_card",
+      package_id: "pkg-schema",
+      source_fingerprint: "sha256:schema",
+      doc_key: "seed/schema-mismatch.json",
+      published_at: "2026-06-29T12:01:00.000Z",
+      updated_at: "2026-06-29T12:01:00.000Z",
+    } as const;
+    const actor = makeHydrationActor({
+      artifacts: [malformed, schemaMismatch],
+      docs: {
+        [artifactDocKey(malformed.doc_key)]: "{not-json",
+        [artifactDocKey(schemaMismatch.doc_key)]: {
+          schemaVersion: "feed.artifact.v1",
+          artifactId: "schema-mismatch-artifact",
+        },
+      },
+    });
+
+    const malformedRead = await storage.readArtifact(actor, "malformed-artifact");
+    expect(malformedRead.kind).toBe("hydration_failed");
+
+    const plan = await storage.reconcileFeedProjection(actor);
+    expect(plan.upserts.map((row) => row.artifactId).sort()).toEqual(["malformed-artifact", "schema-mismatch-artifact"]);
+    expect(plan.upserts.every((row) => row.visibility === "repair_only")).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(2);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
+function artifactDocKey(docKey: string): string {
+  return `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${docKey}`;
+}
+
+function makeHydrationActor(input: {
+  artifacts: Array<{
+    artifact_id: string;
+    artifact_type: string;
+    package_id: string;
+    source_fingerprint: string;
+    doc_key: string;
+    published_at: string;
+    updated_at: string;
+  }>;
+  docs: Record<string, unknown>;
+}): FeedHostActorStorage {
+  const docs = new Map(Object.entries(input.docs));
+
+  function makeDb(path: string) {
+    return {
+      migrations: {
+        apply: async () => ({ ok: false, error: MULTI_RESOURCE_ERROR }),
+      },
+      query: async (sql: string, params: Array<string | number>) => {
+        if (path === FEED_HOST_ARTIFACTS_DB_PATH && sql.includes("WHERE artifact_id = ?")) {
+          const artifactId = String(params[0]);
+          return {
+            ok: true,
+            data: {
+              columns: [],
+              rows: input.artifacts.filter((row) => row.artifact_id === artifactId),
+            },
+          };
+        }
+        if (path === FEED_HOST_ARTIFACTS_DB_PATH && sql.includes("FROM artifact_index")) {
+          return {
+            ok: true,
+            data: {
+              columns: [],
+              rows: input.artifacts,
+            },
+          };
+        }
+        if (path === FEED_HOST_FEED_DB_PATH && sql.includes("FROM feed_artifact_projection")) {
+          return {
+            ok: true,
+            data: {
+              columns: [],
+              rows: [],
+            },
+          };
+        }
+        return {
+          ok: true,
+          data: {
+            columns: [],
+            rows: [],
+          },
+        };
+      },
+      batch: async () => ({ ok: true }),
+      execute: async () => ({ ok: true }),
+    };
+  }
+
+  return {
+    actorId: "did:pkh:eip155:1:0xfeedfeedfeedfeedfeedfeedfeedfeedfeedfeed",
+    artifacts: { sql: { db: (path: string) => makeDb(path) } },
+    feed: { sql: { db: (path: string) => makeDb(path) } },
+    documents: {
+      kv: {
+        get: async (key: string) =>
+          docs.has(key)
+            ? { ok: true, data: { data: docs.get(key) } }
+            : { ok: false, error: { code: "KV_NOT_FOUND", message: `not found: ${key}` } },
+        put: async () => ({ ok: true }),
+      },
+    },
+    settings: {
+      kv: {
+        put: async () => ({ ok: true }),
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+}
 
 test("invokes the legacy migration hook once per actor during bootstrap", async () => {
   const { actor } = makeActor();

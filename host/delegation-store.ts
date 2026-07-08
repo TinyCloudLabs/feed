@@ -12,6 +12,7 @@ export type StoredFeedDelegationRecord = {
   actorId: string;
   delegateDID: string;
   resources: StoredFeedDelegationResource[];
+  policyHash?: string;
 };
 
 /**
@@ -90,6 +91,7 @@ function isStoredRecord(value: unknown): value is StoredFeedDelegationRecord {
     typeof record.actorId === "string" &&
     typeof record.delegateDID === "string" &&
     Array.isArray(record.resources) &&
+    (record.policyHash === undefined || typeof record.policyHash === "string") &&
     record.resources.every(
       (resource) =>
         resource !== null &&
