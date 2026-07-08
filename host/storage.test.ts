@@ -3,6 +3,8 @@ import { FEED_HOST_ARTIFACT_DOC_PREFIX, FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_F
 import type { FeedHostActorStorage } from "./storage.ts";
 import { FeedHostStorage } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
+import type { FeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import { seedDefaultFeed, SEEDED_ARTIFACT_ID } from "./seed.ts";
 
 // Real SDK failures surface as plain service-error objects, not Error instances.
 const MULTI_RESOURCE_ERROR = {
@@ -319,3 +321,27 @@ function emptyMigrationSummary(): FeedV1MigrationSummary {
     skippedInteractions: 0,
   };
 }
+
+test("seeds the reviewed artifact at the canonical artifacts/{artifactId}.json KV path", async () => {
+  const documentKeys: string[] = [];
+  const hostStorage = new FeedHostStorage();
+  const storage = {
+    insertSeedRows: async () => undefined,
+    writeArtifactDocument: async (actor: FeedHostActorStorage, artifact: FeedArtifact) =>
+      hostStorage.writeArtifactDocument(actor, artifact),
+  } as unknown as FeedHostStorage;
+  const actor = {
+    documents: {
+      kv: {
+        put: async (key: string) => {
+          documentKeys.push(key);
+          return { ok: true, data: undefined };
+        },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+
+  await seedDefaultFeed(storage, actor);
+
+  expect(documentKeys).toEqual([`xyz.tinycloud.artifacts/artifacts/${SEEDED_ARTIFACT_ID}.json`]);
+});

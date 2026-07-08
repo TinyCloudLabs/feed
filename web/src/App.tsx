@@ -207,9 +207,6 @@ export function App() {
       try {
         const snapshot = await client.getFeedEvents();
         if (cancelled) return;
-        // A transient poll failure should clear as soon as the next snapshot succeeds.
-        setLoadState((current) => (current === "error" ? "ready" : current));
-        setLoadError(null);
         const signature = snapshot.text.trim();
         if (signature !== lastSignature) {
           lastSignature = signature;

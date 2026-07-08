@@ -160,15 +160,33 @@ test("first-run approval starts the default bundle and streams the stub artifact
     .toBe(true);
 });
 
-test("first-run failure state is distinct from the running empty state", async ({ page }) => {
+test("first-run failure state only clears after a successful reload", async ({ page }) => {
   const wallet = createTestWallet();
   await installWallet(page, wallet);
 
+  let feedRequests = 0;
   await page.route(/\/feed(\?.*)?$/, async (route) => {
+    feedRequests += 1;
+    if (feedRequests === 2) {
+      await route.fulfill({
+        status: 503,
+        headers: { "content-type": "text/plain" },
+        body: "bundle offline",
+      });
+      return;
+    }
     await route.fulfill({
-      status: 503,
-      headers: { "content-type": "text/plain" },
-      body: "bundle offline",
+      status: 200,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items: [] }),
+    });
+  });
+
+  await page.route(/\/feed\/events(\?.*)?$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+      body: "",
     });
   });
 
@@ -176,7 +194,17 @@ test("first-run failure state is distinct from the running empty state", async (
   await signInWithWallet(page, wallet);
   await page.getByRole("button", { name: /approve and start/i }).click();
 
+  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible();
+
+  await page.getByRole("button", { name: /check again/i }).click();
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 60000 });
-  await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
   await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toHaveCount(0);
+
+  await page.waitForTimeout(6500);
+  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
+  expect(feedRequests).toBe(2);
+
+  await page.getByRole("button", { name: "Retry" }).click();
+  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible({ timeout: 60000 });
+  expect(feedRequests).toBe(3);
 });

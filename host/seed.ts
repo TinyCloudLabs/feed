@@ -58,7 +58,7 @@ export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostA
       dedupeKey: "feed-v1-default-reviewed-bundle",
     },
     storage: {
-      docKey: "runs/run-reviewed-bundle/candidate-1.json",
+      docKey: `${SEEDED_ARTIFACT_ID}.json`,
     },
     createdAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
     updatedAt: DEFAULT_REVIEWED_BUNDLE.sourceRef.observedAt,
