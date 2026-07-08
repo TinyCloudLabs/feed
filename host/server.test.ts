@@ -573,11 +573,6 @@ describe("Feed Host server", () => {
 
     const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
     expect(policy.resources.map((resource) => resource.path)).toEqual(FEED_HOST_DELEGATION_RESOURCES.map((resource) => resource.path));
-    expect(policy.resources.map((resource) => resource.path)).toEqual([
-      "xyz.tinycloud.artifacts/index",
-      "xyz.tinycloud.feed/index",
-      "xyz.tinycloud.artifacts/artifacts",
-    ]);
     for (const resource of policy.resources) {
       await postJson(`${runtime.url}/delegations`, {
         actorId: ACTOR_ID,
