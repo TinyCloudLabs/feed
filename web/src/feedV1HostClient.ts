@@ -15,6 +15,10 @@ export type FeedV1Page = {
   nextCursor?: string;
 };
 
+export type FeedEventStream = {
+  text: string;
+};
+
 export type ArtifactProvenance = Pick<FeedArtifact, "artifactId" | "sourceRefs" | "producedBy" | "freshness" | "idempotency">;
 
 export type FeedV1HostClientOptions = {
@@ -94,19 +98,28 @@ export class FeedV1HostClient {
     });
   }
 
+  async getFeedEvents(): Promise<FeedEventStream> {
+    return { text: await this.requestText("/feed/events", { headers: { accept: "text/event-stream" } }) };
+  }
+
   eventsUrl(): string {
     return `${this.baseUrl}/feed/events`;
   }
 
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const text = await this.requestText(path, init);
+    return (text ? JSON.parse(text) : undefined) as T;
+  }
+
+  private async requestText(path: string, init: RequestInit = {}): Promise<string> {
     const headers = new Headers(init.headers);
-    headers.set("accept", "application/json");
+    if (!headers.has("accept")) headers.set("accept", "application/json");
     if (init.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
     if (this.token) headers.set("authorization", `Bearer ${this.token}`);
     if (this.actorId) headers.set("x-feed-actor-id", this.actorId);
     const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers });
     const text = await res.text();
     if (!res.ok) throw new FeedV1HostError(`Feed Host request failed: ${res.status}`, res.status, text);
-    return (text ? JSON.parse(text) : undefined) as T;
+    return text;
   }
 }
