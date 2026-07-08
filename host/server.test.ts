@@ -5,6 +5,7 @@ import type {
   FeedbackEvent,
   ControlIntentEvent,
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import type { SqlSeedRow } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import {
   FEED_HOST_DELEGATION_RESOURCES,
@@ -208,7 +209,9 @@ class FakeFeedHostStorage {
   private controlIntents = 0;
   private generationRequests = 0;
 
-  async bootstrapSchema(_actor: FeedHostActorStorage): Promise<void> {}
+  async bootstrapSchema(_actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    return emptyMigrationSummary();
+  }
 
   async hasArtifacts(_actor: FeedHostActorStorage): Promise<boolean> {
     return this.artifacts.size > 0;
@@ -341,4 +344,20 @@ async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
   });
   expect(response.ok).toBe(true);
   return (await response.json()) as T;
+}
+
+function emptyMigrationSummary(): FeedV1MigrationSummary {
+  return {
+    legacyArtifacts: 0,
+    legacyInteractions: 0,
+    migratedArtifacts: 0,
+    migratedArtifactDocs: 0,
+    migratedArtifactRows: 0,
+    migratedFeedRows: 0,
+    migratedFeedbackEvents: 0,
+    migratedControlIntents: 0,
+    migratedGenerationRequests: 0,
+    skippedArtifacts: 0,
+    skippedInteractions: 0,
+  };
 }

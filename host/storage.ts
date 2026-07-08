@@ -12,6 +12,15 @@ import type {
   FeedbackEvent,
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import {
+  applyFeedV1MigrationPlan,
+  buildFeedV1MigrationPlan,
+  LEGACY_FEED_DB_PATH,
+  LEGACY_INTERACTIONS_DB_PATH,
+  type FeedV1MigrationSummary,
+  type FeedV1MigrationWriter,
+  type MigratedFeedArtifact,
+} from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
+import {
   assertFeedV1SchemaUsesMigrations,
   feedV1MigrationApplyPlans,
   type FeedV1SqlResourceName,
@@ -45,6 +54,12 @@ export type FeedHostActorStorage = {
   artifacts: DelegatedAccess;
   feed: DelegatedAccess;
   documents: DelegatedAccess;
+  legacyArtifacts?: DelegatedAccess;
+  legacyInteractions?: DelegatedAccess;
+};
+
+export type FeedHostStorageOptions = {
+  migrateLegacyData?: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
 };
 
 const DB_PATHS: Record<FeedV1SqlResourceName, string> = {
@@ -54,9 +69,14 @@ const DB_PATHS: Record<FeedV1SqlResourceName, string> = {
 
 export class FeedHostStorage {
   private readonly bootstrapped = new WeakSet<object>();
+  private readonly migrateLegacyDataHook: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
 
-  async bootstrapSchema(actor: FeedHostActorStorage): Promise<void> {
-    if (this.bootstrapped.has(actor)) return;
+  constructor(options: FeedHostStorageOptions = {}) {
+    this.migrateLegacyDataHook = options.migrateLegacyData ?? ((actor) => this.performLegacyMigration(actor));
+  }
+
+  async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    if (this.bootstrapped.has(actor)) return emptyMigrationSummary();
     assertFeedV1SchemaUsesMigrations();
     for (const plan of feedV1MigrationApplyPlans()) {
       const db = this.db(actor, plan.dbName);
@@ -66,7 +86,9 @@ export class FeedHostStorage {
       });
       if (!migrated.ok) throw new Error(`Failed to initialize ${plan.dbName}: ${resultError(migrated)}`);
     }
+    const migrationSummary = await this.migrateLegacyDataHook(actor);
     this.bootstrapped.add(actor);
+    return migrationSummary;
   }
 
   async hasArtifacts(actor: FeedHostActorStorage): Promise<boolean> {
@@ -85,7 +107,7 @@ export class FeedHostStorage {
     );
   }
 
-  async writeArtifactDocument(actor: FeedHostActorStorage, artifact: FeedArtifact): Promise<void> {
+  async writeArtifactDocument(actor: FeedHostActorStorage, artifact: FeedArtifact | MigratedFeedArtifact): Promise<void> {
     const result = await actor.documents.kv.put(artifactDocKey(artifact.storage.docKey), artifact, {
       contentType: "application/json",
     });
@@ -241,6 +263,26 @@ export class FeedHostStorage {
     const access = dbName === "artifacts_index" ? actor.artifacts : actor.feed;
     return access.sql.db(DB_PATHS[dbName]);
   }
+
+  private async performLegacyMigration(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    const [legacyArtifacts, legacyInteractions] = await Promise.all([
+      readLegacyRows(actor.legacyArtifacts, LEGACY_FEED_DB_PATH, "artifact"),
+      readLegacyRows(actor.legacyInteractions, LEGACY_INTERACTIONS_DB_PATH, "interaction"),
+    ]);
+    if (legacyArtifacts.length === 0 && legacyInteractions.length === 0) return emptyMigrationSummary();
+
+    const plan = buildFeedV1MigrationPlan({ legacyArtifacts, legacyInteractions });
+    const storage = this;
+    await applyFeedV1MigrationPlan(plan, {
+      writeSqlRows: async (dbName, rows) => {
+        await storage.insertSeedRows(actor, dbName, rows);
+      },
+      writeArtifactDocument: async (artifact) => {
+        await storage.writeArtifactDocument(actor, artifact);
+      },
+    });
+    return plan.summary;
+  }
 }
 
 type MigrationApplyInput = {
@@ -381,4 +423,43 @@ function resultError(result: unknown): string {
 
 function multiResourceInvocationUnsupported(message: string): boolean {
   return message.includes("does not support multi-resource invocations");
+}
+
+async function readLegacyRows(
+  access: DelegatedAccess | undefined,
+  dbPath: string,
+  table: string,
+): Promise<Record<string, unknown>[]> {
+  if (!access) return [];
+  try {
+    const orderBy = table === "artifact" ? "published_at ASC, id ASC" : "recorded_at ASC, id ASC";
+    return await queryRows<Record<string, unknown>>(
+      access.sql.db(dbPath),
+      `SELECT * FROM ${identifier(table)} ORDER BY ${orderBy}`,
+    );
+  } catch (error) {
+    if (isMissingTable(error)) return [];
+    throw error;
+  }
+}
+
+function isMissingTable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no such table/i.test(message);
+}
+
+function emptyMigrationSummary(): FeedV1MigrationSummary {
+  return {
+    legacyArtifacts: 0,
+    legacyInteractions: 0,
+    migratedArtifacts: 0,
+    migratedArtifactDocs: 0,
+    migratedArtifactRows: 0,
+    migratedFeedRows: 0,
+    migratedFeedbackEvents: 0,
+    migratedControlIntents: 0,
+    migratedGenerationRequests: 0,
+    skippedArtifacts: 0,
+    skippedInteractions: 0,
+  };
 }

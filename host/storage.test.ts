@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_FEED_DB_PATH } from "./delegation.ts";
 import type { FeedHostActorStorage } from "./storage.ts";
 import { FeedHostStorage } from "./storage.ts";
+import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 
 // Real SDK failures surface as plain service-error objects, not Error instances.
 const MULTI_RESOURCE_ERROR = {
@@ -85,3 +86,35 @@ test("falls back to statement-by-statement execution when batches cannot mix act
   expect(artifactLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
 });
+
+test("invokes the legacy migration hook once per actor during bootstrap", async () => {
+  const { actor } = makeActor();
+  let migrateCalls = 0;
+  const storage = new FeedHostStorage({
+    migrateLegacyData: async () => {
+      migrateCalls += 1;
+      return emptyMigrationSummary();
+    },
+  });
+
+  await storage.bootstrapSchema(actor);
+  await storage.bootstrapSchema(actor);
+
+  expect(migrateCalls).toBe(1);
+});
+
+function emptyMigrationSummary(): FeedV1MigrationSummary {
+  return {
+    legacyArtifacts: 0,
+    legacyInteractions: 0,
+    migratedArtifacts: 0,
+    migratedArtifactDocs: 0,
+    migratedArtifactRows: 0,
+    migratedFeedRows: 0,
+    migratedFeedbackEvents: 0,
+    migratedControlIntents: 0,
+    migratedGenerationRequests: 0,
+    skippedArtifacts: 0,
+    skippedInteractions: 0,
+  };
+}
