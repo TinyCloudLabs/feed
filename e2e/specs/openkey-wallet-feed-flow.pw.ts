@@ -101,8 +101,17 @@ test("signs in through OpenKey external wallet", async ({ page }) => {
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Practice Fish First" })).toBeVisible();
 
-  await page.getByRole("button", { name: "hide" }).click();
-  await expect(page.locator("article.hidden-card")).toHaveCount(1);
+  // The shared test actor persists feed state on the live node across smoke
+  // runs, so hide the first still-visible card and assert the delta instead of
+  // assuming a single-card greenfield feed.
+  const hiddenCards = page.locator("article.hidden-card");
+  const hiddenBefore = await hiddenCards.count();
+  await page
+    .locator("article.feed-card:not(.hidden-card)")
+    .first()
+    .getByRole("button", { name: "hide" })
+    .click();
+  await expect(hiddenCards).toHaveCount(hiddenBefore + 1);
 
   await page.getByRole("button", { name: "Ask Feed" }).click();
   await expect
