@@ -399,10 +399,11 @@ export function reconcileFeedProjections(input: {
 export function buildFeedEvents(input: {
   projections: readonly FeedProjectionState[];
 }): FeedSseEvent[] {
+  const snapshotKey = hashJson(input.projections);
   return sortFeedEvents(
     input.projections.flatMap((projection) => [
       {
-        id: `projection:${projection.artifactId}:${projection.updatedAt}`,
+        id: `projection:${projection.artifactId}:${projection.updatedAt}|${snapshotKey}`,
         event: "projection-updated",
         data: {
           artifactId: projection.artifactId,
@@ -416,7 +417,7 @@ export function buildFeedEvents(input: {
         },
       },
       {
-        id: `artifact:${projection.artifactId}:${projection.updatedAt}`,
+        id: `artifact:${projection.artifactId}:${projection.updatedAt}|${snapshotKey}`,
         event: "artifact-published",
         data: {
           artifactId: projection.artifactId,
@@ -430,6 +431,7 @@ export function buildFeedEvents(input: {
 }
 
 type FeedEventSortKey = {
+  snapshotKey: string;
   updatedAt: string;
   artifactId: string;
   kindOrder: number;
@@ -445,15 +447,18 @@ function feedEventSortKey(event: FeedSseEvent): FeedEventSortKey | null {
 
 function parseFeedEventId(id: string): FeedEventSortKey | null {
   const trimmed = id.trim();
-  const kindOrder = trimmed.startsWith("projection:") ? 0 : trimmed.startsWith("artifact:") ? 1 : undefined;
+  const snapshotSeparator = trimmed.lastIndexOf("|");
+  const snapshotKey = snapshotSeparator >= 0 ? trimmed.slice(snapshotSeparator + 1).trim() : "legacy";
+  const base = snapshotSeparator >= 0 ? trimmed.slice(0, snapshotSeparator) : trimmed;
+  const kindOrder = base.startsWith("projection:") ? 0 : base.startsWith("artifact:") ? 1 : undefined;
   if (kindOrder === undefined) return null;
-  const remainder = trimmed.slice(trimmed.indexOf(":") + 1);
+  const remainder = base.slice(base.indexOf(":") + 1);
   const match = /^(.+):(\d{4}-\d{2}-\d{2}T.+)$/.exec(remainder);
   if (!match) return null;
   const artifactId = match[1];
   const updatedAt = match[2];
-  if (artifactId.trim() === "" || updatedAt.trim() === "" || Number.isNaN(Date.parse(updatedAt))) return null;
-  return { artifactId, updatedAt, kindOrder };
+  if (artifactId.trim() === "" || updatedAt.trim() === "" || Number.isNaN(Date.parse(updatedAt)) || snapshotKey.trim() === "") return null;
+  return { artifactId, updatedAt, kindOrder, snapshotKey };
 }
 
 function compareFeedEventSortKeys(left: FeedEventSortKey | null, right: FeedEventSortKey | null): number {
@@ -484,6 +489,8 @@ export function filterFeedEventsAfterId(events: readonly FeedSseEvent[], afterEv
   if (!trimmed) return ordered;
   const cursor = parseFeedEventId(trimmed);
   if (!cursor) return ordered;
+  const currentSnapshotKey = feedEventSortKey(ordered[0])?.snapshotKey;
+  if (!currentSnapshotKey || currentSnapshotKey !== cursor.snapshotKey) return ordered;
   return ordered.filter((event) => compareFeedEventSortKeys(feedEventSortKey(event), cursor) > 0);
 }
 

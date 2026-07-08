@@ -6,6 +6,8 @@ import type {
   FeedReconcileArtifact,
 } from "./logic.ts";
 import {
+  buildFeedEvents,
+  filterFeedEventsAfterId,
   mergeFeedPreferences,
   rankFeedProjections,
   reconcileFeedProjections,
@@ -172,6 +174,46 @@ describe("Feed ranking and reconciliation logic", () => {
     expect(plan.upserts[0].visibility).toBe("ranked");
     expect(plan.upserts[0].reasonCodes).not.toContain("broken_ref");
     expect(plan.upserts[0].reasonCodes).not.toContain("source_unavailable");
+  });
+
+  test("SSE resume replays reordered snapshots instead of dropping backfilled projections", () => {
+    const initial = buildFeedEvents({
+      projections: [
+        projection({
+          artifactId: "alpha",
+          packageId: "alpha-package",
+          publishedAt: "2026-06-29T12:00:00.000Z",
+          updatedAt: "2026-06-29T12:00:00.000Z",
+          rankScore: 0.58,
+        }),
+      ],
+    });
+
+    const current = buildFeedEvents({
+      projections: [
+        projection({
+          artifactId: "alpha",
+          packageId: "alpha-package",
+          publishedAt: "2026-06-29T12:00:00.000Z",
+          updatedAt: "2026-06-29T12:00:00.000Z",
+          rankScore: 0.58,
+        }),
+        projection({
+          artifactId: "beta",
+          packageId: "beta-package",
+          publishedAt: "2026-06-29T11:59:00.000Z",
+          updatedAt: "2026-06-29T11:59:00.000Z",
+          rankScore: 0.55,
+        }),
+      ],
+    });
+
+    const cursor = initial.at(-1)?.id ?? "";
+    const resumed = filterFeedEventsAfterId(current, cursor);
+
+    expect(resumed.map((event) => event.id)).not.toContain(cursor);
+    expect(resumed.some((event) => event.id.includes("projection:beta:"))).toBe(true);
+    expect(resumed).toHaveLength(current.length);
   });
 });
 

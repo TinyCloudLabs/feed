@@ -488,6 +488,7 @@ describe("Feed Host server", () => {
     expect(eventsText).not.toContain("event: run-status");
     const eventIds = [...eventsText.matchAll(/^id: (.+)$/gm)].map((match) => match[1]);
     expect(eventIds.length).toBeGreaterThan(1);
+    const cursorEventId = eventIds[eventIds.length - 1];
 
     storage.addArtifactFixture(
       makeArtifact({
@@ -495,8 +496,8 @@ describe("Feed Host server", () => {
         packageId: "follow-up",
         runId: "run-seed-002",
         packageDigest: "sha256:fixture-package-follow-up",
-        createdAt: "2026-06-29T12:10:00.000Z",
-        updatedAt: "2026-06-29T12:10:00.000Z",
+        createdAt: "2026-06-29T11:59:00.000Z",
+        updatedAt: "2026-06-29T11:59:00.000Z",
         sourceFingerprint: "sha256:fixture-source-follow-up",
         artifactFingerprint: "sha256:fixture-artifact-follow-up",
         dedupeKey: "feed-v1-fixture:follow-up",
@@ -509,8 +510,8 @@ describe("Feed Host server", () => {
         artifactId: SECOND_ARTIFACT_ID,
         packageId: "follow-up",
         sourceFingerprint: "sha256:fixture-source-follow-up",
-        publishedAt: "2026-06-29T12:10:00.000Z",
-        updatedAt: "2026-06-29T12:10:00.000Z",
+        publishedAt: "2026-06-29T11:59:00.000Z",
+        updatedAt: "2026-06-29T11:59:00.000Z",
         rankScore: 0.42,
         reasonCodes: ["fixture"],
       }),
@@ -518,19 +519,19 @@ describe("Feed Host server", () => {
         runId: "run-seed-002",
         packageId: "follow-up",
         status: "published",
-        startedAt: "2026-06-29T12:10:00.000Z",
-        finishedAt: "2026-06-29T12:10:00.000Z",
+        startedAt: "2026-06-29T11:59:00.000Z",
+        finishedAt: "2026-06-29T11:59:00.000Z",
       },
     );
     const resumedResponse = await fetch(`${runtime.url}/feed/events`, {
       headers: {
         "x-feed-actor-id": ACTOR_ID,
-        "last-event-id": eventIds[0],
+        "last-event-id": cursorEventId,
       },
     });
     expect(resumedResponse.ok).toBe(true);
     const resumedText = await resumedResponse.text();
-    expect(resumedText).not.toContain(`id: ${eventIds[0]}`);
+    expect(resumedText).not.toContain(`id: ${cursorEventId}`);
     expect(resumedText).toContain(`id: projection:${SECOND_ARTIFACT_ID}:`);
   });
 
