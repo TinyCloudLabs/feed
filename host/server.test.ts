@@ -18,6 +18,8 @@ import type { FeedHostActorStorage, FeedHostStorage } from "./storage.ts";
 import { startFeedHost, type FeedHostRuntime } from "./server.ts";
 
 const ACTOR_ID = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+const OTHER_ACTOR_ID = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+const MUTATING_ROUTES = ["/feedback", "/control-intents"] as const;
 // Stable host identity used for restart coverage. In production this comes
 // from FEED_HOST_PRIVATE_KEY: the host signs in and its did:pkh stays stable.
 const HOST_DID = "did:pkh:eip155:1:0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
@@ -72,14 +74,18 @@ describe("Feed Host server", () => {
     expect(artifact.title).toBe("Practice Fish First");
     expect(artifact.body.markdown).toContain("fundraising workflow");
 
-    const feedbackResponse = await postJson<{ accepted: true; eventId: string }>(`${runtime.url}/feedback`, {
-      eventId: "feedback-test-001",
-      artifactId: SEEDED_ARTIFACT_ID,
-      actorId: ACTOR_ID,
-      readerNonce: "feedback-nonce-001",
-      signal: "save",
-      createdAt: "2026-06-29T12:05:00.000Z",
-    });
+    const feedbackResponse = await postJson<{ accepted: true; eventId: string }>(
+      `${runtime.url}/feedback`,
+      {
+        eventId: "feedback-test-001",
+        artifactId: SEEDED_ARTIFACT_ID,
+        actorId: ACTOR_ID,
+        readerNonce: "feedback-nonce-001",
+        signal: "save",
+        createdAt: "2026-06-29T12:05:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
     expect(feedbackResponse.accepted).toBe(true);
 
     const updatedFeed = await getJson<{ items: { artifactId: string; disposition: string }[] }>(`${runtime.url}/feed?limit=10`, {
@@ -87,16 +93,20 @@ describe("Feed Host server", () => {
     });
     expect(updatedFeed.items[0].disposition).toBe("saved");
 
-    await postJson(`${runtime.url}/control-intents`, {
-      eventId: "intent-test-001",
-      actorId: ACTOR_ID,
-      readerNonce: "intent-nonce-001",
-      intentKind: "ask_feed",
-      status: "accepted",
-      targetRef: "feed",
-      payload: { prompt: "Generate another seed artifact." },
-      createdAt: "2026-06-29T12:06:00.000Z",
-    });
+    await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        eventId: "intent-test-001",
+        actorId: ACTOR_ID,
+        readerNonce: "intent-nonce-001",
+        intentKind: "ask_feed",
+        status: "accepted",
+        targetRef: "feed",
+        payload: { prompt: "Generate another seed artifact." },
+        createdAt: "2026-06-29T12:06:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
 
     const state = await getJson<{ feedback: number; controlIntents: number; generationRequests: number }>(
       `${runtime.url}/admin/state`,
@@ -125,13 +135,96 @@ describe("Feed Host server", () => {
       }),
     });
 
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(400);
     expect(await response.json()).toEqual({
       error: {
         code: "actor_mismatch",
         message: "actorId does not match the delegation owner identity",
       },
     });
+  });
+
+  test("rejects writes without an authenticated actor context", async () => {
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    for (const resource of policy.resources) {
+      await postJson(`${runtime.url}/delegations`, {
+        actorId: ACTOR_ID,
+        serializedDelegation: resource.path,
+      });
+    }
+
+    for (const path of MUTATING_ROUTES) {
+      const response = await postResponse(`${runtime.url}${path}`, {
+        actorId: ACTOR_ID,
+        eventId: `unauth-${path.slice(1)}`,
+        artifactId: SEEDED_ARTIFACT_ID,
+        readerNonce: `unauth-${path.slice(1)}-nonce`,
+        signal: path === "/feedback" ? "save" : undefined,
+        intentKind: path === "/control-intents" ? "ask_feed" : undefined,
+        status: path === "/control-intents" ? "accepted" : undefined,
+        targetRef: path === "/control-intents" ? "feed" : undefined,
+        createdAt: "2026-06-29T12:07:00.000Z",
+      });
+      expect(response.status).toBe(403);
+    }
+  });
+
+  test("rejects mismatched actor ids in write payloads", async () => {
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    for (const resource of policy.resources) {
+      await postJson(`${runtime.url}/delegations`, {
+        actorId: ACTOR_ID,
+        serializedDelegation: resource.path,
+      });
+    }
+
+    for (const path of MUTATING_ROUTES) {
+      const response = await postResponse(
+        `${runtime.url}${path}`,
+        path === "/feedback"
+          ? {
+              eventId: `mismatch-${path.slice(1)}`,
+              artifactId: SEEDED_ARTIFACT_ID,
+              actorId: OTHER_ACTOR_ID,
+              readerNonce: `mismatch-${path.slice(1)}-nonce`,
+              signal: "save",
+              createdAt: "2026-06-29T12:08:00.000Z",
+            }
+          : {
+              eventId: `mismatch-${path.slice(1)}`,
+              actorId: OTHER_ACTOR_ID,
+              readerNonce: `mismatch-${path.slice(1)}-nonce`,
+              intentKind: "ask_feed",
+              status: "accepted",
+              targetRef: "feed",
+              createdAt: "2026-06-29T12:08:00.000Z",
+            },
+        { "x-feed-actor-id": ACTOR_ID },
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: {
+          code: "actor_mismatch",
+          message: "payload actorId does not match the request actor",
+        },
+      });
+    }
   });
 
   test("persists accepted delegations and restores actors across restarts", async () => {
@@ -338,14 +431,19 @@ async function getJson<T>(url: string, headers: HeadersInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-async function postJson<T = unknown>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+async function postJson<T = unknown>(url: string, body: unknown, headers: HeadersInit = {}): Promise<T> {
+  const response = await postResponse(url, body, headers);
   expect(response.ok).toBe(true);
   return (await response.json()) as T;
+}
+
+async function postResponse(url: string, body: unknown, headers: HeadersInit = {}): Promise<Response> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
+  return response;
 }
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {

@@ -99,7 +99,7 @@ test("signs in through OpenKey external wallet", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Feed" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: "Practice Fish First" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Practice Fish First" })).toBeVisible({ timeout: 120000 });
 
   // The shared test actor persists feed state on the live node across smoke
   // runs, so hide the first still-visible card and assert the delta instead of

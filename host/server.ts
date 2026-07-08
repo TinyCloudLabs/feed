@@ -24,6 +24,8 @@ import { seedDefaultFeed } from "./seed.ts";
 import { FeedHostStorage, type FeedHostActorStorage } from "./storage.ts";
 
 type JsonBody = Record<string, unknown>;
+type FeedbackRequestBody = Omit<FeedbackEvent, "actorId"> & { actorId?: string };
+type ControlIntentRequestBody = Omit<ControlIntentEvent, "actorId"> & { actorId?: string };
 
 export type FeedHostServerOptions = {
   port: number;
@@ -126,7 +128,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         return await route(request, await getContext());
       } catch (error) {
         if (error instanceof FeedDelegationError) {
-          return json({ error: { code: error.code, message: error.message } }, 403);
+          return json({ error: { code: error.code, message: error.message } }, error.code === "actor_mismatch" ? 400 : 403);
         }
         const message = error instanceof Error ? error.message : String(error);
         return json({ error: { code: "internal_error", message } }, 500);
@@ -237,17 +239,16 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   }
 
   if (request.method === "POST" && url.pathname === "/feedback") {
-    const event = await requireBody<FeedbackEvent>(request, ["eventId", "artifactId", "actorId", "readerNonce", "signal", "createdAt"]);
+    const event = await requireBody<FeedbackRequestBody>(request, ["eventId", "artifactId", "readerNonce", "signal", "createdAt"]);
     requirePayloadActorMatchesHeader(request, event.actorId);
-    const actor = await requireActorReady(request, context, event.actorId);
-    await storage.recordFeedback(actorStorage(actor), event);
+    const actor = await requireActorReady(request, context);
+    await storage.recordFeedback(actorStorage(actor), { ...event, actorId: actor.actorId });
     return json({ accepted: true, eventId: event.eventId });
   }
 
   if (request.method === "POST" && url.pathname === "/control-intents") {
-    const event = await requireBody<ControlIntentEvent>(request, [
+    const event = await requireBody<ControlIntentRequestBody>(request, [
       "eventId",
-      "actorId",
       "readerNonce",
       "intentKind",
       "status",
@@ -255,8 +256,8 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       "createdAt",
     ]);
     requirePayloadActorMatchesHeader(request, event.actorId);
-    const actor = await requireActorReady(request, context, event.actorId);
-    await storage.recordControlIntent(actorStorage(actor), event);
+    const actor = await requireActorReady(request, context);
+    await storage.recordControlIntent(actorStorage(actor), { ...event, actorId: actor.actorId });
     return json({ accepted: true, eventId: event.eventId });
   }
 
@@ -291,9 +292,9 @@ async function requireDelegation(context: FeedHostContext, actorId: string): Pro
   return delegation;
 }
 
-function requirePayloadActorMatchesHeader(request: Request, payloadActorId: string): void {
+function requirePayloadActorMatchesHeader(request: Request, payloadActorId?: string): void {
   const headerActorId = request.headers.get("x-feed-actor-id");
-  if (headerActorId && !actorIdsMatch(headerActorId, payloadActorId)) {
+  if (headerActorId && payloadActorId !== undefined && !actorIdsMatch(headerActorId, payloadActorId)) {
     throw new FeedDelegationError("payload actorId does not match the request actor", "actor_mismatch");
   }
 }
