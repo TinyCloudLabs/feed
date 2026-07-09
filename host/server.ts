@@ -34,6 +34,7 @@ import {
   FeedHostError,
   FeedHostStorage,
   type FeedHostActorStorage,
+  type FeedHostSkillCredentialsPatch,
 } from "./storage.ts";
 
 type JsonBody = Record<string, unknown>;
@@ -425,6 +426,36 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     );
   }
 
+  if (request.method === "GET" && url.pathname === "/skills") {
+    const actor = await requireCompleteActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
+      throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
+    }
+    return json(
+      await storage.listSkills(actorStorage(actor), {
+        actorId: actor.actorId,
+        limit,
+        cursor,
+      }),
+    );
+  }
+
+  const skillCredentialsMatch = url.pathname.match(/^\/skills\/([^/]+)\/credentials$/);
+  if (request.method === "PATCH" && skillCredentialsMatch) {
+    const actor = await requireCompleteActor(request, context);
+    const skillId = decodeURIComponent(skillCredentialsMatch[1]);
+    const body = await readJsonObject(request, "invalid_skill_credentials", "credentials body must be JSON");
+    const patch = normalizeSkillCredentialsPatch(body);
+    const skill = await storage.upsertSkillCredentials(actorStorage(actor), {
+      actorId: actor.actorId,
+      skillId,
+      patch,
+    });
+    return json({ updated: true, skill });
+  }
+
   return json({ error: { code: "not_found", message: `${request.method} ${url.pathname}` } }, 404);
 }
 
@@ -706,6 +737,34 @@ function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string):
     payload: sanitizeFeedbackPayload(signal, body.payload),
     createdAt: readString(body, "createdAt", "invalid_feedback", "createdAt is required"),
   };
+}
+
+function normalizeSkillCredentialsPatch(body: Record<string, unknown>): FeedHostSkillCredentialsPatch {
+  const expectedVersion = optionalNumber(body.expectedVersion);
+  const credentialMode = optionalString(body.credentialMode);
+  if (expectedVersion === undefined || credentialMode === undefined) {
+    throw new FeedHostError("expectedVersion and credentialMode are required", 400, "invalid_skill_credentials");
+  }
+  const patch: FeedHostSkillCredentialsPatch = {
+    expectedVersion,
+    credentialMode: credentialMode as FeedHostSkillCredentialsPatch["credentialMode"],
+  };
+  const providerId = optionalString(body.providerId);
+  if (providerId) patch.providerId = providerId;
+  const secretRef = optionalString(body.secretRef);
+  if (secretRef) patch.secretRef = secretRef;
+  if (body.budget !== undefined) {
+    const budget = optionalObject(body.budget);
+    if (!budget) throw new FeedHostError("budget must be an object", 400, "invalid_skill_credentials");
+    patch.budget = {
+      budgetId: optionalString(budget.budgetId),
+      limit: optionalNumber(budget.limit),
+      spent: optionalNumber(budget.spent),
+      currency: optionalString(budget.currency),
+      disabled: typeof budget.disabled === "boolean" ? budget.disabled : undefined,
+    };
+  }
+  return patch;
 }
 
 function normalizeControlIntentEvent(body: Record<string, unknown>, actorId: string): ControlIntentEvent {

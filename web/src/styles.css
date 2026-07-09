@@ -352,3 +352,60 @@ pre {
   }
 }
 
+.settings-panel {
+  margin: 0 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.skill-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.skill-row {
+  border: 1px solid #e2e6ea;
+  border-radius: 12px;
+  padding: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.skill-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 14px;
+  color: #4f5b66;
+}
+
+.skill-summary strong {
+  font-size: 15px;
+  color: #1f2933;
+}
+
+.skill-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: end;
+}
+
+.skill-actions label {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: #5b6570;
+}
+
+.skill-actions input {
+  padding: 6px 8px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  min-width: 200px;
+}
+

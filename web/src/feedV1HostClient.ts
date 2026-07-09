@@ -1,5 +1,6 @@
 import type {
   ControlIntentEvent,
+  CredentialMode,
   FeedArtifact,
   FeedArtifactProjection,
   FeedbackEvent,
@@ -20,6 +21,48 @@ export type FeedEventStream = {
 };
 
 export type ArtifactProvenance = Pick<FeedArtifact, "artifactId" | "sourceRefs" | "producedBy" | "freshness" | "idempotency">;
+
+export type FeedHostSkillBudgetState = {
+  budgetId: string;
+  limit?: number;
+  spent: number;
+  currency: string;
+  disabled: boolean;
+  remaining?: number;
+  status: "ready" | "blocked_budget";
+};
+
+// The wire type does NOT carry secretRef; only a hasSecret boolean marker.
+// The Feed Host redacts submitted credential references so they never round
+// trip through GET or PATCH responses.
+export type FeedHostSkillState = {
+  skillId: string;
+  credentialMode: CredentialMode;
+  providerId?: string;
+  hasSecret: boolean;
+  budget: FeedHostSkillBudgetState;
+  version: number;
+  updatedAt: string;
+};
+
+export type FeedHostSkillsPage = {
+  items: FeedHostSkillState[];
+  nextCursor?: string;
+};
+
+export type FeedHostSkillCredentialsPatch = {
+  expectedVersion: number;
+  credentialMode: CredentialMode;
+  providerId?: string;
+  secretRef?: string;
+  budget?: {
+    budgetId?: string;
+    limit?: number;
+    spent?: number;
+    currency?: string;
+    disabled?: boolean;
+  };
+};
 
 export type FeedV1HostClientOptions = {
   baseUrl: string;
@@ -82,6 +125,26 @@ export class FeedV1HostClient {
 
   async getProvenance(artifactId: string): Promise<ArtifactProvenance> {
     return this.request<ArtifactProvenance>(`/artifacts/${encodeURIComponent(artifactId)}/provenance`);
+  }
+
+  async listSkills(input: { limit?: number; cursor?: string } = {}): Promise<FeedHostSkillsPage> {
+    const params = new URLSearchParams();
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    if (input.cursor) params.set("cursor", input.cursor);
+    return this.request<FeedHostSkillsPage>(`/skills${params.size ? `?${params}` : ""}`);
+  }
+
+  async patchSkillCredentials(
+    skillId: string,
+    patch: FeedHostSkillCredentialsPatch,
+  ): Promise<{ updated: true; skill: FeedHostSkillState }> {
+    return this.request<{ updated: true; skill: FeedHostSkillState }>(
+      `/skills/${encodeURIComponent(skillId)}/credentials`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      },
+    );
   }
 
   async postFeedback(event: FeedbackEvent): Promise<{ accepted: true; eventId: string }> {

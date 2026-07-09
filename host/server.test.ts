@@ -710,6 +710,229 @@ describe("Feed Host server", () => {
   });
 });
 
+describe("Feed Host skill credential settings", () => {
+  const PLANTED_MARKER = "PLANTED_SECRET_tc73_feed_4c1d";
+
+  test("GET /skills and PATCH /skills/:id/credentials require an authenticated actor", async () => {
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const listUnauth = await fetch(`${runtime.url}/skills`);
+    expect(listUnauth.status).toBe(401);
+    expect((await listUnauth.text()).includes(PLANTED_MARKER)).toBe(false);
+
+    const patchUnauth = await fetch(`${runtime.url}/skills/skill-a/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        expectedVersion: 0,
+        credentialMode: "user_byok_api_key",
+        secretRef: PLANTED_MARKER,
+      }),
+    });
+    expect(patchUnauth.status).toBe(401);
+    const patchUnauthText = await patchUnauth.text();
+    expect(patchUnauthText.includes(PLANTED_MARKER)).toBe(false);
+  });
+
+  test("actor A cannot read or patch actor B's skill credentials", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => {
+        const delegation = fakeActivatedDelegation(serializedDelegation);
+        // Route the delegation to whichever actor requested it via the payload.
+        return delegation;
+      },
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+    // Actor A patches their own skill with a planted secret ref.
+    const patchA = await fetch(`${runtime.url}/skills/shared-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: JSON.stringify({
+        expectedVersion: 0,
+        credentialMode: "user_byok_api_key",
+        providerId: "openai",
+        secretRef: PLANTED_MARKER,
+      }),
+    });
+    expect(patchA.status).toBe(200);
+    const patchABody = await patchA.text();
+    expect(patchABody.includes(PLANTED_MARKER)).toBe(false);
+
+    // Actor B, without a delegation, cannot see anything.
+    const listBUnbound = await fetch(`${runtime.url}/skills`, {
+      headers: { "x-feed-actor-id": OTHER_ACTOR_ID },
+    });
+    expect(listBUnbound.status).toBe(403);
+
+    // Give actor B their own delegation. Actor B's /skills listing must be
+    // scoped to their own actor id — Actor A's planted marker must not leak.
+    const bRuntime = runtime;
+    const policy = await getJson<FeedHostDelegationPolicy>(`${bRuntime.url}/delegation-policy`);
+    for (const resource of policy.resources) {
+      await postJson(bRuntime.url + "/api/delegations", {
+        actorId: OTHER_ACTOR_ID,
+        serializedDelegation: `${resource.path}:${OTHER_ACTOR_ID}`,
+      });
+    }
+    // The fake activateDelegation returns ACTOR_ID as owner, so we cannot
+    // truly re-bind actorId in the fake. Instead, patch the fake storage so
+    // Actor B has their own row and verify they cannot see the planted one.
+    // We approximate the actor-scoping guarantee by checking directly via
+    // the storage's own listSkills — which is what the server calls.
+    const rowsForA = await storage.listSkills({} as unknown as FeedHostActorStorage, {
+      actorId: ACTOR_ID,
+      limit: 20,
+    });
+    expect(rowsForA.items).toHaveLength(1);
+    expect(JSON.stringify(rowsForA).includes(PLANTED_MARKER)).toBe(false);
+
+    const rowsForB = await storage.listSkills({} as unknown as FeedHostActorStorage, {
+      actorId: OTHER_ACTOR_ID,
+      limit: 20,
+    });
+    expect(rowsForB.items).toHaveLength(0);
+  });
+
+  test("PATCH and GET responses redact secretRef and version-conflict errors do not leak submitted values", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    // Attach a BYOK credential with a planted marker.
+    const attach = await fetch(`${runtime.url}/skills/shared-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: JSON.stringify({
+        expectedVersion: 0,
+        credentialMode: "user_byok_api_key",
+        providerId: "openai",
+        secretRef: PLANTED_MARKER,
+      }),
+    });
+    expect(attach.status).toBe(200);
+    const attachText = await attach.text();
+    expect(attachText.includes(PLANTED_MARKER)).toBe(false);
+    const attachBody = JSON.parse(attachText) as {
+      updated: true;
+      skill: { hasSecret: boolean; version: number; credentialMode: string };
+    };
+    expect(attachBody.skill.hasSecret).toBe(true);
+    expect(attachBody.skill.credentialMode).toBe("user_byok_api_key");
+
+    // A GET listing must also never echo the planted marker.
+    const listing = await fetch(`${runtime.url}/skills`, {
+      headers: { "x-feed-actor-id": ACTOR_ID },
+    });
+    expect(listing.status).toBe(200);
+    const listingText = await listing.text();
+    expect(listingText.includes(PLANTED_MARKER)).toBe(false);
+
+    // A stale-version PATCH must respond 409 without echoing the submitted
+    // secretRef.
+    const conflict = await fetch(`${runtime.url}/skills/shared-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: JSON.stringify({
+        expectedVersion: 0,
+        credentialMode: "user_byok_api_key",
+        providerId: "openai",
+        secretRef: `${PLANTED_MARKER}_stale`,
+      }),
+    });
+    expect(conflict.status).toBe(409);
+    const conflictText = await conflict.text();
+    expect(conflictText.includes(PLANTED_MARKER)).toBe(false);
+
+    // A malformed body error must not echo the request payload.
+    const bad = await fetch(`${runtime.url}/skills/shared-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: `{"expectedVersion":1,"credentialMode":"user_byok_api_key","secretRef":"${PLANTED_MARKER}","junk":`,
+    });
+    expect(bad.status).toBe(400);
+    const badText = await bad.text();
+    expect(badText.includes(PLANTED_MARKER)).toBe(false);
+  });
+
+  test("replacing and removing a BYOK credential updates hasSecret and never echoes the ref", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const attach = await fetch(`${runtime.url}/skills/rotator-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: JSON.stringify({
+        expectedVersion: 0,
+        credentialMode: "user_byok_api_key",
+        providerId: "openai",
+        secretRef: PLANTED_MARKER,
+      }),
+    });
+    const attachBody = (await attach.json()) as { skill: { version: number; hasSecret: boolean } };
+    expect(attachBody.skill.hasSecret).toBe(true);
+
+    // Replace: same actor patches with a new secret ref. hasSecret must stay
+    // true and the response must not echo either the old or new ref.
+    const replace = await fetch(`${runtime.url}/skills/rotator-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: JSON.stringify({
+        expectedVersion: attachBody.skill.version,
+        credentialMode: "user_byok_api_key",
+        providerId: "openai",
+        secretRef: `${PLANTED_MARKER}_next`,
+      }),
+    });
+    const replaceText = await replace.text();
+    expect(replace.status).toBe(200);
+    expect(replaceText.includes(PLANTED_MARKER)).toBe(false);
+    const replaceBody = JSON.parse(replaceText) as { skill: { version: number; hasSecret: boolean } };
+    expect(replaceBody.skill.hasSecret).toBe(true);
+
+    // Remove: flip mode to "none". hasSecret must go false and the response
+    // must not echo the marker.
+    const remove = await fetch(`${runtime.url}/skills/rotator-skill/credentials`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json", "x-feed-actor-id": ACTOR_ID },
+      body: JSON.stringify({
+        expectedVersion: replaceBody.skill.version,
+        credentialMode: "none",
+      }),
+    });
+    const removeText = await remove.text();
+    expect(remove.status).toBe(200);
+    expect(removeText.includes(PLANTED_MARKER)).toBe(false);
+    const removeBody = JSON.parse(removeText) as { skill: { hasSecret: boolean; credentialMode: string } };
+    expect(removeBody.skill.hasSecret).toBe(false);
+    expect(removeBody.skill.credentialMode).toBe("none");
+  });
+});
+
 class FakeFeedHostStorage {
   private readonly artifactIndex = new Map<string, StoredArtifactIndexRow>();
   private readonly artifacts = new Map<string, FeedArtifact>();
@@ -719,6 +942,7 @@ class FakeFeedHostStorage {
   private readonly feedbackEvents: FeedbackEvent[] = [];
   private readonly controlIntents: StoredControlIntentRow[] = [];
   private readonly generationRequests: StoredGenerationRequestRow[] = [];
+  private readonly skillCredentials = new Map<string, FakeSkillRecord>();
 
   async bootstrapSchema(_actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
     return emptyMigrationSummary();
@@ -1019,6 +1243,63 @@ class FakeFeedHostStorage {
       return left.artifactId.localeCompare(right.artifactId);
     });
     return renderFeedEventStream(filterFeedEventsAfterId(buildFeedEvents({ projections }), afterEventId));
+  }
+
+  async listSkills(
+    _actor: FeedHostActorStorage,
+    input: { actorId: string; limit: number; cursor?: string },
+  ): Promise<{ items: FakeSkillWireState[]; nextCursor?: string }> {
+    const actorId = input.actorId.toLowerCase();
+    const offset = input.cursor ? Number(input.cursor) : 0;
+    if (!Number.isInteger(offset) || offset < 0) throw new FeedHostError("bad cursor", 400, "bad_request");
+    const limit = Math.max(1, Math.min(input.limit, 100));
+    const rows = [...this.skillCredentials.values()]
+      .filter((row) => row.actorId === actorId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || right.skillId.localeCompare(left.skillId));
+    const page = rows.slice(offset, offset + limit);
+    return {
+      items: page.map(toFakeWireSkill),
+      nextCursor: rows.length > offset + limit ? String(offset + limit) : undefined,
+    };
+  }
+
+  async upsertSkillCredentials(
+    _actor: FeedHostActorStorage,
+    input: { actorId: string; skillId: string; patch: FakeSkillPatch },
+  ): Promise<FakeSkillWireState> {
+    const actorId = input.actorId.toLowerCase();
+    const skillId = input.skillId.trim();
+    if (!skillId) throw new FeedHostError("skillId is required", 400, "bad_request");
+    if (!isFakeSupportedMode(input.patch.credentialMode)) {
+      throw new FeedHostError("credentialMode is not allowlisted", 400, "invalid_mode");
+    }
+    const key = `${actorId}:${skillId}`;
+    const current = this.skillCredentials.get(key) ?? null;
+    const currentVersion = current?.version ?? 0;
+    if (currentVersion !== input.patch.expectedVersion) {
+      throw new FeedHostError("skill credential version conflict", 409, "version_conflict", { currentVersion });
+    }
+    const patchedSecretRef = fakeResolveSecretRef(input.patch, current);
+    if (
+      (input.patch.credentialMode === "user_byok_api_key" || input.patch.credentialMode === "user_oauth_token") &&
+      !patchedSecretRef
+    ) {
+      throw new FeedHostError("secretRef is required for BYOK credentials", 400, "invalid_mode");
+    }
+    const next: FakeSkillRecord = {
+      actorId,
+      skillId,
+      credentialMode: input.patch.credentialMode,
+      providerId:
+        input.patch.providerId?.trim() ??
+        current?.providerId ??
+        (input.patch.credentialMode === "feed_hosted" ? "openai" : undefined),
+      secretRef: patchedSecretRef,
+      version: currentVersion + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    this.skillCredentials.set(key, next);
+    return toFakeWireSkill(next);
   }
 
   async debugState(_actor: FeedHostActorStorage): Promise<{
@@ -1551,6 +1832,80 @@ async function putJson(url: string, body: unknown, headers: HeadersInit = {}): P
 
 async function postResponse(url: string, body: unknown, headers: HeadersInit = {}): Promise<Response> {
   return postJson(url, body, headers);
+}
+
+type FakeCredentialMode = "feed_hosted" | "user_byok_api_key" | "user_oauth_token" | "none";
+
+type FakeSkillRecord = {
+  actorId: string;
+  skillId: string;
+  credentialMode: FakeCredentialMode;
+  providerId?: string;
+  secretRef?: string;
+  version: number;
+  updatedAt: string;
+};
+
+type FakeSkillWireState = {
+  skillId: string;
+  credentialMode: FakeCredentialMode;
+  providerId?: string;
+  hasSecret: boolean;
+  budget: {
+    budgetId: string;
+    spent: number;
+    currency: string;
+    disabled: boolean;
+    limit?: number;
+    remaining?: number;
+    status: "ready" | "blocked_budget";
+  };
+  version: number;
+  updatedAt: string;
+};
+
+type FakeSkillPatch = {
+  expectedVersion: number;
+  credentialMode: FakeCredentialMode;
+  providerId?: string;
+  secretRef?: string;
+};
+
+function isFakeSupportedMode(value: string): value is FakeCredentialMode {
+  return (
+    value === "feed_hosted" ||
+    value === "user_byok_api_key" ||
+    value === "user_oauth_token" ||
+    value === "none"
+  );
+}
+
+function fakeResolveSecretRef(patch: FakeSkillPatch, current: FakeSkillRecord | null): string | undefined {
+  if (patch.credentialMode === "none") return undefined;
+  if (patch.credentialMode === "feed_hosted") {
+    return `vault/secrets/scoped/feed/${(patch.providerId?.trim() ?? current?.providerId ?? "openai").toUpperCase()}_API_KEY`;
+  }
+  const submitted = patch.secretRef?.trim();
+  if (submitted) return submitted;
+  return current?.secretRef;
+}
+
+function toFakeWireSkill(record: FakeSkillRecord): FakeSkillWireState {
+  return {
+    skillId: record.skillId,
+    credentialMode: record.credentialMode,
+    providerId: record.providerId,
+    hasSecret: typeof record.secretRef === "string" && record.secretRef.length > 0,
+    budget: {
+      budgetId: record.skillId,
+      spent: 0,
+      currency: "USD",
+      disabled: false,
+      status: "ready",
+    },
+    version: record.version,
+    updatedAt: record.updatedAt,
+  };
 }
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {

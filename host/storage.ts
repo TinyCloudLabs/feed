@@ -5,7 +5,13 @@ import type {
   SqlStatement,
   SqlValue,
 } from "@tinycloud/node-sdk";
-import { type FeedArtifact, type FeedArtifactProjection, type FeedbackEvent, validateFeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import {
+  type CredentialMode,
+  type FeedArtifact,
+  type FeedArtifactProjection,
+  type FeedbackEvent,
+  validateFeedArtifact,
+} from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import {
   applyFeedV1MigrationPlan,
   buildFeedV1MigrationPlan,
@@ -99,6 +105,71 @@ type ControlIntentRow = {
   payload_hash: string | null;
   payload_json: string | null;
   created_at: string;
+};
+
+type SkillCredentialsRow = {
+  profile_id: string;
+  scope: string;
+  value_json: string;
+  version: number;
+  updated_at: string;
+};
+
+type StoredSkillCredentialsValue = {
+  skillId: string;
+  credentialMode: CredentialMode;
+  providerId?: string;
+  secretRef?: string;
+  budget?: {
+    budgetId: string;
+    limit?: number;
+    spent?: number;
+    currency?: string;
+    disabled?: boolean;
+  };
+};
+
+// Wire representation of a skill's credential state. NEVER carries the raw
+// secretRef — only a boolean marker — so a submitted secret value can't leak
+// through GET/PATCH responses or error bodies.
+export type FeedHostSkillBudgetState = {
+  budgetId: string;
+  limit?: number;
+  spent: number;
+  currency: string;
+  disabled: boolean;
+  remaining?: number;
+  status: "ready" | "blocked_budget";
+};
+
+export type FeedHostSkillState = {
+  skillId: string;
+  credentialMode: CredentialMode;
+  providerId?: string;
+  hasSecret: boolean;
+  budget: FeedHostSkillBudgetState;
+  version: number;
+  updatedAt: string;
+};
+
+// Internal record — server-side only. Holds the raw secretRef so we can carry
+// it forward across upserts. Never returned to callers.
+type FeedHostSkillRecord = Omit<FeedHostSkillState, "hasSecret"> & {
+  secretRef?: string;
+};
+
+export type FeedHostSkillCredentialsPatch = {
+  expectedVersion: number;
+  credentialMode: CredentialMode;
+  providerId?: string;
+  secretRef?: string;
+  budget?: {
+    budgetId?: string;
+    limit?: number;
+    spent?: number;
+    currency?: string;
+    disabled?: boolean;
+  };
 };
 
 type GenerationRequestRow = {
@@ -495,6 +566,121 @@ export class FeedHostStorage {
     return rows;
   }
 
+  async listSkills(
+    actor: FeedHostActorStorage,
+    input: { actorId: string; limit: number; cursor?: string },
+  ): Promise<{ items: FeedHostSkillState[]; nextCursor?: string }> {
+    const offset = input.cursor ? Number(input.cursor) : 0;
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
+    }
+    const limit = Math.max(1, Math.min(input.limit, 100));
+    const normalizedActorId = normalizeActorId(input.actorId);
+    let rows: SkillCredentialsRow[];
+    try {
+      rows = await queryRows<SkillCredentialsRow>(
+        this.db(actor, "feed_index"),
+        `SELECT profile_id, scope, value_json, version, updated_at
+           FROM preference_profile
+          WHERE actor_id = ? AND scope LIKE ?
+          ORDER BY updated_at DESC, profile_id DESC
+          LIMIT ? OFFSET ?`,
+        [normalizedActorId, "skill:%:credentials", limit + 1, offset],
+      );
+    } catch {
+      // Redact the underlying SQL error so quoted params/values (which can
+      // include an actor's raw secretRef payload if a lookup ever races a
+      // patch) never surface in HTTP error bodies.
+      throw new FeedHostError("skill credential listing failed", 500, "internal_error");
+    }
+    const pageRows = rows.slice(0, limit);
+    return {
+      items: pageRows.map((row) => toWireSkillState(skillRecordFromRow(row))),
+      nextCursor: rows.length > limit ? String(offset + limit) : undefined,
+    };
+  }
+
+  async upsertSkillCredentials(
+    actor: FeedHostActorStorage,
+    input: { actorId: string; skillId: string; patch: FeedHostSkillCredentialsPatch },
+  ): Promise<FeedHostSkillState> {
+    const skillId = input.skillId.trim();
+    if (!skillId) throw new FeedHostError("skillId is required", 400, "bad_request");
+    if (!isSupportedCredentialMode(input.patch.credentialMode)) {
+      throw new FeedHostError("credentialMode is not allowlisted", 400, "invalid_mode");
+    }
+    const scope = skillCredentialsScope(skillId);
+    const normalizedActorId = normalizeActorId(input.actorId);
+
+    let existing: SkillCredentialsRow[];
+    try {
+      existing = await queryRows<SkillCredentialsRow>(
+        this.db(actor, "feed_index"),
+        `SELECT profile_id, scope, value_json, version, updated_at
+           FROM preference_profile
+          WHERE actor_id = ? AND scope = ?
+          LIMIT 1`,
+        [normalizedActorId, scope],
+      );
+    } catch {
+      throw new FeedHostError("skill credential lookup failed", 500, "internal_error");
+    }
+    const current = existing[0] ? skillRecordFromRow(existing[0]) : null;
+    const currentVersion = current?.version ?? 0;
+    if (currentVersion !== input.patch.expectedVersion) {
+      throw new FeedHostError("skill credential version conflict", 409, "version_conflict", { currentVersion });
+    }
+
+    const next = mergeSkillState(skillId, current, input.patch);
+    const profileId = skillProfileId(normalizedActorId, skillId);
+    const nextValue: StoredSkillCredentialsValue = {
+      skillId: next.skillId,
+      credentialMode: next.credentialMode,
+      providerId: next.providerId,
+      secretRef: next.secretRef,
+      budget: {
+        budgetId: next.budget.budgetId,
+        limit: next.budget.limit,
+        spent: next.budget.spent,
+        currency: next.budget.currency,
+        disabled: next.budget.disabled,
+      },
+    };
+    let changes: number;
+    try {
+      changes = await execute(
+        this.db(actor, "feed_index"),
+        `INSERT INTO preference_profile (
+          profile_id, actor_id, scope, value_json, version, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(profile_id) DO UPDATE SET
+          actor_id = excluded.actor_id,
+          scope = excluded.scope,
+          value_json = excluded.value_json,
+          version = excluded.version,
+          updated_at = excluded.updated_at
+        WHERE preference_profile.version = ?`,
+        [
+          profileId,
+          normalizedActorId,
+          scope,
+          JSON.stringify(nextValue),
+          next.version,
+          next.updatedAt,
+          currentVersion,
+        ],
+      );
+    } catch {
+      throw new FeedHostError("skill credential update failed", 500, "internal_error");
+    }
+    if (changes === 0) {
+      throw new FeedHostError("skill credential version conflict", 409, "version_conflict", { currentVersion });
+    }
+    return toWireSkillState(next);
+  }
+
+
+
   async listFeedEvents(actor: FeedHostActorStorage, afterEventId?: string): Promise<string> {
     const projections = await this.readProjectionStates(actor);
     return renderFeedEventStream(filterFeedEventsAfterId(buildFeedEvents({ projections }), afterEventId));
@@ -861,6 +1047,215 @@ async function queryRows<T extends Record<string, unknown>>(
 async function batch(db: IDatabaseHandle, statements: SqlStatement[]): Promise<void> {
   const result = await db.batch(statements);
   if (!result.ok) throw new Error(`TinyCloud SQL batch failed: ${resultError(result)}`);
+}
+
+async function execute(db: IDatabaseHandle, sql: string, params: SqlValue[] = []): Promise<number> {
+  const result = await db.execute(sql, params);
+  if (!result.ok) throw new Error(`TinyCloud SQL execute failed: ${resultError(result)}`);
+  return result.data.changes;
+}
+
+function skillCredentialsScope(skillId: string): string {
+  return `skill:${skillId}:credentials`;
+}
+
+function skillProfileId(actorId: string, skillId: string): string {
+  return `${actorId}:${skillCredentialsScope(skillId)}`;
+}
+
+function isSupportedCredentialMode(value: CredentialMode): boolean {
+  return (
+    value === "feed_hosted" ||
+    value === "user_byok_api_key" ||
+    value === "user_oauth_token" ||
+    value === "none"
+  );
+}
+
+function credentialModeFromValue(value: unknown): CredentialMode {
+  if (
+    value === "feed_hosted" ||
+    value === "user_byok_api_key" ||
+    value === "user_oauth_token" ||
+    value === "none"
+  ) {
+    return value;
+  }
+  return "none";
+}
+
+function numberFromRecord(record: Record<string, unknown>, key: string): number | undefined {
+  const value = record[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function stringFromRecord(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function parseStoredSkillValue(valueJson: string, scope: string): StoredSkillCredentialsValue {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(valueJson) as unknown;
+  } catch {
+    parsed = {};
+  }
+  const record =
+    parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+  const skillId = stringFromRecord(record, "skillId") ?? scope.replace(/^skill:/, "").replace(/:credentials$/, "");
+  const budgetRecord =
+    record.budget && typeof record.budget === "object" && !Array.isArray(record.budget)
+      ? (record.budget as Record<string, unknown>)
+      : undefined;
+  return {
+    skillId,
+    credentialMode: credentialModeFromValue(record.credentialMode),
+    providerId: stringFromRecord(record, "providerId"),
+    secretRef: stringFromRecord(record, "secretRef"),
+    budget: budgetRecord
+      ? {
+          budgetId: stringFromRecord(budgetRecord, "budgetId") ?? skillId,
+          limit: numberFromRecord(budgetRecord, "limit"),
+          spent: numberFromRecord(budgetRecord, "spent"),
+          currency: stringFromRecord(budgetRecord, "currency"),
+          disabled: budgetRecord.disabled === true,
+        }
+      : undefined,
+  };
+}
+
+function skillRecordFromRow(row: SkillCredentialsRow): FeedHostSkillRecord {
+  const value = parseStoredSkillValue(row.value_json, row.scope);
+  const budget = value.budget ?? {
+    budgetId: value.skillId,
+    spent: 0,
+    currency: "USD",
+    disabled: false,
+  };
+  const spent = budget.spent ?? 0;
+  const remaining = budget.limit === undefined ? undefined : budget.limit - spent;
+  return {
+    skillId: value.skillId,
+    credentialMode: value.credentialMode,
+    providerId: value.providerId,
+    secretRef: value.secretRef,
+    budget: {
+      budgetId: budget.budgetId,
+      limit: budget.limit,
+      spent,
+      currency: budget.currency ?? "USD",
+      disabled: budget.disabled ?? false,
+      remaining,
+      status: budget.disabled || (remaining !== undefined && remaining <= 0) ? "blocked_budget" : "ready",
+    },
+    version: Number(row.version),
+    updatedAt: row.updated_at,
+  };
+}
+
+function toWireSkillState(record: FeedHostSkillRecord): FeedHostSkillState {
+  return {
+    skillId: record.skillId,
+    credentialMode: record.credentialMode,
+    providerId: record.providerId,
+    hasSecret: typeof record.secretRef === "string" && record.secretRef.length > 0,
+    budget: record.budget,
+    version: record.version,
+    updatedAt: record.updatedAt,
+  };
+}
+
+function mergeSkillState(
+  skillId: string,
+  current: FeedHostSkillRecord | null,
+  patch: FeedHostSkillCredentialsPatch,
+): FeedHostSkillRecord {
+  const now = new Date().toISOString();
+  const nextBudget = patch.budget
+    ? {
+        budgetId: patch.budget.budgetId?.trim() || current?.budget.budgetId || skillId,
+        limit: patch.budget.limit ?? current?.budget.limit,
+        spent: patch.budget.spent ?? current?.budget.spent ?? 0,
+        currency: patch.budget.currency?.trim() || current?.budget.currency || "USD",
+        disabled: patch.budget.disabled ?? current?.budget.disabled ?? false,
+      }
+    : current?.budget
+      ? {
+          budgetId: current.budget.budgetId,
+          limit: current.budget.limit,
+          spent: current.budget.spent,
+          currency: current.budget.currency,
+          disabled: current.budget.disabled,
+        }
+      : {
+          budgetId: skillId,
+          spent: 0,
+          currency: "USD",
+          disabled: false,
+        };
+  const credentialMode = patch.credentialMode;
+  const secretRef = resolveNextSecretRef(credentialMode, patch, current);
+  if (
+    (credentialMode === "user_byok_api_key" || credentialMode === "user_oauth_token") &&
+    !secretRef
+  ) {
+    throw new FeedHostError("secretRef is required for BYOK credentials", 400, "invalid_mode");
+  }
+  const providerId =
+    patch.providerId?.trim() ??
+    current?.providerId ??
+    (credentialMode === "feed_hosted" ? "openai" : undefined);
+  const remaining = nextBudget.limit === undefined ? undefined : nextBudget.limit - nextBudget.spent;
+  return {
+    skillId,
+    credentialMode,
+    providerId,
+    secretRef,
+    budget: {
+      budgetId: nextBudget.budgetId,
+      limit: nextBudget.limit,
+      spent: nextBudget.spent,
+      currency: nextBudget.currency,
+      disabled: nextBudget.disabled,
+      remaining,
+      status:
+        nextBudget.disabled || (remaining !== undefined && remaining <= 0) ? "blocked_budget" : "ready",
+    },
+    version: (current?.version ?? 0) + 1,
+    updatedAt: now,
+  };
+}
+
+function resolveNextSecretRef(
+  credentialMode: CredentialMode,
+  patch: FeedHostSkillCredentialsPatch,
+  current: FeedHostSkillRecord | null,
+): string | undefined {
+  // "none" clears any prior secret so remove() genuinely wipes the reference.
+  if (credentialMode === "none") return undefined;
+  // For feed_hosted, the server picks a fixed vault ref by provider; never
+  // trust the client's submitted secretRef here.
+  if (credentialMode === "feed_hosted") {
+    return providerSecretRefFor(patch.providerId?.trim() ?? current?.providerId ?? "openai");
+  }
+  const submitted = patch.secretRef?.trim();
+  if (submitted) return submitted;
+  return current?.secretRef;
+}
+
+function providerSecretRefFor(providerId: string): string {
+  switch (providerId) {
+    case "phala":
+      return "vault/secrets/scoped/feed/REDPILL_API_KEY";
+    default:
+      return "vault/secrets/scoped/feed/OPENAI_API_KEY";
+  }
 }
 
 function responseRows<T extends Record<string, unknown>>(response: QueryResponse<T>): T[] {

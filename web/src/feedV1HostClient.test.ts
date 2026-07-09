@@ -118,6 +118,80 @@ describe("FeedV1HostClient", () => {
     ]);
   });
 
+  test("lists skills and patches skill credentials against actor-scoped host routes", async () => {
+    const PLANTED = "PLANTED_SECRET_client_e2f";
+    const calls: { url: string; method: string; body?: unknown }[] = [];
+    const client = new FeedV1HostClient({
+      baseUrl: "https://feed.example.test",
+      token: "token-1",
+      actorId: "did:pkh:eip155:1:0xabc",
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({
+          url,
+          method,
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        expect((init?.headers as Headers).get("x-feed-actor-id")).toBe("did:pkh:eip155:1:0xabc");
+        if (url.endsWith("/skills")) {
+          return jsonResponse({
+            items: [
+              {
+                skillId: "shared-skill",
+                credentialMode: "user_byok_api_key",
+                providerId: "openai",
+                hasSecret: true,
+                budget: { budgetId: "shared-skill", spent: 0, currency: "USD", disabled: false, status: "ready" },
+                version: 1,
+                updatedAt: "2026-07-08T00:00:00.000Z",
+              },
+            ],
+          });
+        }
+        return jsonResponse({
+          updated: true,
+          skill: {
+            skillId: "shared-skill",
+            credentialMode: "user_byok_api_key",
+            providerId: "openai",
+            hasSecret: true,
+            budget: { budgetId: "shared-skill", spent: 0, currency: "USD", disabled: false, status: "ready" },
+            version: 2,
+            updatedAt: "2026-07-08T00:00:01.000Z",
+          },
+        });
+      },
+    });
+
+    const page = await client.listSkills();
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0].hasSecret).toBe(true);
+    // The wire type has no secretRef field to prevent a submitted secret from
+    // leaking back through the client.
+    expect("secretRef" in page.items[0]).toBe(false);
+
+    const patched = await client.patchSkillCredentials("shared-skill", {
+      expectedVersion: 1,
+      credentialMode: "user_byok_api_key",
+      providerId: "openai",
+      secretRef: PLANTED,
+    });
+    expect(patched.skill.hasSecret).toBe(true);
+    expect("secretRef" in patched.skill).toBe(false);
+    // The client submits the secret on the way up but the returned skill
+    // object never re-exposes it.
+    expect(JSON.stringify(patched).includes(PLANTED)).toBe(false);
+    expect(calls[1].url).toBe("https://feed.example.test/skills/shared-skill/credentials");
+    expect(calls[1].method).toBe("PATCH");
+    expect(calls[1].body).toEqual({
+      expectedVersion: 1,
+      credentialMode: "user_byok_api_key",
+      providerId: "openai",
+      secretRef: PLANTED,
+    });
+  });
+
   test("surfaces non-2xx host responses", async () => {
     const client = new FeedV1HostClient({
       baseUrl: "https://feed.example.test",
