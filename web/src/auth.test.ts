@@ -1,16 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_REVIEWED_BUNDLE } from "../../shared/default-reviewed-bundle.ts";
-import { firstRunApprovalKey } from "./firstRunConsent.ts";
+import {
+  FEED_MANIFEST,
+  FeedReconnectRequiredError,
+  isFeedReconnectRequiredError,
+} from "./authPolicy.ts";
 
-describe("first-run approval persistence", () => {
-  test("scopes approval storage to host origin and bundle digest", () => {
-    const hostOrigin = "https://api.feed.tinycloud.xyz";
-    const key = firstRunApprovalKey(hostOrigin);
-    const otherKey = firstRunApprovalKey("https://other.feed.tinycloud.xyz");
+describe("Feed sign-in policy", () => {
+  test("does not request a separate first-run approval store", () => {
+    expect(FEED_MANIFEST.permissions).toEqual([]);
+    expect(JSON.stringify(FEED_MANIFEST)).not.toContain("first-run-approval");
+  });
 
-    expect(key).toContain(encodeURIComponent(DEFAULT_REVIEWED_BUNDLE.packageId));
-    expect(key).toContain(encodeURIComponent(hostOrigin));
-    expect(key).toContain(encodeURIComponent(DEFAULT_REVIEWED_BUNDLE.digest));
-    expect(otherKey).not.toBe(key);
+  test("uses a typed, user-readable reconnect error without authority details", () => {
+    const error = new FeedReconnectRequiredError(new Error("tinycloud.kv/put denied"));
+    expect(isFeedReconnectRequiredError(error)).toBe(true);
+    expect(error.message).toBe("Your saved Feed access needs to be refreshed. Sign in again to continue.");
+    expect(error.message).not.toContain("tinycloud");
   });
 });

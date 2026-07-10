@@ -112,6 +112,10 @@ export class FeedV1HostClient {
     });
   }
 
+  async disconnectFeed(): Promise<void> {
+    await this.request<void>("/api/delegations", { method: "DELETE" });
+  }
+
   async listFeed(input: { limit?: number; cursor?: string } = {}): Promise<FeedV1Page> {
     const params = new URLSearchParams();
     if (input.limit !== undefined) params.set("limit", String(input.limit));
