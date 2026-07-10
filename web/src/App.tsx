@@ -626,6 +626,7 @@ function SkillCredentialsPanel({ client }: { client: FeedV1HostClient }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busySkillId, setBusySkillId] = useState<string | null>(null);
   const [inputs, setInputs] = useState<Record<string, { providerId: string; secretRef: string }>>({});
+  const [newSkill, setNewSkill] = useState({ skillId: "", providerId: "", secretRef: "" });
 
   const reload = useCallback(async () => {
     setLoadState("loading");
@@ -650,6 +651,7 @@ function SkillCredentialsPanel({ client }: { client: FeedV1HostClient }) {
     mode: "user_byok_api_key" | "none",
     providerId?: string,
     secretRef?: string,
+    onSuccess?: () => void,
   ) => {
     setBusySkillId(skillId);
     try {
@@ -659,6 +661,7 @@ function SkillCredentialsPanel({ client }: { client: FeedV1HostClient }) {
         providerId,
         secretRef,
       });
+      onSuccess?.();
       await reload();
     } catch (error) {
       setLoadError(formatHostError(error));
@@ -682,6 +685,58 @@ function SkillCredentialsPanel({ client }: { client: FeedV1HostClient }) {
       {loadState === "ready" && skills.length === 0 && (
         <p>No skill credentials attached yet. Attach one below by entering a provider and reference name.</p>
       )}
+      <form
+        className="skill-row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const skillId = newSkill.skillId.trim();
+          const providerId = newSkill.providerId.trim();
+          const secretRef = newSkill.secretRef.trim();
+          if (!skillId || !secretRef) return;
+          void patch(skillId, 0, "user_byok_api_key", providerId || undefined, secretRef, () => {
+            setNewSkill({ skillId: "", providerId: "", secretRef: "" });
+          });
+        }}
+      >
+        <div className="skill-summary">
+          <strong>Attach a new skill</strong>
+          <span>Creates an actor-scoped credential setting at version 1.</span>
+        </div>
+        <div className="skill-actions">
+          <label>
+            Skill ID
+            <input
+              value={newSkill.skillId}
+              onChange={(event) => setNewSkill((state) => ({ ...state, skillId: event.target.value }))}
+              disabled={busySkillId !== null}
+            />
+          </label>
+          <label>
+            New skill provider
+            <input
+              value={newSkill.providerId}
+              onChange={(event) => setNewSkill((state) => ({ ...state, providerId: event.target.value }))}
+              disabled={busySkillId !== null}
+            />
+          </label>
+          <label>
+            New skill secret reference
+            <input
+              type="password"
+              value={newSkill.secretRef}
+              onChange={(event) => setNewSkill((state) => ({ ...state, secretRef: event.target.value }))}
+              placeholder="vault/secrets/..."
+              disabled={busySkillId !== null}
+            />
+          </label>
+          <button
+            type="submit"
+            disabled={busySkillId !== null || !newSkill.skillId.trim() || !newSkill.secretRef.trim()}
+          >
+            Attach credential
+          </button>
+        </div>
+      </form>
       <ul className="skill-list">
         {skills.map((skill) => {
           const draft = inputs[skill.skillId] ?? { providerId: skill.providerId ?? "", secretRef: "" };
