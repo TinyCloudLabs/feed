@@ -145,6 +145,15 @@ test("first-run approval starts the default bundle and streams the stub artifact
   await expect(page.getByText("The reviewed bundle should emit one grounded stub artifact.")).toBeVisible();
   await expect(page.getByRole("button", { name: "hide" })).toBeVisible();
 
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "BYOK settings" })).toBeVisible();
+  await page.getByLabel("Skill ID").fill("smoke-new-skill");
+  await page.getByLabel("New skill provider").fill("openai");
+  await page.getByLabel("New skill secret reference").fill("vault/secrets/smoke/openai");
+  await page.getByRole("button", { name: "Attach credential" }).click();
+  await expect(page.getByText("smoke-new-skill", { exact: true })).toBeVisible();
+  await expect(page.getByText("credential attached", { exact: true })).toBeVisible();
+
   await expect
     .poll(async () => {
       try {

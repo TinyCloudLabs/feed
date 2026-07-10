@@ -16,7 +16,11 @@ import {
   type FeedSession,
 } from "./auth.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
-import { FeedV1HostClient, FeedV1HostError } from "./feedV1HostClient.ts";
+import {
+  FeedV1HostClient,
+  FeedV1HostError,
+  type FeedHostSkillState,
+} from "./feedV1HostClient.ts";
 import { bodyPreview, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
@@ -50,6 +54,7 @@ export function App() {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const feedLoadInFlight = useRef(false);
   const bundleStartInFlight = useRef(false);
 
@@ -325,9 +330,16 @@ export function App() {
           <button onClick={() => void sendAskFeed()} disabled={bundleState !== "running" || busyAction === "ask_feed"}>
             Ask Feed
           </button>
+          <button onClick={() => setSettingsOpen((open) => !open)} aria-expanded={settingsOpen}>
+            {settingsOpen ? "Close settings" : "Settings"}
+          </button>
           <button onClick={() => void disconnect()}>Sign out</button>
         </div>
       </header>
+
+      {settingsOpen && bundleState === "running" && (
+        <SkillCredentialsPanel client={client} />
+      )}
 
       <main className="content-shell">
         {bundleState === "idle" && (
@@ -606,4 +618,191 @@ function StatusScreen({
 function formatHostError(error: unknown): string {
   if (error instanceof FeedV1HostError) return `${error.status}: ${error.body || error.message}`;
   return error instanceof Error ? error.message : String(error);
+}
+
+function SkillCredentialsPanel({ client }: { client: FeedV1HostClient }) {
+  const [skills, setSkills] = useState<FeedHostSkillState[]>([]);
+  const [loadState, setLoadState] = useState<LoadState>("idle");
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [busySkillId, setBusySkillId] = useState<string | null>(null);
+  const [inputs, setInputs] = useState<Record<string, { providerId: string; secretRef: string }>>({});
+  const [newSkill, setNewSkill] = useState({ skillId: "", providerId: "", secretRef: "" });
+
+  const reload = useCallback(async () => {
+    setLoadState("loading");
+    try {
+      const page = await client.listSkills({ limit: 50 });
+      setSkills(page.items);
+      setLoadError(null);
+      setLoadState("ready");
+    } catch (error) {
+      setLoadState("error");
+      setLoadError(formatHostError(error));
+    }
+  }, [client]);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const patch = async (
+    skillId: string,
+    expectedVersion: number,
+    mode: "user_byok_api_key" | "none",
+    providerId?: string,
+    secretRef?: string,
+    onSuccess?: () => void,
+  ) => {
+    setBusySkillId(skillId);
+    try {
+      await client.patchSkillCredentials(skillId, {
+        expectedVersion,
+        credentialMode: mode,
+        providerId,
+        secretRef,
+      });
+      onSuccess?.();
+      await reload();
+    } catch (error) {
+      setLoadError(formatHostError(error));
+    } finally {
+      setBusySkillId(null);
+    }
+  };
+
+  return (
+    <section className="panel settings-panel" aria-labelledby="skill-credentials-title">
+      <div className="panel-copy">
+        <p className="panel-kicker">Skill credentials</p>
+        <h2 id="skill-credentials-title">BYOK settings</h2>
+        <p>
+          Attach a bring-your-own-key credential for a skill, replace it, or remove it. The Feed Host stores
+          the reference only and never returns the raw value.
+        </p>
+      </div>
+      {loadState === "loading" && <p>Loading skill credential settings.</p>}
+      {loadError && <p className="error">{loadError}</p>}
+      {loadState === "ready" && skills.length === 0 && (
+        <p>No skill credentials attached yet. Attach one below by entering a provider and reference name.</p>
+      )}
+      <form
+        className="skill-row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const skillId = newSkill.skillId.trim();
+          const providerId = newSkill.providerId.trim();
+          const secretRef = newSkill.secretRef.trim();
+          if (!skillId || !secretRef) return;
+          void patch(skillId, 0, "user_byok_api_key", providerId || undefined, secretRef, () => {
+            setNewSkill({ skillId: "", providerId: "", secretRef: "" });
+          });
+        }}
+      >
+        <div className="skill-summary">
+          <strong>Attach a new skill</strong>
+          <span>Creates an actor-scoped credential setting at version 1.</span>
+        </div>
+        <div className="skill-actions">
+          <label>
+            Skill ID
+            <input
+              value={newSkill.skillId}
+              onChange={(event) => setNewSkill((state) => ({ ...state, skillId: event.target.value }))}
+              disabled={busySkillId !== null}
+            />
+          </label>
+          <label>
+            New skill provider
+            <input
+              value={newSkill.providerId}
+              onChange={(event) => setNewSkill((state) => ({ ...state, providerId: event.target.value }))}
+              disabled={busySkillId !== null}
+            />
+          </label>
+          <label>
+            New skill secret reference
+            <input
+              type="password"
+              value={newSkill.secretRef}
+              onChange={(event) => setNewSkill((state) => ({ ...state, secretRef: event.target.value }))}
+              placeholder="vault/secrets/..."
+              disabled={busySkillId !== null}
+            />
+          </label>
+          <button
+            type="submit"
+            disabled={busySkillId !== null || !newSkill.skillId.trim() || !newSkill.secretRef.trim()}
+          >
+            Attach credential
+          </button>
+        </div>
+      </form>
+      <ul className="skill-list">
+        {skills.map((skill) => {
+          const draft = inputs[skill.skillId] ?? { providerId: skill.providerId ?? "", secretRef: "" };
+          const busy = busySkillId === skill.skillId;
+          return (
+            <li key={skill.skillId} className="skill-row">
+              <div className="skill-summary">
+                <strong>{skill.skillId}</strong>
+                <span>mode: {skill.credentialMode}</span>
+                <span>{skill.hasSecret ? "credential attached" : "no credential"}</span>
+                <span>v{skill.version}</span>
+              </div>
+              <div className="skill-actions">
+                <label>
+                  Provider
+                  <input
+                    value={draft.providerId}
+                    onChange={(event) =>
+                      setInputs((state) => ({
+                        ...state,
+                        [skill.skillId]: { ...draft, providerId: event.target.value },
+                      }))
+                    }
+                    disabled={busy}
+                  />
+                </label>
+                <label>
+                  Secret reference
+                  <input
+                    type="password"
+                    value={draft.secretRef}
+                    onChange={(event) =>
+                      setInputs((state) => ({
+                        ...state,
+                        [skill.skillId]: { ...draft, secretRef: event.target.value },
+                      }))
+                    }
+                    placeholder={skill.hasSecret ? "leave blank to keep existing" : "vault/secrets/..."}
+                    disabled={busy}
+                  />
+                </label>
+                <button
+                  onClick={() =>
+                    void patch(
+                      skill.skillId,
+                      skill.version,
+                      "user_byok_api_key",
+                      draft.providerId.trim() || undefined,
+                      draft.secretRef.trim() || undefined,
+                    )
+                  }
+                  disabled={busy || (!skill.hasSecret && !draft.secretRef.trim())}
+                >
+                  {skill.hasSecret ? "Replace" : "Attach"}
+                </button>
+                <button
+                  onClick={() => void patch(skill.skillId, skill.version, "none")}
+                  disabled={busy || !skill.hasSecret}
+                >
+                  Remove
+                </button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
 }
