@@ -6,9 +6,9 @@ export const DEFAULT_REVIEWED_BUNDLE = {
   workflowDigest: "sha256:1949c691df27c44afc5818e88b0ce245b7c8de9e70583d1eff1a1d560f6a8f35",
   artifactId: "run-reviewed-bundle:candidate-1",
   artifactType: "stub_artifact",
-  artifactTitle: "Reviewed stub artifact",
-  artifactSummary: "A deterministic stub artifact from the reviewed bundle.",
-  artifactBodyText: "The reviewed bundle should emit one grounded stub artifact.",
+  artifactTitle: "A useful first look",
+  artifactSummary: "Feed found a theme worth revisiting in your recent context.",
+  artifactBodyText: "The same decision appears across your recent conversations. Open the source details to see where it came from.",
   disclosure: {
     userCopy:
       "Reads bounded Listen excerpts, stores artifacts and feedback in TinyCloud, and emits a single reviewed stub artifact with no third-party writes or user-world mutation.",

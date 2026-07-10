@@ -88,7 +88,7 @@ describe("FeedV1HostClient", () => {
     expect(calls).toEqual(["https://feed.example.test/feed/events"]);
   });
 
-  test("fetches delegation policy and submits portable delegation", async () => {
+  test("fetches delegation policy, submits portable delegation, and disconnects", async () => {
     const calls: { url: string; body?: unknown }[] = [];
     const client = new FeedV1HostClient({
       baseUrl: "https://feed.example.test",
@@ -106,6 +106,7 @@ describe("FeedV1HostClient", () => {
       actorId: "did:pkh:reader",
       serializedDelegation: "{\"delegateDID\":\"did:key:feed-host\"}",
     });
+    await client.disconnectFeed();
 
     expect(policy.delegateDID).toBe("did:key:feed-host");
     expect(receipt.accepted).toBe(true);
@@ -115,6 +116,7 @@ describe("FeedV1HostClient", () => {
         url: "https://feed.example.test/api/delegations",
         body: { actorId: "did:pkh:reader", serializedDelegation: "{\"delegateDID\":\"did:key:feed-host\"}" },
       },
+      { url: "https://feed.example.test/api/delegations", body: undefined },
     ]);
   });
 

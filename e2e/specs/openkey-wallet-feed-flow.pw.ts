@@ -109,22 +109,23 @@ async function signInWithWallet(page: Page, wallet: TestWallet): Promise<void> {
   await page.getByText(TEST_WALLET_NAME).click();
   await page.getByRole("button", { name: /create tinycloud space/i }).click({ timeout: 15000 }).catch(() => undefined);
   await expect.poll(() => page.evaluate(() => (window as any).__walletRequests), { timeout: 60000 }).toContain("personal_sign");
-  await expect(page.getByRole("heading", { name: "Feed", exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Sign out" })).toBeVisible();
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
-  await expect(page.getByRole("heading", { name: /approve the default bundle before feed starts/i })).toBeVisible();
-  await expect(page.getByRole("button", { name: /approve and start/i })).toBeVisible();
 }
 
-test("first-run approval starts the default bundle and streams the stub artifact", async ({ page }) => {
+test("one sign-in sets up Feed automatically and streams the first artifact", async ({ page }) => {
   const wallet = createTestWallet();
   const actorId = wallet.actorId;
   await installWallet(page, wallet);
 
   let feedRequests = 0;
+  let releaseFirstFeed: (() => void) | undefined;
+  const firstFeedReady = new Promise<void>((resolve) => {
+    releaseFirstFeed = resolve;
+  });
   await page.route(/\/feed(\?.*)?$/, async (route) => {
     feedRequests += 1;
     if (feedRequests === 1) {
+      await firstFeedReady;
       await route.fulfill({
         status: 200,
         headers: { "content-type": "application/json" },
@@ -138,15 +139,19 @@ test("first-run approval starts the default bundle and streams the stub artifact
   await page.goto("/");
   await signInWithWallet(page, wallet);
 
-  await page.getByRole("button", { name: /approve and start/i }).click();
-  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /setting up your feed/i })).toBeVisible();
+  await expect(page.getByText(/no additional approvals are needed/i)).toBeVisible();
+  await expect(page.getByText(/approve the default bundle/i)).toHaveCount(0);
+  await expect(page.getByText(/first-run-approval/i)).toHaveCount(0);
+  releaseFirstFeed?.();
+  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
   await expect(page.getByRole("button", { name: "Check again" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Reviewed stub artifact" })).toBeVisible({ timeout: 60000 });
-  await expect(page.getByText("The reviewed bundle should emit one grounded stub artifact.")).toBeVisible();
-  await expect(page.getByRole("button", { name: "hide" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByText(/same decision appears across your recent conversations/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
 
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "BYOK settings" })).toBeVisible();
+  await page.getByRole("button", { name: "Access & automation", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Access & automation" })).toBeVisible();
   await page.getByLabel("Skill ID").fill("smoke-new-skill");
   await page.getByLabel("New skill provider").fill("openai");
   await page.getByLabel("New skill secret reference").fill("vault/secrets/smoke/openai");
@@ -169,7 +174,7 @@ test("first-run approval starts the default bundle and streams the stub artifact
     .toBe(true);
 });
 
-test("first-run failure state only clears after a successful reload", async ({ page }) => {
+test("Feed failure state only clears after a successful reload", async ({ page }) => {
   const wallet = createTestWallet();
   await installWallet(page, wallet);
 
@@ -214,13 +219,12 @@ test("first-run failure state only clears after a successful reload", async ({ p
 
   await page.goto("/");
   await signInWithWallet(page, wallet);
-  await page.getByRole("button", { name: /approve and start/i }).click();
 
-  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
 
   await page.getByRole("button", { name: /check again/i }).click();
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 60000 });
-  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toHaveCount(0);
 
   await page.waitForTimeout(6500);
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
@@ -230,6 +234,25 @@ test("first-run failure state only clears after a successful reload", async ({ p
   await expect.poll(() => feedRequests).toBe(3);
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
   releaseRetryResponse?.();
-  await expect(page.getByRole("heading", { name: /nothing yet, bundle running/i })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible({ timeout: 60000 });
   expect(feedRequests).toBe(3);
+});
+
+test("a restored session with stale access asks for one clear reconnect", async ({ page }) => {
+  const wallet = createTestWallet();
+  await installWallet(page, wallet);
+
+  await page.goto("/");
+  await signInWithWallet(page, wallet);
+  await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
+
+  await page.evaluate(() => {
+    localStorage.setItem("feed:v1:hostDelegations", JSON.stringify({ actorId: "stale-policy" }));
+  });
+  await page.reload();
+
+  await expect(page.getByRole("heading", { name: /your private context, made useful/i })).toBeVisible();
+  await expect(page.getByRole("alert")).toHaveText(/saved Feed access needs to be refreshed/i);
+  await expect(page.getByRole("alert")).not.toContainText(/tinycloud\.kv|delegation|bundle|manifest/i);
+  await expect(page.getByRole("button", { name: /sign in with openkey/i })).toBeVisible();
 });

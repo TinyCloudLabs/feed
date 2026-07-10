@@ -8,35 +8,18 @@ import {
   type PortableDelegation,
 } from "@tinycloud/web-sdk";
 import type { providers } from "ethers";
-import { DEFAULT_REVIEWED_BUNDLE } from "../../shared/default-reviewed-bundle.ts";
 import { TINYCLOUD_HOST } from "./config.ts";
 import type { FeedHostDelegationPolicy, FeedHostDelegationReceipt } from "./delegation.ts";
 import { FeedV1HostClient } from "./feedV1HostClient.ts";
 import { connectWallet } from "./openkey.ts";
-import { firstRunApprovalKey } from "./firstRunConsent.ts";
+import {
+  FEED_MANIFEST,
+  FeedReconnectRequiredError,
+} from "./authPolicy.ts";
 
 const SESSION_EXPIRATION_MS = 7 * 24 * 60 * 60 * 1000;
 const LAST_ADDRESS_KEY = "feed:v1:lastAddress";
 const DELEGATION_CACHE_KEY = "feed:v1:hostDelegations";
-// First-run consent is durable TinyCloud state, not browser-local storage.
-
-const MANIFEST: Manifest = {
-  app_id: "xyz.tinycloud.feed",
-  name: "TinyFeed",
-  description: "Private Feed Host client for Feed v1 artifacts and controls.",
-  space: "applications",
-  prefix: "",
-  defaults: false,
-  permissions: [
-    {
-      service: "tinycloud.kv",
-      space: "applications",
-      path: "feed:v1:first-run-approval/",
-      actions: ["get", "put"],
-      description: "Store first-run approval records for the default reviewed bundle.",
-    },
-  ],
-};
 
 let instance: TinyCloudWeb | null = null;
 let walletMode = false;
@@ -44,21 +27,6 @@ let walletMode = false;
 export type FeedSession = {
   address: string;
   readerDid: string;
-};
-
-export type FirstRunApprovalRecord = {
-  schemaVersion: "feed.v1.first_run_approval";
-  actorId: string;
-  hostOrigin: string;
-  bundleId: string;
-  bundleDigest: string;
-  approvedAt: string;
-  disclosure: {
-    userCopy: string;
-    credentialOwner: typeof DEFAULT_REVIEWED_BUNDLE.disclosure.credentialOwner;
-    providerClass: typeof DEFAULT_REVIEWED_BUNDLE.disclosure.providerClass;
-    egressClass: typeof DEFAULT_REVIEWED_BUNDLE.disclosure.egressClass;
-  };
 };
 
 type CachedFeedHostDelegation = {
@@ -70,44 +38,6 @@ type CachedFeedHostDelegation = {
     serializedDelegation: string;
   }>;
 };
-
-export async function loadFirstRunApproval(input: { actorId: string; hostOrigin: string }): Promise<FirstRunApprovalRecord | null> {
-  if (!instance) return null;
-  try {
-    const result = await instance.kv.get<FirstRunApprovalRecord>(firstRunApprovalKey(input.hostOrigin));
-    if (!result.ok) return null;
-    const record = result.data.data;
-    if (!isFirstRunApprovalRecord(record, input.actorId, input.hostOrigin)) return null;
-    return record;
-  } catch {
-    return null;
-  }
-}
-
-export async function saveFirstRunApproval(input: {
-  actorId: string;
-  hostOrigin: string;
-  approvedAt?: string;
-}): Promise<FirstRunApprovalRecord> {
-  if (!instance) throw new Error("TinyCloud session is required before recording first-run approval");
-  const record: FirstRunApprovalRecord = {
-    schemaVersion: "feed.v1.first_run_approval",
-    actorId: input.actorId,
-    hostOrigin: input.hostOrigin,
-    bundleId: DEFAULT_REVIEWED_BUNDLE.packageId,
-    bundleDigest: DEFAULT_REVIEWED_BUNDLE.digest,
-    approvedAt: input.approvedAt ?? new Date().toISOString(),
-    disclosure: {
-      userCopy: DEFAULT_REVIEWED_BUNDLE.disclosure.userCopy,
-      credentialOwner: DEFAULT_REVIEWED_BUNDLE.disclosure.credentialOwner,
-      providerClass: DEFAULT_REVIEWED_BUNDLE.disclosure.providerClass,
-      egressClass: DEFAULT_REVIEWED_BUNDLE.disclosure.egressClass,
-    },
-  };
-  const result = await instance.kv.put(firstRunApprovalKey(input.hostOrigin), record);
-  if (!result.ok) throw new Error(result.error.message);
-  return record;
-}
 
 function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
   return {
@@ -128,31 +58,11 @@ function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
   };
 }
 
-function isFirstRunApprovalRecord(value: unknown, actorId: string, hostOrigin: string): value is FirstRunApprovalRecord {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const record = value as Partial<FirstRunApprovalRecord>;
-  return (
-    record.schemaVersion === "feed.v1.first_run_approval" &&
-    record.actorId === actorId &&
-    record.hostOrigin === hostOrigin &&
-    record.bundleId === DEFAULT_REVIEWED_BUNDLE.packageId &&
-    record.bundleDigest === DEFAULT_REVIEWED_BUNDLE.digest &&
-    typeof record.approvedAt === "string" &&
-    !!record.disclosure &&
-    typeof record.disclosure === "object" &&
-    !Array.isArray(record.disclosure) &&
-    record.disclosure.userCopy === DEFAULT_REVIEWED_BUNDLE.disclosure.userCopy &&
-    record.disclosure.credentialOwner === DEFAULT_REVIEWED_BUNDLE.disclosure.credentialOwner &&
-    record.disclosure.providerClass === DEFAULT_REVIEWED_BUNDLE.disclosure.providerClass &&
-    record.disclosure.egressClass === DEFAULT_REVIEWED_BUNDLE.disclosure.egressClass
-  );
-}
-
 function buildConfig(web3Provider?: providers.Web3Provider, policy?: FeedHostDelegationPolicy): Config {
   return {
     ...(web3Provider ? { providers: { web3: { driver: web3Provider } } } : {}),
     tinycloudHosts: [TINYCLOUD_HOST],
-    manifest: policy ? [MANIFEST, delegationManifest(policy)] : MANIFEST,
+    manifest: policy ? [FEED_MANIFEST, delegationManifest(policy)] : FEED_MANIFEST,
     sessionStorage: new BrowserSessionStorage(),
     sessionExpirationMs: SESSION_EXPIRATION_MS,
   };
@@ -317,7 +227,6 @@ function sameActions(left: string[], right: string[]): boolean {
   return right.every((action) => granted.has(action));
 }
 
-function reconnectRequiredError(cause?: unknown): Error {
-  const message = cause instanceof Error ? ` ${cause.message}` : "";
-  return new Error(`Feed Host needs a fresh wallet-backed delegation. Sign in with OpenKey again.${message}`);
+function reconnectRequiredError(cause?: unknown): FeedReconnectRequiredError {
+  return new FeedReconnectRequiredError(cause);
 }
