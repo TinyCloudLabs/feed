@@ -130,6 +130,7 @@ export function App() {
         await loadFeed();
         setFeedState("running");
       } catch (error) {
+        console.error("[Feed setup]", error);
         if (isFeedReconnectRequiredError(error)) {
           await signOut().catch(() => undefined);
           setSession(null);

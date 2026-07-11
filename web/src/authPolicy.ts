@@ -1,6 +1,7 @@
 import type { Manifest } from "@tinycloud/web-sdk";
 
 export const FEED_MANIFEST: Manifest = {
+  manifest_version: 1,
   app_id: "xyz.tinycloud.feed",
   name: "TinyFeed",
   description: "Private Feed Host client for Feed v1 artifacts and controls.",
@@ -20,4 +21,3 @@ export class FeedReconnectRequiredError extends Error {
 export function isFeedReconnectRequiredError(error: unknown): error is FeedReconnectRequiredError {
   return error instanceof FeedReconnectRequiredError;
 }
-
