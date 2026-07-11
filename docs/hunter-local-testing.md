@@ -21,6 +21,36 @@ signature request for each SQL or KV resource.
 Do not use or commit a production private key. The automated test creates an
 ephemeral Ethereum key in memory.
 
+## Review the mobile wireframes
+
+The approved mobile walkthrough is available in the shared `tinycloud-dev`
+workspace at:
+
+```text
+.context/design/artifactory-everyday-feed/
+```
+
+From the workspace root, serve it in one terminal:
+
+```sh
+python3 -m http.server 4107 \
+  --directory .context/design/artifactory-everyday-feed
+```
+
+Open [http://127.0.0.1:4107/#flow](http://127.0.0.1:4107/#flow). If Portless is
+already installed, the same viewer can use the stable URL from Sam's setup:
+
+```sh
+bunx portless alias artifactory-wireframes 4107
+open 'https://artifactory-wireframes.localhost/#flow'
+```
+
+Use **Previous**, **Next**, or the flow steps to move through the mobile views.
+The first six screens are the implemented everyday Feed journey; screens 7–14
+capture Hunter's proposed switcher, discovery, group, routine, and physical
+output concepts. The `.context` design bundle is not part of the Feed clone, so
+Hunter needs the shared workspace or a copy of that directory.
+
 ## 1. Install
 
 ```sh
@@ -128,6 +158,134 @@ bun run build
 The current baseline is 40 unit/integration tests plus three Playwright browser
 scenarios.
 
+## Use Sam's real Listen transcripts without sharing Sam's key
+
+Use a request/grant/import capability chain. Hunter creates the receiving key;
+Sam grants only read access to that key; Hunter may derive a narrower child
+grant for another Hunter-owned session. Never send `key.json`, an Ethereum
+private key, or a TinyCloud profile directory.
+
+Use `@tinycloud/cli` `0.7.7-beta.4` or newer for this flow. The commands below
+use `bunx` so the Feed repository's older development CLI cannot be selected by
+accident.
+
+### A. Hunter creates the read session and request
+
+From the Feed repository root:
+
+```sh
+mkdir -p hunter-handoff.local
+
+bunx @tinycloud/cli@beta profile create hunter-feed-source \
+  --host https://node.tinycloud.xyz \
+  --posture delegate-session \
+  --operator human
+
+bunx @tinycloud/cli@beta --profile hunter-feed-source auth request \
+  --permission docs/hunter-transcript-permissions.json \
+  --expiry 7d \
+  --emit hunter-handoff.local/transcripts.request.json
+```
+
+Hunter sends only `transcripts.request.json` to Sam. The request contains a
+public session DID and requested capabilities; it does not contain Hunter's
+private session key.
+
+### B. Sam reviews and grants the request
+
+Before approving, Sam should inspect the request and confirm it contains only:
+
+- SQL `read` on `xyz.tinycloud.listen/conversations`;
+- KV `get` and `list` on `xyz.tinycloud.listen/transcript/`;
+- the intended Hunter session DID and expiry.
+
+Using Sam's existing owner profile:
+
+```sh
+bunx @tinycloud/cli@beta \
+  --profile feed-migration-owner \
+  --json auth grant hunter-handoff.local/transcripts.request.json \
+  > hunter-handoff.local/transcripts.grant.json
+```
+
+Sam sends only `transcripts.grant.json` back to Hunter. The resulting parent
+delegation is read-only, expires after at most seven days, and can be revoked by
+CID. Its actual expiry cannot exceed Sam's active owner session.
+
+### C. Hunter imports and verifies the grant
+
+```sh
+bunx @tinycloud/cli@beta \
+  --profile hunter-feed-source \
+  auth import hunter-handoff.local/transcripts.grant.json
+
+bunx @tinycloud/cli@beta --profile hunter-feed-source auth caps
+
+bunx @tinycloud/cli@beta --profile hunter-feed-source kv list \
+  --space applications \
+  --prefix 'xyz.tinycloud.listen/transcript/'
+
+bunx @tinycloud/cli@beta --profile hunter-feed-source sql export \
+  --space applications \
+  --db 'xyz.tinycloud.listen/conversations' \
+  --output hunter-handoff.local/conversations.db
+```
+
+Fetch a specific transcript without broadening access:
+
+```sh
+bunx @tinycloud/cli@beta --profile hunter-feed-source kv get \
+  'xyz.tinycloud.listen/transcript/TRANSCRIPT_ID' \
+  --space applications \
+  --output hunter-handoff.local/transcript.json
+```
+
+### D. Hunter derives a child grant for his own worker session
+
+The worker creates its own request. Hunter's read session grants the same or a
+narrower request from the imported parent capability—Sam does not sign again.
+
+```sh
+bunx @tinycloud/cli@beta profile create hunter-feed-worker \
+  --host https://node.tinycloud.xyz \
+  --posture delegate-session \
+  --operator agent
+
+bunx @tinycloud/cli@beta --profile hunter-feed-worker auth request \
+  --permission docs/hunter-transcript-permissions.json \
+  --expiry 1d \
+  --emit hunter-handoff.local/worker.request.json
+
+bunx @tinycloud/cli@beta \
+  --profile hunter-feed-source \
+  --json auth grant hunter-handoff.local/worker.request.json \
+  > hunter-handoff.local/worker.grant.json
+
+bunx @tinycloud/cli@beta --profile hunter-feed-worker \
+  auth import hunter-handoff.local/worker.grant.json
+
+bunx @tinycloud/cli@beta --profile hunter-feed-worker auth caps
+```
+
+The child grant cannot add permissions or outlive the parent. Revoking or
+expiring the parent invalidates authority for its descendants.
+
+### Current Feed integration boundary
+
+The CLI sessions above can read/export the delegated source data and prove
+sub-delegation. The current browser Feed binds API actor headers to the wallet
+that signed into Feed. It does not yet import a separate source-owner grant or
+select that owner as its data actor. Therefore Hunter has two working options:
+
+1. use the delegated CLI session to inspect/export Sam's transcripts, then copy
+   approved fixtures into Hunter's own TinyCloud space and run Feed normally;
+2. add the planned delegated-source-actor integration before pointing the live
+   Feed UI directly at Sam's space.
+
+Trying to send Sam-owned delegation data through an unmodified Hunter-signed
+Feed UI will correctly fail actor binding rather than silently crossing the
+identity boundary.
+
 ## Troubleshooting
 
 ### `Failed to fetch`
@@ -156,4 +314,3 @@ bun pm ls | grep '@tinycloud/.*sdk'
 ```
 
 Also confirm `/delegation-policy` returns a fragmentless principal DID.
-
