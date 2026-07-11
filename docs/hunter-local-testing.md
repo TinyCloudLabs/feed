@@ -23,18 +23,17 @@ ephemeral Ethereum key in memory.
 
 ## Review the mobile wireframes
 
-The approved mobile walkthrough is available in the shared `tinycloud-dev`
-workspace at:
+The approved mobile walkthrough is included in this repository at:
 
 ```text
-.context/design/artifactory-everyday-feed/
+docs/wireframes/artifactory-everyday-feed/
 ```
 
-From the workspace root, serve it in one terminal:
+From the Feed repository root, serve it in one terminal:
 
 ```sh
 python3 -m http.server 4107 \
-  --directory .context/design/artifactory-everyday-feed
+  --directory docs/wireframes/artifactory-everyday-feed
 ```
 
 Open [http://127.0.0.1:4107/#flow](http://127.0.0.1:4107/#flow). If Portless is
@@ -48,8 +47,8 @@ open 'https://artifactory-wireframes.localhost/#flow'
 Use **Previous**, **Next**, or the flow steps to move through the mobile views.
 The first six screens are the implemented everyday Feed journey; screens 7–14
 capture Hunter's proposed switcher, discovery, group, routine, and physical
-output concepts. The `.context` design bundle is not part of the Feed clone, so
-Hunter needs the shared workspace or a copy of that directory.
+output concepts. The viewer and its SVG sources are tracked with this guide, so
+a normal Feed clone is sufficient.
 
 ## 1. Install
 
