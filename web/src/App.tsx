@@ -13,7 +13,7 @@ import {
   type FeedSession,
 } from "./auth.ts";
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
-import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import { errorDetail, reportClientEvent, reportStartupTiming } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
 import {
   FeedV1HostClient,
@@ -21,6 +21,7 @@ import {
   type FeedHostSkillState,
 } from "./feedV1HostClient.ts";
 import { bodyPreview, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
+import { StartupTrace, type StartupFlow } from "./startupTiming.ts";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
@@ -35,6 +36,10 @@ function shortAddress(value: string): string {
 
 function newNonce(): string {
   return crypto.randomUUID();
+}
+
+function newStartupTrace(flow: StartupFlow): StartupTrace {
+  return new StartupTrace(flow, reportStartupTiming);
 }
 
 export function App() {
@@ -53,24 +58,34 @@ export function App() {
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef(false);
   const lastRecoveryAt = useRef(0);
+  const timingRef = useRef<StartupTrace>(newStartupTrace("session_restore"));
 
   const client = useMemo(
-    () => new FeedV1HostClient({ baseUrl: FEED_HOST_URL, token: FEED_HOST_TOKEN || undefined, actorId: session?.readerDid }),
+    () => new FeedV1HostClient({
+      baseUrl: FEED_HOST_URL,
+      token: FEED_HOST_TOKEN || undefined,
+      actorId: session?.readerDid,
+      traceId: () => timingRef.current.traceId,
+    }),
     [session?.readerDid],
   );
 
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
-      const nextPolicy = await client.getDelegationPolicy();
+      const timing = timingRef.current;
+      timing.mark("page_loaded");
+      const nextPolicy = await timing.measure("policy_fetch", () => client.getDelegationPolicy());
       if (cancelled) return;
       setPolicy(nextPolicy);
-      const restored = await restoreSession(nextPolicy);
+      const restored = await restoreSession(nextPolicy, timing);
       if (!cancelled && restored) setSession(restored);
+      if (!cancelled && !restored) timing.complete("signed_out");
     };
     bootstrap()
       .then(() => undefined)
       .catch((error: unknown) => {
+        timingRef.current.complete("error");
         if (!cancelled) setSignInError(error instanceof Error ? error.message : String(error));
       })
       .finally(() => {
@@ -91,12 +106,16 @@ export function App() {
     lastRecoveryAt.current = now;
     reportClientEvent("warn", "delegation_lost_recovering", undefined, session?.readerDid);
     try {
-      const nextPolicy = await client.getDelegationPolicy();
+      const timing = newStartupTrace("delegation_recovery");
+      timingRef.current = timing;
+      timing.mark("recovery_started");
+      const nextPolicy = await timing.measure("policy_fetch", () => client.getDelegationPolicy());
       setFeedState("starting");
       setSetupStage("context");
       setPolicy(nextPolicy);
       return true;
     } catch (error) {
+      timingRef.current.complete("error");
       reportClientEvent("error", "delegation_recovery_failed", errorDetail(error), session?.readerDid);
       return false;
     }
@@ -106,9 +125,10 @@ export function App() {
     if (!session || feedLoadInFlight.current) return;
     feedLoadInFlight.current = true;
     setLoadState("loading");
+    const timing = timingRef.current;
     try {
-      const page = await client.listFeed({ limit: 40 });
-      const hydrated = await Promise.all(
+      const page = await timing.measure("feed_page_fetch", () => client.listFeed({ limit: 40 }));
+      const hydrated = await timing.measure("artifact_hydration", () => Promise.all(
         page.items.map(async (projection): Promise<FeedItem> => {
           try {
             const artifact = await client.getArtifact(projection.artifactId);
@@ -118,7 +138,7 @@ export function App() {
             return { projection, artifact: null, error: message };
           }
         }),
-      );
+      ));
       setItems(sortedFeed(hydrated));
       setLoadError(null);
       setLoadState("ready");
@@ -128,6 +148,7 @@ export function App() {
         if (await recoverDelegation()) return;
       }
       reportClientEvent("error", "feed_load_failed", errorDetail(error), session.readerDid);
+      timing.complete("error");
       setLoadState("error");
       setLoadError(formatHostError(error));
     } finally {
@@ -154,13 +175,20 @@ export function App() {
       setSetupError(null);
       setLoadError(null);
       try {
-        await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
+        const timing = timingRef.current;
+        await timing.measure("feed_host_setup", () => submitFeedHostDelegations({
+          client,
+          policy,
+          actorId: session.readerDid,
+          timing,
+        }));
         setSetupStage("preparing");
         await loadFeed();
         setFeedState("running");
       } catch (error) {
         console.error("[Feed setup]", error);
         if (isFeedReconnectRequiredError(error)) {
+          timingRef.current.complete("error");
           reportClientEvent("warn", "feed_reconnect_required", errorDetail(error), session.readerDid);
           await signOut().catch(() => undefined);
           setSession(null);
@@ -169,6 +197,7 @@ export function App() {
           return;
         }
         reportClientEvent("error", "feed_setup_failed", errorDetail(error), session.readerDid);
+        timingRef.current.complete("error");
         setFeedState("error");
         setSetupError(`Feed could not finish connecting (${errorDetail(error)}). Check your connection and try again.`);
       } finally {
@@ -185,6 +214,16 @@ export function App() {
     setLoadError(null);
     void startFeed();
   }, [policy, session, startFeed]);
+
+  useEffect(() => {
+    if (feedState !== "running" || loadState !== "ready") return;
+    const timing = timingRef.current;
+    const frame = window.requestAnimationFrame(() => {
+      timing.mark("first_feed_render");
+      timing.complete("ok");
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [feedState, loadState]);
 
   useEffect(() => {
     if (!session || feedState !== "running") return;
@@ -225,12 +264,17 @@ export function App() {
 
   const connect = async () => {
     setSignInError(null);
+    const timing = newStartupTrace("interactive_sign_in");
+    timingRef.current = timing;
+    timing.mark("user_started");
     try {
-      const nextPolicy = policy ?? (await client.getDelegationPolicy());
+      const nextPolicy = policy ?? (await timing.measure("policy_fetch", () => client.getDelegationPolicy()));
+      if (policy) timing.mark("policy_cached");
       setPolicy(nextPolicy);
       resetFeedState();
-      setSession(await signIn(nextPolicy));
+      setSession(await signIn(nextPolicy, timing));
     } catch (error) {
+      timing.complete("error");
       reportClientEvent("error", "sign_in_failed", errorDetail(error));
       setSignInError(error instanceof Error ? error.message : String(error));
     }

@@ -100,7 +100,7 @@ const PUBLIC_PATHS = new Set([
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, If-None-Match, Last-Event-ID",
+  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, X-Feed-Trace-Id, If-None-Match, Last-Event-ID",
 };
 
 const JSON_HEADERS = {
@@ -119,6 +119,8 @@ const SSE_HEADERS = {
 };
 
 export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
+  const hostStartedAt = performance.now();
+  logEvent("info", "host_starting", { seedOnStart: options.seedOnStart !== false });
   const storage = options.storage ?? new FeedHostStorage();
   const hostNode =
     options.hostNode ?? createFeedHostNode({ privateKey: options.hostPrivateKey, host: options.tinycloudHost });
@@ -129,6 +131,9 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   hostReady.catch((error) => {
     console.error("Feed Host TinyCloud sign-in failed:", error instanceof Error ? error.message : error);
   });
+  hostReady.then(() => {
+    logEvent("info", "host_identity_ready", { durationMs: Math.round(performance.now() - hostStartedAt) });
+  }).catch(() => undefined);
   const activateDelegation =
     options.activateDelegation ??
     ((input) =>
@@ -149,17 +154,23 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const getContext = async (): Promise<FeedHostContext> => {
     await hostReady;
     const policy = createFeedHostPolicy(hostNode.did);
-    context ??= {
-      storage,
-      policy,
-      policyHash: createPolicyHash(policy),
-      serverInfo: buildServerInfo(policy),
-      actors,
-      activateDelegation,
-      seedOnStart: options.seedOnStart !== false,
-      delegationStore,
-      enableDevPublisher: options.enableDevPublisher === true,
-    };
+    if (!context) {
+      context = {
+        storage,
+        policy,
+        policyHash: createPolicyHash(policy),
+        serverInfo: buildServerInfo(policy),
+        actors,
+        activateDelegation,
+        seedOnStart: options.seedOnStart !== false,
+        delegationStore,
+        enableDevPublisher: options.enableDevPublisher === true,
+      };
+      logEvent("info", "host_ready", {
+        durationMs: Math.round(performance.now() - hostStartedAt),
+        policyResources: policy.resources.length,
+      });
+    }
     return context;
   };
 
@@ -175,6 +186,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
 
       const url = new URL(request.url);
       const startedAt = performance.now();
+      const traceId = sanitizeTraceId(request.headers.get("x-feed-trace-id"));
       const logRequest = (response: Response, errorCode?: string) => {
         if (request.method === "GET" && PUBLIC_PATHS.has(url.pathname)) return response;
         logEvent(levelForStatus(response.status), "http_request", {
@@ -183,6 +195,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           status: response.status,
           ms: Math.round(performance.now() - startedAt),
           actor: request.headers.get("x-feed-actor-id") ?? undefined,
+          ...(traceId ? { traceId } : {}),
           ...(errorCode ? { code: errorCode } : {}),
         });
         return response;
@@ -223,6 +236,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
 async function route(request: Request, context: FeedHostContext): Promise<Response> {
   const { storage, policy, policyHash, serverInfo, actors, activateDelegation, seedOnStart, delegationStore } = context;
   const url = new URL(request.url);
+  const traceId = sanitizeTraceId(request.headers.get("x-feed-trace-id"));
 
   if (request.method === "GET" && url.pathname === "/health") {
     return json({
@@ -265,6 +279,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   }
 
   if (request.method === "POST" && url.pathname === "/api/delegations") {
+    const activationStartedAt = performance.now();
     const body = await readJsonObject(request, "invalid_delegation", "delegation body must be JSON");
     const serializedDelegation = readString(body, "serializedDelegation", "invalid_delegation", "serializedDelegation is required");
     const payloadActorId = optionalString(body.actorId);
@@ -282,6 +297,12 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         }
       }
       throw error;
+    });
+    logEvent("info", "delegation_activated", {
+      ...(traceId ? { traceId } : {}),
+      actor: activated.actorId,
+      resources: activated.resources.length,
+      durationMs: Math.round(performance.now() - activationStartedAt),
     });
     if (payloadActorId && !actorIdsMatch(payloadActorId, activated.actorId)) {
       throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
@@ -310,7 +331,15 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         expiresAt: activated.expiresAt,
       });
     }
-    if (hasCompleteFeedHostDelegation(state)) await ensureActorReady(storage, state, seedOnStart);
+    if (hasCompleteFeedHostDelegation(state)) {
+      const actorReadyStartedAt = performance.now();
+      await ensureActorReady(storage, state, seedOnStart);
+      logEvent("info", "actor_storage_ready", {
+        ...(traceId ? { traceId } : {}),
+        actor: activated.actorId,
+        durationMs: Math.round(performance.now() - actorReadyStartedAt),
+      });
+    }
     return json({
       accepted: true,
       actorId: activated.actorId,
@@ -334,10 +363,16 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       const eventName = optionalString(record.event);
       if (!eventName) continue;
       const level = record.level === "error" || record.level === "warn" ? record.level : "info";
+      const traceId = sanitizeTraceId(optionalString(record.traceId) ?? request.headers.get("x-feed-trace-id"));
+      const timing = sanitizeClientTimingFields(record);
       logEvent(level, `client_${eventName.slice(0, 64)}`, {
         source: "web",
         ...(actor ? { actor } : {}),
-        ...(optionalString(record.detail) ? { detail: optionalString(record.detail)!.slice(0, 500) } : {}),
+        ...(traceId ? { traceId } : {}),
+        ...timing,
+        ...(eventName !== "startup_timing" && optionalString(record.detail)
+          ? { detail: optionalString(record.detail)!.slice(0, 500) }
+          : {}),
       });
       accepted += 1;
     }
@@ -582,6 +617,67 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   }
 
   return json({ error: { code: "not_found", message: `${request.method} ${url.pathname}` } }, 404);
+}
+
+const STARTUP_TIMING_STAGES = new Set([
+  "page_loaded",
+  "user_started",
+  "policy_fetch",
+  "policy_cached",
+  "wallet_connect",
+  "tinycloud_sign_in",
+  "tinycloud_session_restore",
+  "recovery_started",
+  "feed_host_setup",
+  "cached_delegation_submit",
+  "delegation_materialize",
+  "delegation_submit",
+  "feed_page_fetch",
+  "artifact_hydration",
+  "first_feed_render",
+  "startup_total",
+]);
+
+export function sanitizeTraceId(value: string | null | undefined): string | undefined {
+  if (!value) return undefined;
+  return /^feed_[a-zA-Z0-9-]{1,64}$/.test(value) ? value : undefined;
+}
+
+export function sanitizeClientTimingFields(record: Record<string, unknown>): Record<string, unknown> {
+  const flow = record.flow === "session_restore" || record.flow === "interactive_sign_in" || record.flow === "delegation_recovery"
+    ? record.flow
+    : undefined;
+  const phase = record.phase === "start" || record.phase === "end" || record.phase === "mark" || record.phase === "complete"
+    ? record.phase
+    : undefined;
+  const outcome = record.outcome === "ok" || record.outcome === "error" || record.outcome === "signed_out"
+    ? record.outcome
+    : undefined;
+  const candidateStage = optionalString(record.stage);
+  const stage = candidateStage && STARTUP_TIMING_STAGES.has(candidateStage) ? candidateStage : undefined;
+  const clientTs = safeClientTimestamp(record.clientTs);
+  const elapsedMs = safeDuration(record.elapsedMs);
+  const durationMs = safeDuration(record.durationMs);
+  return {
+    ...(flow ? { flow } : {}),
+    ...(stage ? { stage } : {}),
+    ...(phase ? { phase } : {}),
+    ...(clientTs ? { clientTs } : {}),
+    ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(outcome ? { outcome } : {}),
+  };
+}
+
+function safeDuration(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 3_600_000
+    ? Math.round(value)
+    : undefined;
+}
+
+function safeClientTimestamp(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > 40 || !Number.isFinite(Date.parse(value))) return undefined;
+  return value;
 }
 
 function authorized(request: Request, token: string | undefined): boolean {
