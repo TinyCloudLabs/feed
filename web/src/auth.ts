@@ -1,7 +1,9 @@
 import {
   BrowserSessionStorage,
   composeManifestRequest,
+  PermissionNotInManifestError,
   serializeDelegation,
+  SessionExpiredError,
   TinyCloudWeb,
   type Config,
   type Manifest,
@@ -10,6 +12,7 @@ import type { providers } from "ethers";
 import { TINYCLOUD_HOST } from "./config.ts";
 import type { FeedHostDelegationPolicy, FeedHostDelegationReceipt } from "./delegation.ts";
 import { FeedV1HostClient } from "./feedV1HostClient.ts";
+import { errorDetail, reportClientEvent } from "./clientLog.ts";
 import { connectWallet } from "./openkey.ts";
 import {
   FEED_MANIFEST,
@@ -125,19 +128,28 @@ export async function submitFeedHostDelegations(input: {
         serializedDelegation: cached.serializedDelegation,
       })];
     } catch (error) {
+      // A stale cached blob (expired, superseded policy) is not fatal:
+      // materializing a fresh delegation below is silent, so fall through.
+      reportClientEvent("warn", "cached_delegation_rejected", errorDetail(error), input.actorId);
       clearCachedDelegations();
-      throw reconnectRequiredError(error);
     }
   }
 
-  const result = await instance.materializeDelegation(
-    input.policy.delegateDID,
-    feedCapabilityRequest(input.policy),
-  );
-  if (result.prompted) {
-    throw new Error("Feed Host delegation unexpectedly required another wallet approval");
+  let serializedDelegation: string;
+  try {
+    const result = await instance.materializeDelegation(
+      input.policy.delegateDID,
+      feedCapabilityRequest(input.policy),
+    );
+    if (result.prompted) {
+      throw new Error("Feed Host delegation unexpectedly required another wallet approval");
+    }
+    serializedDelegation = serializeDelegation(result.delegation);
+  } catch (error) {
+    reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId);
+    if (isSessionScopeError(error)) throw reconnectRequiredError(error);
+    throw error;
   }
-  const serializedDelegation = serializeDelegation(result.delegation);
   saveCachedDelegations({
     actorId: input.actorId,
     delegateDID: input.policy.delegateDID,
@@ -145,6 +157,14 @@ export async function submitFeedHostDelegations(input: {
     serializedDelegation,
   });
   return [await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation })];
+}
+
+// Session-scope failures (recap doesn't cover the policy, or the session is
+// expired/expiring) are fixed by signing in again — not by retrying.
+function isSessionScopeError(error: unknown): boolean {
+  if (error instanceof PermissionNotInManifestError || error instanceof SessionExpiredError) return true;
+  const name = (error as { name?: string } | null)?.name;
+  return name === "PermissionNotInManifestError" || name === "SessionExpiredError";
 }
 
 export async function signOut(): Promise<void> {

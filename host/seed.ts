@@ -36,7 +36,7 @@ export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostA
     body: {
       text: DEFAULT_REVIEWED_BUNDLE.artifactBodyText,
     },
-    sourceRefs: [DEFAULT_REVIEWED_BUNDLE.sourceRef as TranscriptSourceRef],
+    sourceRefs: [{ ...DEFAULT_REVIEWED_BUNDLE.sourceRef, quoteLineRefs: [...DEFAULT_REVIEWED_BUNDLE.sourceRef.quoteLineRefs] } as TranscriptSourceRef],
     producedBy: {
       packageId: pkg.packageId,
       packageVersion: pkg.version,
@@ -84,7 +84,7 @@ export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostA
     packageId: pkg.packageId,
     packageDigest: pkg.digest,
     status: "published",
-    sourceRefs: [DEFAULT_REVIEWED_BUNDLE.sourceRef as TranscriptSourceRef],
+    sourceRefs: [{ ...DEFAULT_REVIEWED_BUNDLE.sourceRef, quoteLineRefs: [...DEFAULT_REVIEWED_BUNDLE.sourceRef.quoteLineRefs] } as TranscriptSourceRef],
     publishedArtifactIds: [artifact.artifactId],
     droppedCandidates: [],
     spend: { budgetId: "default-reviewed-bundle", amount: 0, currency: "USD" },

@@ -31,8 +31,15 @@ import {
 } from "./delegation.ts";
 import { FeedHostDelegationStore } from "./delegation-store.ts";
 import { SEEDED_ARTIFACT_ID } from "./seed.ts";
-import { FeedHostError, type FeedHostActorStorage, type FeedHostStorage } from "./storage.ts";
+import {
+  DEFAULT_MAX_PENDING_GENERATION_REQUESTS,
+  FeedHostError,
+  type FeedHostActorStorage,
+  type FeedHostStorage,
+} from "./storage.ts";
 import { startFeedHost, type FeedHostRuntime } from "./server.ts";
+
+process.env.FEED_HOST_LOG = "0";
 
 const ACTOR_ID = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const OTHER_ACTOR_ID = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
@@ -548,6 +555,193 @@ describe("Feed Host server", () => {
     expect(resumedText).toContain(`id: projection:${SECOND_ARTIFACT_ID}:`);
   });
 
+  test("dev publisher imports a Feed v1 artifact for the single active actor", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      enableDevPublisher: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const artifact = makeArtifact({
+      artifactId: "run-dev-extract-insights:test-card",
+      packageId: "artifactory.extract-insights",
+      runId: "run-dev-extract-insights",
+      packageDigest: "sha256:extract-insights-dev",
+      createdAt: "2026-07-10T22:00:00.000Z",
+      updatedAt: "2026-07-10T22:00:00.000Z",
+      sourceFingerprint: "sha256:dev-source",
+      artifactFingerprint: "sha256:dev-artifact",
+      dedupeKey: "dev-dedupe",
+      docKey: "runs/run-dev-extract-insights/test-card.json",
+      title: "Dev Imported Insight",
+      summary: "A local extract-insights artifact imported through the dev bridge.",
+      bodyMarkdown: "Feed Host accepted a native Feed v1 artifact from a local Artifactory skill.",
+    });
+
+    const publish = await postJson(`${runtime.url}/admin/dev/publish-artifact`, { artifact });
+    expect(publish.status).toBe(200);
+    expect(await publish.json()).toMatchObject({
+      accepted: true,
+      artifactId: artifact.artifactId,
+      state: {
+        artifacts: 2,
+        projections: 2,
+      },
+    });
+
+    const feed = await getJson<{ items: Array<{ artifactId: string }> }>(`${runtime.url}/feed?limit=10`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(feed.items.some((item) => item.artifactId === artifact.artifactId)).toBe(true);
+
+    const hydrated = await getJson<FeedArtifact>(`${runtime.url}/artifacts/${encodeURIComponent(artifact.artifactId)}`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(hydrated.title).toBe("Dev Imported Insight");
+  });
+
+  test("dev generation worker endpoints list, claim, and complete requests", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      enableDevPublisher: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const intent = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "gen-worker-intent-001",
+        readerNonce: "gen-worker-nonce-001",
+        intentKind: "ask_feed",
+        targetRef: "feed",
+        payload: { prompt: "Summarize my week" },
+        createdAt: "2026-07-10T22:00:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+    expect(intent.status).toBe(202);
+    const intentBody = (await intent.json()) as { requestId?: string };
+    expect(intentBody.requestId).toBe("gen-worker-intent-001");
+
+    const accepted = await getJson<{ items: Array<{ requestId: string; status: string; prompt: string | null }> }>(
+      `${runtime.url}/admin/dev/generation-requests?status=accepted`,
+    );
+    expect(accepted.items).toHaveLength(1);
+    expect(accepted.items[0].requestId).toBe("gen-worker-intent-001");
+    expect(accepted.items[0].prompt).toBe("Summarize my week");
+
+    const claim = await postJson(`${runtime.url}/admin/dev/generation-requests/gen-worker-intent-001/status`, {
+      status: "pending",
+      expectedStatus: "accepted",
+    });
+    expect(claim.status).toBe(200);
+    expect(await claim.json()).toMatchObject({ updated: true, request: { status: "pending" } });
+
+    const doubleClaim = await postJson(`${runtime.url}/admin/dev/generation-requests/gen-worker-intent-001/status`, {
+      status: "pending",
+      expectedStatus: "accepted",
+    });
+    expect(doubleClaim.status).toBe(409);
+    expect(((await doubleClaim.json()) as { error: { code: string } }).error.code).toBe("status_conflict");
+
+    const complete = await postJson(`${runtime.url}/admin/dev/generation-requests/gen-worker-intent-001/status`, {
+      status: "consumed",
+    });
+    expect(complete.status).toBe(200);
+
+    const drained = await getJson<{ items: unknown[] }>(`${runtime.url}/admin/dev/generation-requests?status=accepted`);
+    expect(drained.items).toHaveLength(0);
+
+    const missing = await postJson(`${runtime.url}/admin/dev/generation-requests/nope/status`, { status: "consumed" });
+    expect(missing.status).toBe(404);
+
+    const invalid = await postJson(`${runtime.url}/admin/dev/generation-requests/gen-worker-intent-001/status`, {
+      status: "nonsense",
+    });
+    expect(invalid.status).toBe(400);
+  });
+
+  test("rejects new generation requests once the actor backlog is full", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      enableDevPublisher: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    for (let index = 0; index < DEFAULT_MAX_PENDING_GENERATION_REQUESTS; index++) {
+      const response = await postJson(
+        `${runtime.url}/control-intents`,
+        {
+          actorId: ACTOR_ID,
+          eventId: `backlog-intent-${index}`,
+          readerNonce: `backlog-nonce-${index}`,
+          intentKind: "ask_feed",
+          targetRef: "feed",
+          payload: { prompt: `Generate insight number ${index}` },
+          createdAt: "2026-07-10T22:00:00.000Z",
+        },
+        { "x-feed-actor-id": ACTOR_ID },
+      );
+      expect(response.status).toBe(202);
+    }
+
+    const overflow = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "backlog-intent-overflow",
+        readerNonce: "backlog-nonce-overflow",
+        intentKind: "ask_feed",
+        targetRef: "feed",
+        payload: { prompt: "One request too many" },
+        createdAt: "2026-07-10T22:00:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+    expect(overflow.status).toBe(429);
+    const overflowBody = (await overflow.json()) as { error: { code: string; details?: { pendingCount?: number } } };
+    expect(overflowBody.error.code).toBe("generation_backlog_full");
+
+    const consume = await postJson(`${runtime.url}/admin/dev/generation-requests/backlog-intent-0/status`, {
+      status: "consumed",
+    });
+    expect(consume.status).toBe(200);
+
+    const retry = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "backlog-intent-retry",
+        readerNonce: "backlog-nonce-retry",
+        intentKind: "ask_feed",
+        targetRef: "feed",
+        payload: { prompt: "Backlog drained, please generate" },
+        createdAt: "2026-07-10T22:05:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID },
+    );
+    expect(retry.status).toBe(202);
+  });
+
   test("binds delegations to the validated actor identity", async () => {
     runtime = startFeedHost({
       port: 0,
@@ -691,6 +885,76 @@ describe("Feed Host server", () => {
     });
     expect(feed.items).toHaveLength(1);
     expect(feed.items[0].artifactId).toBe(SEEDED_ARTIFACT_ID);
+  });
+
+  test("accepts one multi-resource delegation covering the full policy in a single submission", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const combined = policy.resources.map((resource) => resource.path).join("|");
+    const response = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: combined,
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { status: string; resources: string[] };
+    expect(body.status).toBe("active");
+    expect(body.resources.sort()).toEqual(policy.resources.map((resource) => resource.path).sort());
+
+    const feed = await getJson<{ items: unknown[] }>(`${runtime.url}/feed?limit=10`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(feed.items).toHaveLength(1);
+  });
+
+  test("restores a persisted multi-resource delegation with a single activation", async () => {
+    const store = fakeDelegationStore();
+    let activations = 0;
+    const serverOptions = () => ({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      hostNode: fakeHostNode(HOST_DID),
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }: { serializedDelegation: string }) => {
+        activations += 1;
+        return fakeActivatedDelegation(serializedDelegation);
+      },
+    });
+    runtime = startFeedHost(serverOptions());
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const combined = policy.resources.map((resource) => resource.path).join("|");
+    const future = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const stored = await (async () => {
+      await store.save({
+        actorId: ACTOR_ID.toLowerCase(),
+        delegateDID: policy.delegateDID,
+        policyHash: (await getJson<{ policyHash: string }>(`${runtime.url}/health`)).policyHash,
+        resources: policy.resources.map((resource) => ({
+          path: resource.path,
+          serializedDelegation: combined,
+          acceptedAt: new Date().toISOString(),
+          expiresAt: future,
+        })),
+      });
+      return store.load(ACTOR_ID.toLowerCase());
+    })();
+    expect(stored?.resources).toHaveLength(policy.resources.length);
+
+    activations = 0;
+    const feed = await getJson<{ items: unknown[] }>(`${runtime.url}/feed?limit=10`, {
+      "x-feed-actor-id": ACTOR_ID,
+    });
+    expect(feed.items).toHaveLength(1);
+    expect(activations).toBe(1);
   });
 
   test("prunes expired persisted delegations and requires re-delegation", async () => {
@@ -1154,6 +1418,7 @@ class FakeFeedHostStorage {
     const payload = plainObject(event.payload);
     let status = normalizedKind === "generate_new_request" ? "accepted" : "applied";
     let requestId: string | undefined;
+    let capError: FeedHostError | undefined;
 
     switch (normalizedKind) {
       case "set_artifact_visibility":
@@ -1207,6 +1472,22 @@ class FakeFeedHostStorage {
         break;
       }
       case "generate_new_request": {
+        const pendingCount = this.generationRequests.filter(
+          (row) =>
+            row.actor_id === event.actorId &&
+            (row.status === "accepted" || row.status === "pending") &&
+            row.expires_at > event.createdAt,
+        ).length;
+        if (pendingCount >= DEFAULT_MAX_PENDING_GENERATION_REQUESTS) {
+          capError = new FeedHostError(
+            `generation backlog is full (${pendingCount} pending); retry after requests complete`,
+            429,
+            "generation_backlog_full",
+            { pendingCount, limit: DEFAULT_MAX_PENDING_GENERATION_REQUESTS },
+          );
+          status = capError.code;
+          break;
+        }
         const request = buildGenerationRequestRecord({
           actorId: event.actorId,
           readerNonce: event.readerNonce,
@@ -1235,6 +1516,7 @@ class FakeFeedHostStorage {
       created_at: event.createdAt,
     };
     this.controlIntents.unshift(row);
+    if (capError) throw capError;
     return { eventId: event.eventId, duplicate: false, status: row.status, requestId };
   }
 
@@ -1242,8 +1524,55 @@ class FakeFeedHostStorage {
     return this.controlIntents.slice(0, Math.max(1, Math.min(limit, 500)));
   }
 
-  async listGenerationRequests(_actor: FeedHostActorStorage, limit = 100): Promise<StoredGenerationRequestRow[]> {
-    return this.generationRequests.slice(0, Math.max(1, Math.min(limit, 500)));
+  async listGenerationRequests(
+    _actor: FeedHostActorStorage,
+    limit = 100,
+    filter: { status?: string; excludeExpired?: boolean; order?: "asc" | "desc" } = {},
+  ): Promise<StoredGenerationRequestRow[]> {
+    const now = new Date().toISOString();
+    let rows = this.generationRequests.filter(
+      (row) =>
+        (filter.status === undefined || row.status === filter.status) &&
+        (!filter.excludeExpired || row.expires_at > now),
+    );
+    rows = [...rows].sort((left, right) =>
+      filter.order === "asc"
+        ? left.created_at.localeCompare(right.created_at)
+        : right.created_at.localeCompare(left.created_at),
+    );
+    return rows.slice(0, Math.max(1, Math.min(limit, 500)));
+  }
+
+  async updateGenerationRequestStatus(
+    _actor: FeedHostActorStorage,
+    input: { requestId: string; status: string; expectedStatus?: string; updatedAt: string },
+  ): Promise<Record<string, unknown>> {
+    const row = this.generationRequests.find((candidate) => candidate.request_id === input.requestId);
+    if (!row) {
+      throw new FeedHostError(`generation request not found: ${input.requestId}`, 404, "not_found");
+    }
+    if (input.expectedStatus !== undefined && row.status !== input.expectedStatus) {
+      throw new FeedHostError(
+        `generation request status is ${row.status}, expected ${input.expectedStatus}`,
+        409,
+        "status_conflict",
+      );
+    }
+    row.status = input.status;
+    row.updated_at = input.updatedAt;
+    return {
+      requestId: row.request_id,
+      readerNonce: row.reader_nonce,
+      actorId: row.actor_id,
+      status: row.status,
+      scope: JSON.parse(row.scope_json) as Record<string, unknown>,
+      packageId: row.package_id,
+      dedupeKey: row.dedupe_key,
+      prompt: row.prompt,
+      expiresAt: row.expires_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
   }
 
   async listFeedEvents(_actor: FeedHostActorStorage, afterEventId?: string): Promise<string> {
@@ -1452,12 +1781,14 @@ type StoredGenerationRequestRow = {
   updated_at: string;
 };
 
+// A serialized delegation may cover several resources (one signed UCAN with a
+// multi-entry att claim); the fake models that with a "|"-joined path list.
 function fakeActivatedDelegation(resource: string, expiresInMs = 60 * 60 * 1000): ActivatedFeedDelegation {
   return {
     actorId: ACTOR_ID,
     acceptedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
-    resources: [resource],
+    resources: resource.split("|"),
     portableDelegation: {} as ActivatedFeedDelegation["portableDelegation"],
     access: { resource } as unknown as ActivatedFeedDelegation["access"],
   };

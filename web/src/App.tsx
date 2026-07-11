@@ -13,6 +13,7 @@ import {
   type FeedSession,
 } from "./auth.ts";
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
+import { errorDetail, reportClientEvent } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
 import {
   FeedV1HostClient,
@@ -99,6 +100,7 @@ export function App() {
       setLoadError(null);
       setLoadState("ready");
     } catch (error) {
+      reportClientEvent("error", "feed_load_failed", errorDetail(error), session.readerDid);
       setLoadState("error");
       setLoadError(formatHostError(error));
     } finally {
@@ -132,14 +134,16 @@ export function App() {
       } catch (error) {
         console.error("[Feed setup]", error);
         if (isFeedReconnectRequiredError(error)) {
+          reportClientEvent("warn", "feed_reconnect_required", errorDetail(error), session.readerDid);
           await signOut().catch(() => undefined);
           setSession(null);
           setSignInError(error.message);
           resetFeedState();
           return;
         }
+        reportClientEvent("error", "feed_setup_failed", errorDetail(error), session.readerDid);
         setFeedState("error");
-        setSetupError("Feed could not finish connecting. Check your connection and try again.");
+        setSetupError(`Feed could not finish connecting (${errorDetail(error)}). Check your connection and try again.`);
       } finally {
         setupInFlight.current = false;
       }
@@ -196,6 +200,7 @@ export function App() {
       resetFeedState();
       setSession(await signIn(nextPolicy));
     } catch (error) {
+      reportClientEvent("error", "sign_in_failed", errorDetail(error));
       setSignInError(error instanceof Error ? error.message : String(error));
     }
   };
