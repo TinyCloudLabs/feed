@@ -27,6 +27,7 @@ type FeedState = "idle" | "starting" | "running" | "error";
 type SetupStage = "identity" | "context" | "preparing";
 
 const FEED_EVENTS_RETRY_MS = 5000;
+const RECOVERY_COOLDOWN_MS = 30_000;
 
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
@@ -51,6 +52,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef(false);
+  const lastRecoveryAt = useRef(0);
 
   const client = useMemo(
     () => new FeedV1HostClient({ baseUrl: FEED_HOST_URL, token: FEED_HOST_TOKEN || undefined, actorId: session?.readerDid }),
@@ -79,6 +81,27 @@ export function App() {
     };
   }, []);
 
+  // The host holds delegations in memory; a restart (or expiry) turns every
+  // call into 403 insufficient_policy. Delegation minting is silent now, so
+  // recover by refetching the policy and re-running setup — no user prompts.
+  // Cooldown keeps a genuinely broken delegation from looping forever.
+  const recoverDelegation = useCallback(async (): Promise<boolean> => {
+    const now = Date.now();
+    if (now - lastRecoveryAt.current < RECOVERY_COOLDOWN_MS) return false;
+    lastRecoveryAt.current = now;
+    reportClientEvent("warn", "delegation_lost_recovering", undefined, session?.readerDid);
+    try {
+      const nextPolicy = await client.getDelegationPolicy();
+      setFeedState("starting");
+      setSetupStage("context");
+      setPolicy(nextPolicy);
+      return true;
+    } catch (error) {
+      reportClientEvent("error", "delegation_recovery_failed", errorDetail(error), session?.readerDid);
+      return false;
+    }
+  }, [client, session]);
+
   const loadFeed = useCallback(async () => {
     if (!session || feedLoadInFlight.current) return;
     feedLoadInFlight.current = true;
@@ -100,13 +123,17 @@ export function App() {
       setLoadError(null);
       setLoadState("ready");
     } catch (error) {
+      if (isDelegationLostError(error)) {
+        feedLoadInFlight.current = false;
+        if (await recoverDelegation()) return;
+      }
       reportClientEvent("error", "feed_load_failed", errorDetail(error), session.readerDid);
       setLoadState("error");
       setLoadError(formatHostError(error));
     } finally {
       feedLoadInFlight.current = false;
     }
-  }, [client, session]);
+  }, [client, recoverDelegation, session]);
 
   const resetFeedState = useCallback(() => {
     setFeedState("idle");
@@ -177,6 +204,10 @@ export function App() {
         }
       } catch (error) {
         if (!cancelled) {
+          if (isDelegationLostError(error) && (await recoverDelegation())) {
+            // Setup restarts; feedState leaves "running" and this loop unwinds.
+            return;
+          }
           setLoadState("error");
           setLoadError(formatHostError(error));
         }
@@ -190,7 +221,7 @@ export function App() {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [client, feedState, loadFeed, session]);
+  }, [client, feedState, loadFeed, recoverDelegation, session]);
 
   const connect = async () => {
     setSignInError(null);
@@ -535,6 +566,15 @@ function StatusScreen({
 function formatHostError(error: unknown): string {
   if (error instanceof FeedV1HostError) return `${error.status}: ${error.body || error.message}`;
   return error instanceof Error ? error.message : String(error);
+}
+
+// The host reports a missing/stale delegation as 403 insufficient_policy or
+// denied, or 409 delegation_stale — all recoverable by re-submitting.
+function isDelegationLostError(error: unknown): boolean {
+  if (!(error instanceof FeedV1HostError)) return false;
+  if (error.status === 409) return error.body.includes("delegation_stale");
+  if (error.status === 403) return error.body.includes("insufficient_policy") || error.body.includes("denied");
+  return false;
 }
 
 function SkillCredentialsPanel({
