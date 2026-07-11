@@ -64,6 +64,18 @@ export const FEED_HOST_DELEGATION_RESOURCES = [
   {
     service: "tinycloud.sql",
     serviceShort: "sql",
+    path: "xyz.tinycloud.listen/conversations",
+    actions: ["tinycloud.sql/read"],
+  },
+  {
+    service: "tinycloud.kv",
+    serviceShort: "kv",
+    path: "xyz.tinycloud.listen/transcript/",
+    actions: ["tinycloud.kv/get", "tinycloud.kv/list"],
+  },
+  {
+    service: "tinycloud.sql",
+    serviceShort: "sql",
     path: LEGACY_FEED_DB_PATH,
     actions: ["tinycloud.sql/read"],
   },
