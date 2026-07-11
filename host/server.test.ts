@@ -37,7 +37,12 @@ import {
   type FeedHostActorStorage,
   type FeedHostStorage,
 } from "./storage.ts";
-import { startFeedHost, type FeedHostRuntime } from "./server.ts";
+import {
+  sanitizeClientTimingFields,
+  sanitizeTraceId,
+  startFeedHost,
+  type FeedHostRuntime,
+} from "./server.ts";
 
 process.env.FEED_HOST_LOG = "0";
 
@@ -75,6 +80,33 @@ afterEach(() => {
 });
 
 describe("Feed Host server", () => {
+  test("allowlists startup timing fields and rejects planted sensitive values", () => {
+    const planted = "PLANTED_SECRET_serialized_delegation";
+    expect(sanitizeTraceId("feed_1234-abcd")).toBe("feed_1234-abcd");
+    expect(sanitizeTraceId(planted)).toBeUndefined();
+    expect(sanitizeClientTimingFields({
+      flow: "interactive_sign_in",
+      stage: "delegation_materialize",
+      phase: "end",
+      clientTs: "2026-07-11T12:00:00.000Z",
+      elapsedMs: 127.4,
+      durationMs: 42.8,
+      outcome: "ok",
+      detail: planted,
+      serializedDelegation: planted,
+      transcript: planted,
+    })).toEqual({
+      flow: "interactive_sign_in",
+      stage: "delegation_materialize",
+      phase: "end",
+      clientTs: "2026-07-11T12:00:00.000Z",
+      elapsedMs: 127,
+      durationMs: 43,
+      outcome: "ok",
+    });
+    expect(JSON.stringify(sanitizeClientTimingFields({ stage: planted, detail: planted }))).not.toContain(planted);
+  });
+
   test("serves public metadata and an OpenAPI document that matches the host routes", async () => {
     runtime = startFeedHost({
       port: 0,

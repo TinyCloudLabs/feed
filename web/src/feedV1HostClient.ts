@@ -69,6 +69,7 @@ export type FeedV1HostClientOptions = {
   token?: string;
   actorId?: string;
   fetchImpl?: typeof fetch;
+  traceId?: () => string | undefined;
 };
 
 export class FeedV1HostError extends Error {
@@ -93,12 +94,14 @@ export class FeedV1HostClient {
   private readonly fetchImpl: typeof fetch;
   private readonly token?: string;
   private readonly actorId?: string;
+  private readonly traceId?: () => string | undefined;
 
   constructor(options: FeedV1HostClientOptions) {
     this.baseUrl = normalizeBaseUrl(options.baseUrl);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.token = options.token;
     this.actorId = options.actorId;
+    this.traceId = options.traceId;
   }
 
   async getDelegationPolicy(): Promise<FeedHostDelegationPolicy> {
@@ -184,6 +187,8 @@ export class FeedV1HostClient {
     if (init.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
     if (this.token) headers.set("authorization", `Bearer ${this.token}`);
     if (this.actorId) headers.set("x-feed-actor-id", this.actorId);
+    const traceId = this.traceId?.();
+    if (traceId) headers.set("x-feed-trace-id", traceId);
     const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers });
     const text = await res.text();
     if (!res.ok) throw new FeedV1HostError(`Feed Host request failed: ${res.status}`, res.status, text);

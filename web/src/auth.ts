@@ -13,6 +13,7 @@ import { TINYCLOUD_HOST } from "./config.ts";
 import type { FeedHostDelegationPolicy, FeedHostDelegationReceipt } from "./delegation.ts";
 import { FeedV1HostClient } from "./feedV1HostClient.ts";
 import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import type { StartupTrace } from "./startupTiming.ts";
 import { connectWallet } from "./openkey.ts";
 import {
   FEED_MANIFEST,
@@ -84,10 +85,10 @@ function savedAddress(): string | null {
   }
 }
 
-export async function signIn(policy: FeedHostDelegationPolicy): Promise<FeedSession> {
-  const { address, web3Provider } = await connectWallet();
+export async function signIn(policy: FeedHostDelegationPolicy, timing?: StartupTrace): Promise<FeedSession> {
+  const { address, web3Provider } = await measured(timing, "wallet_connect", () => connectWallet());
   const tc = new TinyCloudWeb(buildConfig(web3Provider, policy));
-  await tc.signIn();
+  await measured(timing, "tinycloud_sign_in", () => tc.signIn());
   instance = tc;
   try {
     localStorage.setItem(LAST_ADDRESS_KEY, address);
@@ -97,11 +98,11 @@ export async function signIn(policy: FeedHostDelegationPolicy): Promise<FeedSess
   return { address, readerDid: tc.did };
 }
 
-export async function restoreSession(policy?: FeedHostDelegationPolicy): Promise<FeedSession | null> {
+export async function restoreSession(policy?: FeedHostDelegationPolicy, timing?: StartupTrace): Promise<FeedSession | null> {
   const address = savedAddress();
   if (!address) return null;
   const tc = new TinyCloudWeb(buildConfig(undefined, policy));
-  const result = await tc.restoreSession(address);
+  const result = await measured(timing, "tinycloud_session_restore", () => tc.restoreSession(address));
   if (result.status !== "restored") {
     try {
       localStorage.removeItem(LAST_ADDRESS_KEY);
@@ -118,15 +119,16 @@ export async function submitFeedHostDelegations(input: {
   client: FeedV1HostClient;
   policy: FeedHostDelegationPolicy;
   actorId: string;
+  timing?: StartupTrace;
 }): Promise<FeedHostDelegationReceipt[]> {
   if (!instance) throw new Error("TinyCloud session is required before creating Feed Host delegations");
   const cached = cachedDelegations(input.actorId, input.policy);
   if (cached) {
     try {
-      return [await input.client.submitDelegation({
+      return [await measured(input.timing, "cached_delegation_submit", () => input.client.submitDelegation({
         actorId: input.actorId,
         serializedDelegation: cached.serializedDelegation,
-      })];
+      }))];
     } catch (error) {
       // A stale cached blob (expired, superseded policy) is not fatal:
       // materializing a fresh delegation below is silent, so fall through.
@@ -137,10 +139,10 @@ export async function submitFeedHostDelegations(input: {
 
   let serializedDelegation: string;
   try {
-    const result = await instance.materializeDelegation(
+    const result = await measured(input.timing, "delegation_materialize", () => instance!.materializeDelegation(
       input.policy.delegateDID,
       feedCapabilityRequest(input.policy),
-    );
+    ));
     if (result.prompted) {
       throw new Error("Feed Host delegation unexpectedly required another wallet approval");
     }
@@ -156,7 +158,14 @@ export async function submitFeedHostDelegations(input: {
     resources: input.policy.resources.map(({ path, actions }) => ({ path, actions })),
     serializedDelegation,
   });
-  return [await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation })];
+  return [await measured(input.timing, "delegation_submit", () => input.client.submitDelegation({
+    actorId: input.actorId,
+    serializedDelegation,
+  }))];
+}
+
+function measured<T>(timing: StartupTrace | undefined, stage: string, operation: () => Promise<T>): Promise<T> {
+  return timing ? timing.measure(stage, operation) : operation();
 }
 
 // Session-scope failures (recap doesn't cover the policy, or the session is
