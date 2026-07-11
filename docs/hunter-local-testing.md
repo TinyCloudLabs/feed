@@ -164,7 +164,7 @@ Hunter must generate. The link embeds a new private session key and a signed,
 expiring delegation for that key. Treat the whole handoff directory as a
 password.
 
-The generated handoff is kept outside Git at:
+The generated handoff and transfer archive are kept outside Git at:
 
 ```text
 .context/hunter-transcript-share/
@@ -173,12 +173,15 @@ The generated handoff is kept outside Git at:
 ├── package.json
 ├── read-transcripts.mjs
 └── share.json
+.context/hunter-transcript-share.zip
 ```
 
-Sam transfers that directory to Hunter through the secure channel. Hunter then
-runs, from inside the transferred directory:
+Sam transfers `hunter-transcript-share.zip` through the secure channel. Hunter
+then extracts it and runs, from inside the transferred directory:
 
 ```sh
+unzip hunter-transcript-share.zip
+cd hunter-transcript-share
 bun install
 bun read-transcripts.mjs ./share.json ./transcripts
 ```
