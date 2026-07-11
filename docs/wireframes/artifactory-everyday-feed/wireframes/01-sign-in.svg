@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800"
+     font-family="-apple-system, system-ui, sans-serif" fill="#fff" stroke="#000" stroke-width="1.5">
+  <!-- viewport: desktop 1280x800; all layout coordinates follow an 8px grid -->
+  <rect x="0" y="0" width="1280" height="800" />
+
+  <!-- 1: minimal product header -->
+  <g transform="translate(48,32)" data-region="header">
+    <rect width="32" height="32" rx="4" fill="#e6e6e6" />
+    <text x="48" y="24" font-size="20" font-weight="600" stroke="none" fill="#000">Feed</text>
+    <text x="1136" y="24" font-size="14" text-anchor="end" stroke="none" fill="#666">How privacy works</text>
+  </g>
+
+  <!-- 2: promise -->
+  <g transform="translate(160,208)" data-region="promise">
+    <text x="0" y="32" font-size="28" font-weight="700" stroke="none" fill="#000">A useful feed from your private context.</text>
+    <text x="0" y="72" font-size="14" stroke="none" fill="#666">Read ideas, ask questions, and shape what Feed makes for you.</text>
+    <text x="0" y="96" font-size="14" stroke="none" fill="#666">Your source data stays in TinyCloud.</text>
+    <rect x="0" y="144" width="440" height="232" rx="6" fill="#e6e6e6" />
+    <line x1="0" y1="144" x2="440" y2="376" stroke="#666" />
+    <line x1="440" y1="144" x2="0" y2="376" stroke="#666" />
+  </g>
+
+  <!-- 3: single sign-in action -->
+  <g transform="translate(760,208)" data-region="sign-in">
+    <rect width="360" height="328" rx="6" />
+    <text x="32" y="48" font-size="20" font-weight="600" stroke="none" fill="#000">Start your Feed</text>
+    <text x="32" y="80" font-size="14" stroke="none" fill="#666">One sign-in connects the services Feed needs.</text>
+    <g transform="translate(32,120)">
+      <rect width="296" height="48" rx="4" fill="#000" />
+      <text x="144" y="32" font-size="14" font-weight="600" text-anchor="middle" stroke="none" fill="#fff">Sign in with OpenKey</text>
+    </g>
+    <line x1="32" y1="200" x2="328" y2="200" stroke="#666" />
+    <text x="32" y="232" font-size="12" stroke="none" fill="#666">Feed will automatically:</text>
+    <text x="32" y="264" font-size="14" stroke="none" fill="#000">✓ Read the context you choose</text>
+    <text x="32" y="288" font-size="14" stroke="none" fill="#000">✓ Save your feed and preferences</text>
+    <text x="32" y="312" font-size="12" stroke="none" fill="#666">Review or revoke access anytime from your account menu.</text>
+  </g>
+
+  <!-- 4: annotation layer -->
+  <g data-region="annotations">
+    <circle cx="40" cy="24" r="12" fill="#fff" stroke="#d33" stroke-dasharray="4 2" /><text x="40" y="28" font-size="12" font-weight="700" text-anchor="middle" stroke="none" fill="#d33">1</text>
+    <circle cx="144" cy="200" r="12" fill="#fff" stroke="#d33" stroke-dasharray="4 2" /><text x="144" y="204" font-size="12" font-weight="700" text-anchor="middle" stroke="none" fill="#d33">2</text>
+    <circle cx="744" cy="200" r="12" fill="#fff" stroke="#d33" stroke-dasharray="4 2" /><text x="744" y="204" font-size="12" font-weight="700" text-anchor="middle" stroke="none" fill="#d33">3</text>
+  </g>
+</svg>

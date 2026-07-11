@@ -1,0 +1,598 @@
+<!doctype html>
+<!-- Wireframe review viewer based on the Paperclip bundled wireframe site template. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Everyday Feed journey — wireframe review</title>
+<style>
+  :root { --bg:#fafaf8; --panel:#fff; --ink:#111; --muted:#666; --line:#e5e5e0; --accent:#d33; --maxw:1200px; }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  html, body { margin:0; padding:0; }
+  body { font:15px/1.55 -apple-system,system-ui,"Segoe UI",sans-serif; background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased; }
+  a { color:inherit; }
+  .shell { display:grid; grid-template-columns:240px 1fr; min-height:100vh; }
+  .toc { position:sticky; top:0; align-self:start; height:100vh; overflow:auto; padding:24px 16px 24px 24px; border-right:1px solid var(--line); background:var(--panel); font-size:13px; z-index:20; }
+  .toc h1 { font-size:14px; margin:0 0 4px; color:var(--muted); }
+  .toc h2 { font-size:12px; margin:24px 0 6px; color:var(--muted); font-weight:700; }
+  .toc a { display:block; text-decoration:none; padding:6px 8px; margin-left:-8px; border-radius:4px; }
+  .toc a:hover, .toc a:focus-visible { background:var(--bg); outline:none; }
+  .toc .num { display:inline-block; width:22px; color:var(--muted); }
+  .toc .toc-summary { display:none; }
+  .toc .toc-body { display:block; }
+  main { padding:48px 56px 96px; max-width:1300px; min-width:0; }
+  .hero { max-width:var(--maxw); margin-bottom:64px; }
+  .hero .crumb { color:var(--muted); font-size:12px; }
+  .hero h1 { font-size:36px; line-height:1.15; letter-spacing:-.02em; margin:8px 0 16px; text-wrap:balance; }
+  .hero p { color:var(--muted); max-width:720px; font-size:16px; text-wrap:pretty; }
+  .pills { margin-top:20px; display:flex; gap:8px; flex-wrap:wrap; }
+  .pill { font-size:12px; padding:4px 10px; border:1px solid var(--line); border-radius:999px; background:var(--panel); color:var(--muted); }
+  section { scroll-margin-top:24px; max-width:var(--maxw); margin-bottom:96px; }
+  section h2 { font-size:28px; line-height:1.2; letter-spacing:-.02em; margin:0 0 8px; text-wrap:balance; }
+  section h2 .step-num { display:inline-block; width:40px; color:var(--muted); }
+  section h3 { font-size:16px; margin:24px 0 8px; }
+  section .desc { color:var(--muted); margin:0 0 24px; max-width:760px; text-wrap:pretty; }
+  .grid { display:grid; gap:24px; grid-template-columns:minmax(0,1.4fr) 220px minmax(240px,.9fr); align-items:start; }
+  .wire { background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; cursor:zoom-in; transition:transform 160ms cubic-bezier(.16,1,.3,1); }
+  .wire:hover { transform:translateY(-2px); }
+  .wire:focus-within { outline:2px solid var(--ink); outline-offset:2px; }
+  .wire .label { padding:10px 14px; font-size:12px; color:var(--muted); border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:8px; }
+  .wire img { display:block; width:100%; height:auto; background:#fff; }
+  .mobile-wire img { max-width:220px; margin:0 auto; }
+  .notes ul { padding-left:20px; margin:8px 0; }
+  .notes li { margin-bottom:8px; }
+  .why { background:var(--panel); border:2px solid var(--ink); padding:14px 16px; border-radius:4px; margin-top:16px; font-size:14px; }
+  .flow-section { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:32px; margin-bottom:64px; max-width:var(--maxw); }
+  .flow-section h2 { margin-top:0; }
+  .flow-steps { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); margin:24px 0; border:1px solid var(--ink); border-radius:6px; overflow:hidden; }
+  .flow-step { min-height:64px; padding:8px; border:0; border-right:1px solid var(--ink); background:var(--panel); color:var(--ink); cursor:pointer; text-align:left; }
+  .flow-step:last-child { border-right:0; }
+  .flow-step:hover { background:var(--bg); }
+  .flow-step[aria-selected="true"] { background:var(--ink); color:var(--panel); }
+  .flow-step:focus-visible, .flow-control:focus-visible { outline:2px solid var(--ink); outline-offset:-4px; }
+  .flow-step .flow-number { display:block; margin-bottom:3px; font-size:12px; opacity:.72; }
+  .flow-step .flow-name { display:block; font-size:13px; font-weight:600; }
+  .flow-player { display:grid; grid-template-columns:300px minmax(0,1fr); gap:40px; align-items:center; padding-top:8px; }
+  .flow-device { width:300px; justify-self:center; border:1px solid var(--line); border-radius:10px; overflow:hidden; background:var(--panel); touch-action:pan-y; }
+  .flow-device-label { display:flex; justify-content:space-between; gap:8px; padding:8px 10px; border-bottom:1px solid var(--line); color:var(--muted); font-size:12px; }
+  .flow-device img { display:block; width:100%; height:auto; background:#fff; }
+  .flow-story { max-width:600px; }
+  .flow-position { margin:0 0 8px; color:var(--muted); font-size:13px; font-variant-numeric:tabular-nums; }
+  .flow-story h3 { margin:0; font-size:24px; line-height:1.2; letter-spacing:-.02em; text-wrap:balance; }
+  .flow-summary { margin:12px 0 20px; color:var(--muted); max-width:62ch; text-wrap:pretty; }
+  .flow-story h4 { margin:18px 0 6px; font-size:14px; }
+  .flow-story ul { margin:0; padding-left:20px; }
+  .flow-story li { margin:5px 0; }
+  .flow-invisible { margin-top:20px; padding:14px 16px; border:2px solid var(--ink); border-radius:4px; }
+  .flow-invisible strong { display:block; margin-bottom:3px; }
+  .flow-invisible p { margin:0; color:var(--muted); }
+  .flow-controls { display:flex; gap:8px; margin-top:24px; }
+  .flow-control { min-height:44px; min-width:104px; border:1.5px solid var(--ink); border-radius:4px; background:var(--panel); color:var(--ink); padding:8px 16px; cursor:pointer; }
+  .flow-control.primary { background:var(--ink); color:var(--panel); }
+  .flow-control:disabled { opacity:.35; cursor:not-allowed; }
+  .feature-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; margin:24px 0 40px; padding:0; list-style:none; }
+  .feature-list li { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+  .feature-list strong { display:block; margin-bottom:4px; }
+  .feature-list p { margin:0; color:var(--muted); font-size:14px; }
+  .feature-horizon { display:inline-block; margin-top:10px; font-size:11px; color:var(--muted); }
+  .feature-steps { display:flex; flex-wrap:wrap; margin:24px 0; border:1px solid var(--ink); border-radius:6px; overflow:hidden; }
+  .feature-step { flex:1 1 104px; min-height:64px; padding:8px; border:0; border-right:1px solid var(--ink); border-bottom:1px solid var(--ink); background:var(--panel); color:var(--ink); cursor:pointer; text-align:left; }
+  .feature-step:last-child { border-right:0; }
+  .feature-step:hover { background:var(--bg); }
+  .feature-step[aria-selected="true"] { background:var(--ink); color:var(--panel); }
+  .feature-step:focus-visible { outline:2px solid var(--ink); outline-offset:-4px; }
+  .feature-step .flow-number { display:block; margin-bottom:3px; font-size:12px; opacity:.72; }
+  .feature-step .flow-name { display:block; font-size:13px; font-weight:600; }
+  .feature-gallery { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:24px; }
+  .feature-gallery .wire { cursor:zoom-in; }
+  .feature-gallery .wire img { width:min(100%,260px); margin:0 auto; }
+  .feature-gallery .feature-caption { padding:14px; border-top:1px solid var(--line); }
+  .feature-gallery .feature-caption strong { display:block; }
+  .feature-gallery .feature-caption span { color:var(--muted); font-size:13px; }
+  .questions { columns:2; column-gap:40px; }
+  .questions li { break-inside:avoid; margin-bottom:12px; }
+  .footer { color:var(--muted); font-size:12px; max-width:var(--maxw); border-top:1px solid var(--line); padding-top:24px; }
+  .lightbox { position:fixed; inset:0; background:rgba(0,0,0,.86); display:none; align-items:center; justify-content:center; z-index:100; cursor:zoom-out; padding:32px; }
+  .lightbox.open { display:flex; }
+  .lightbox img { max-width:100%; max-height:100%; background:#fff; border-radius:4px; }
+  .lightbox .close { position:absolute; top:16px; right:24px; font-size:28px; color:#fff; cursor:pointer; background:transparent; border:0; min-width:44px; min-height:44px; }
+  .lightbox .caption { position:absolute; bottom:16px; left:50%; transform:translateX(-50%); color:#fff; font-size:13px; text-align:center; }
+  @media (max-width:1180px) { .grid { grid-template-columns:minmax(0,1fr) 200px; } .grid > .notes-col { grid-column:1/-1; } }
+  @media (max-width:980px) { .grid { grid-template-columns:1fr; } .grid > .mobile-col { max-width:280px; } }
+  @media (max-width:900px) {
+    .shell { grid-template-columns:1fr; }
+    .toc { position:sticky; top:0; height:auto; max-height:60vh; padding:12px 16px; border-right:0; border-bottom:1px solid var(--line); }
+    body.flow-focused .toc { position:relative; }
+    body.flow-focused #flow { scroll-margin-top:0; }
+    .toc .toc-summary { display:flex; justify-content:space-between; align-items:center; cursor:pointer; list-style:none; padding:4px 0; }
+    .toc .toc-summary::-webkit-details-marker { display:none; }
+    .toc .toc-summary .title { font-size:13px; font-weight:600; }
+    .toc .toc-summary .crumb { font-size:11px; color:var(--muted); }
+    .toc .toc-summary .chevron { width:10px; height:10px; border-right:1.5px solid var(--ink); border-bottom:1.5px solid var(--ink); transform:rotate(45deg); transition:transform 120ms ease; margin-right:4px; }
+    .toc[open] .toc-summary .chevron { transform:rotate(225deg) translate(-2px,-2px); }
+    .toc .toc-body { display:none; padding-top:8px; border-top:1px solid var(--line); margin-top:8px; }
+    .toc[open] .toc-body { display:block; }
+    main { padding:24px 20px 64px; }
+    .hero { margin-bottom:40px; }
+    .hero h1 { font-size:28px; }
+    section { margin-bottom:64px; scroll-margin-top:80px; }
+    section h2 { font-size:24px; }
+    .flow-section { padding:20px; margin-bottom:40px; scroll-margin-top:80px; }
+    .flow-steps { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .flow-step:nth-child(3n) { border-right:0; }
+    .flow-step:nth-child(-n+3) { border-bottom:1px solid var(--ink); }
+    .flow-player { grid-template-columns:280px minmax(0,1fr); gap:28px; }
+    .flow-device { width:280px; }
+  }
+  @media (max-width:560px) {
+    main { padding:16px 14px 56px; }
+    .hero { margin-bottom:32px; }
+    .hero h1 { font-size:24px; }
+    .hero p, section .desc { font-size:14px; }
+    section { margin-bottom:48px; }
+    section h2 { font-size:20px; }
+    section h2 .step-num { width:28px; }
+    .grid { gap:16px; }
+    .flow-section { padding:16px; border-radius:8px; }
+    .flow-steps { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .flow-step { border-right:1px solid var(--ink); border-bottom:1px solid var(--ink); }
+    .flow-step:nth-child(2n) { border-right:0; }
+    .flow-step:nth-last-child(-n+2) { border-bottom:0; }
+    .flow-player { grid-template-columns:1fr; gap:24px; }
+    .flow-device { width:min(100%,300px); grid-row:1; }
+    .flow-story { grid-row:2; }
+    .flow-story h3 { font-size:20px; }
+    .flow-controls { display:grid; grid-template-columns:1fr 1fr; }
+    .flow-control { width:100%; }
+    .questions { columns:1; }
+    .lightbox { padding:12px; overflow:auto; touch-action:pinch-zoom; }
+    .lightbox.open { display:block; }
+    .lightbox img { display:block; width:100%; max-width:none; max-height:none; height:auto; margin:40px auto 56px; }
+    .lightbox .close { position:fixed; top:8px; right:12px; font-size:32px; }
+    .lightbox .caption { position:fixed; bottom:12px; background:rgba(0,0,0,.7); border-radius:4px; padding:6px 12px; }
+  }
+  @media (prefers-reduced-motion:reduce) { html { scroll-behavior:auto; } *, *::before, *::after { transition:none !important; } }
+</style>
+</head>
+<body>
+<div class="shell">
+  <details class="toc">
+    <summary class="toc-summary"><span><span class="crumb">Feed UX · wireframes</span><br><span class="title">Jump to a screen</span></span><span class="chevron" aria-hidden="true"></span></summary>
+    <nav class="toc-body" aria-label="Wireframe sections">
+      <h1>Everyday Feed</h1>
+      <div style="color:var(--muted);margin-bottom:16px">One sign-in; invisible delegation</div>
+      <h2>Flow</h2><a href="#flow"><span class="num">⤳</span>Journey overview</a>
+      <h2>Hunter proposals</h2>
+      <a href="#hunter-list"><span class="num">8</span>Feature short list</a>
+      <a href="#hunter-features"><span class="num">⤳</span>Feature walkthrough</a>
+      <a href="#hunter-gallery"><span class="num">▦</span>Mobile page gallery</a>
+      <h2>Screens</h2>
+      <a href="#s1"><span class="num">1</span>Sign in</a>
+      <a href="#s2"><span class="num">2</span>Automatic setup</a>
+      <a href="#s3"><span class="num">3</span>Feed home</a>
+      <a href="#s4"><span class="num">4</span>Ask Feed</a>
+      <a href="#s5"><span class="num">5</span>Artifact detail</a>
+      <a href="#s6"><span class="num">6</span>Access &amp; automation</a>
+      <h2>Decisions</h2><a href="#open"><span class="num">?</span>Open questions</a>
+    </nav>
+  </details>
+  <main>
+    <header class="hero">
+      <div class="crumb">Feed UX · Wireframe review</div>
+      <h1>Artifactory disappears into an everyday Feed</h1>
+      <p>The user signs in once, lands in useful content, and calls on Artifactory through familiar Feed actions. Delegation, bundles, and agent plumbing run automatically; authority details remain available from an optional menu.</p>
+      <div class="pills"><span class="pill">6-view core journey</span><span class="pill">8 Hunter feature pages</span><span class="pill">Mobile-first</span><span class="pill">Lo-fi · monochrome</span><span class="pill">Click any wireframe to zoom</span></div>
+    </header>
+
+    <section id="flow" class="flow-section">
+      <h2>Walk through everyday Feed</h2>
+      <p class="desc">Choose a step to move between the mobile views. The primary path is sign in → automatic setup → Feed; Ask, artifact detail, and access controls are entered from Feed when needed.</p>
+      <div class="flow-steps" id="flowSteps" role="tablist" aria-label="Feed journey steps">
+        <button class="flow-step" type="button" role="tab" aria-selected="true" data-flow-step="0"><span class="flow-number">1</span><span class="flow-name">Sign in</span></button>
+        <button class="flow-step" type="button" role="tab" aria-selected="false" data-flow-step="1"><span class="flow-number">2</span><span class="flow-name">Setup</span></button>
+        <button class="flow-step" type="button" role="tab" aria-selected="false" data-flow-step="2"><span class="flow-number">3</span><span class="flow-name">Feed</span></button>
+        <button class="flow-step" type="button" role="tab" aria-selected="false" data-flow-step="3"><span class="flow-number">4</span><span class="flow-name">Ask Feed</span></button>
+        <button class="flow-step" type="button" role="tab" aria-selected="false" data-flow-step="4"><span class="flow-number">5</span><span class="flow-name">Artifact</span></button>
+        <button class="flow-step" type="button" role="tab" aria-selected="false" data-flow-step="5"><span class="flow-number">6</span><span class="flow-name">Access</span></button>
+      </div>
+      <div class="flow-player" id="flowPanel" role="tabpanel" tabindex="0" aria-live="polite">
+        <div class="flow-device" id="flowDevice">
+          <div class="flow-device-label"><span id="flowDeviceName">Sign in</span><span>375×812</span></div>
+          <img id="flowImage" src="wireframes/01-sign-in-mobile.svg" alt="Mobile Feed sign-in wireframe" />
+        </div>
+        <div class="flow-story">
+          <p class="flow-position" id="flowPosition">Step 1 of 6 · First visit</p>
+          <h3 id="flowTitle">Sign in once</h3>
+          <p class="flow-summary" id="flowSummary">The user sees one product promise and one OpenKey action. Feed explains outcomes without turning authority into a setup project.</p>
+          <h4>What the user does</h4>
+          <ul id="flowActions"><li>Reads what Feed is for.</li><li>Signs in with OpenKey.</li><li>Sees where access can be reviewed later.</li></ul>
+          <div class="flow-invisible"><strong id="flowInvisibleTitle">What stays invisible</strong><p id="flowInvisible">Manifests, DIDs, bundles, capability paths, and separate service approvals.</p></div>
+          <div class="flow-controls"><button class="flow-control" id="flowBack" type="button" disabled>Back</button><button class="flow-control primary" id="flowNext" type="button">Next</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="s1">
+      <h2><span class="step-num">1.</span>Sign in once</h2>
+      <p class="desc">A single product promise and a single OpenKey action. The supporting disclosure explains outcomes in user terms without presenting a permission-management task.</p>
+      <div class="grid">
+        <div class="wire" data-zoom data-caption="Sign in · desktop"><div class="label"><span>01-sign-in.svg</span><span>1280×800</span></div><img src="wireframes/01-sign-in.svg" alt="Desktop sign-in wireframe" /></div>
+        <div class="wire mobile-wire mobile-col" data-zoom data-caption="Sign in · mobile"><div class="label"><span>mobile</span><span>375×812</span></div><img src="wireframes/01-sign-in-mobile.svg" alt="Mobile sign-in wireframe" /></div>
+        <div class="notes-col notes"><h3>Annotations</h3><ul><li><b>1</b> — Minimal product header; privacy explanation is available but secondary.</li><li><b>2</b> — User value appears before infrastructure.</li><li><b>3</b> — One OpenKey sign-in establishes normal authority automatically.</li><li><b>4</b> — Short disclosure says what connects and where access can be revoked.</li></ul><div class="why"><b>Why this changes:</b> removes “approve bundle” from first run and aligns the interface with TinyCloud’s one-sign-in expectation.</div></div>
+      </div>
+    </section>
+
+    <section id="s2">
+      <h2><span class="step-num">2.</span>Automatic setup</h2>
+      <p class="desc">A transient status view appears only while setup takes long enough to notice. It describes outcomes, not DIDs, resources, bundles, or manifests.</p>
+      <div class="grid">
+        <div class="wire" data-zoom data-caption="Automatic setup · desktop"><div class="label"><span>02-automatic-setup.svg</span><span>1280×800</span></div><img src="wireframes/02-automatic-setup.svg" alt="Desktop automatic setup wireframe" /></div>
+        <div class="wire mobile-wire mobile-col" data-zoom data-caption="Automatic setup · mobile"><div class="label"><span>mobile</span><span>375×812</span></div><img src="wireframes/02-automatic-setup-mobile.svg" alt="Mobile automatic setup wireframe" /></div>
+        <div class="notes-col notes"><h3>Annotations</h3><ul><li><b>1</b> — Calm title explicitly says there are no more approvals.</li><li><b>2</b> — Three plain-language milestones map to identity, context, and first output.</li><li><b>3</b> — Recovery contract promises a concrete reconnect instruction if needed.</li></ul><div class="why"><b>Why this changes:</b> setup becomes system feedback, not a second consent ceremony.</div></div>
+      </div>
+    </section>
+
+    <section id="s3">
+      <h2><span class="step-num">3.</span>Feed home</h2>
+      <p class="desc">The default destination is content. Artifactory appears only through the useful artifacts it creates and a quiet activity summary.</p>
+      <div class="grid">
+        <div class="wire" data-zoom data-caption="Feed home · desktop"><div class="label"><span>03-feed-home.svg</span><span>1280×800</span></div><img src="wireframes/03-feed-home.svg" alt="Desktop Feed home wireframe" /></div>
+        <div class="wire mobile-wire mobile-col" data-zoom data-caption="Feed home · mobile"><div class="label"><span>mobile</span><span>375×812</span></div><img src="wireframes/03-feed-home-mobile.svg" alt="Mobile Feed home wireframe" /></div>
+        <div class="notes-col notes"><h3>Annotations</h3><ul><li><b>1</b> — Familiar Feed navigation; account avatar owns advanced controls.</li><li><b>2</b> — “Ask Feed” is the primary way to intentionally invoke Artifactory.</li><li><b>3</b> — Generated artifacts carry source summaries and direct feedback actions.</li><li><b>4</b> — Quiet status says when Feed last worked without becoming an ops dashboard.</li><li><b>5</b> — Access &amp; automation lives in the optional account menu.</li></ul><div class="why"><b>Why this changes:</b> the product leads with reading and shaping content, not operating a workflow engine.</div></div>
+      </div>
+    </section>
+
+    <section id="s4">
+      <h2><span class="step-num">4.</span>Ask Feed</h2>
+      <p class="desc">A user asks a normal question. Progress is visible in terms of the work being done, while the allowed context remains inspectable and changeable.</p>
+      <div class="grid">
+        <div class="wire" data-zoom data-caption="Ask Feed · desktop"><div class="label"><span>04-ask-feed.svg</span><span>1280×800</span></div><img src="wireframes/04-ask-feed.svg" alt="Desktop Ask Feed wireframe" /></div>
+        <div class="wire mobile-wire mobile-col" data-zoom data-caption="Ask Feed · mobile"><div class="label"><span>mobile</span><span>375×812</span></div><img src="wireframes/04-ask-feed-mobile.svg" alt="Mobile Ask Feed wireframe" /></div>
+        <div class="notes-col notes"><h3>Annotations</h3><ul><li><b>1</b> — The user’s question anchors the view.</li><li><b>2</b> — Progress names evidence work, not agent stages or tool calls.</li><li><b>3</b> — Follow-up composer remains available.</li><li><b>4</b> — Context boundary discloses which private sources are in scope.</li></ul><div class="why"><b>Why this changes:</b> Artifactory becomes a capability of Feed, invoked in language the user already understands.</div></div>
+      </div>
+    </section>
+
+    <section id="s5">
+      <h2><span class="step-num">5.</span>Artifact detail</h2>
+      <p class="desc">The artifact is readable first. Provenance is translated into “why you’re seeing this,” source conversations, and quoted moments.</p>
+      <div class="grid">
+        <div class="wire" data-zoom data-caption="Artifact detail · desktop"><div class="label"><span>05-artifact-detail.svg</span><span>1280×800</span></div><img src="wireframes/05-artifact-detail.svg" alt="Desktop artifact detail wireframe" /></div>
+        <div class="wire mobile-wire mobile-col" data-zoom data-caption="Artifact detail · mobile"><div class="label"><span>mobile</span><span>375×812</span></div><img src="wireframes/05-artifact-detail-mobile.svg" alt="Mobile artifact detail wireframe" /></div>
+        <div class="notes-col notes"><h3>Annotations</h3><ul><li><b>1</b> — Clear return to Feed preserves orientation.</li><li><b>2</b> — Artifact body and feedback actions dominate the layout.</li><li><b>3</b> — Human-readable provenance expands into sources and quoted moments.</li></ul><div class="why"><b>Why this changes:</b> source integrity stays visible without exposing hashes and ledger internals as the default explanation.</div></div>
+      </div>
+    </section>
+
+    <section id="s6">
+      <h2><span class="step-num">6.</span>Access &amp; automation</h2>
+      <p class="desc">This optional settings view is the only everyday-user surface for the authority chain. It starts with health and meaningful abilities; raw delegation details remain collapsed.</p>
+      <div class="grid">
+        <div class="wire" data-zoom data-caption="Access and automation · desktop"><div class="label"><span>06-access-automation.svg</span><span>1280×800</span></div><img src="wireframes/06-access-automation.svg" alt="Desktop access and automation wireframe" /></div>
+        <div class="wire mobile-wire mobile-col" data-zoom data-caption="Access and automation · mobile"><div class="label"><span>mobile</span><span>375×812</span></div><img src="wireframes/06-access-automation-mobile.svg" alt="Mobile access and automation wireframe" /></div>
+        <div class="notes-col notes"><h3>Annotations</h3><ul><li><b>1</b> — Optional settings navigation, never a first-run gate.</li><li><b>2</b> — Health summary answers “is Feed connected?”</li><li><b>3</b> — Abilities are named in user terms: read context, make items, save state.</li><li><b>4</b> — DIDs, delegations, expiry, and services live under Advanced details.</li><li><b>5</b> — Pause and disconnect are understandable escape hatches.</li></ul><div class="why"><b>Why this changes:</b> delegation is invisible during normal use but not hidden from a user who wants control or an audit trail.</div></div>
+      </div>
+    </section>
+
+    <section id="hunter-list">
+      <h2>Hunter’s proposed Feed features</h2>
+      <p class="desc">The conversation repeated a few ideas through different examples. This short list groups the underlying features so we can discuss the product shape without treating every content type as a separate app.</p>
+      <ol class="feature-list">
+        <li><strong>1. Feed switcher</strong><p>Move between focused personal, curated, work, health, or group feeds. Each feed has its own sources and preferences.</p><span class="feature-horizon">NEARER TERM</span></li>
+        <li><strong>2. Curated discovery</strong><p>Find original outside articles using interests learned from private context and explicit reactions. AI selects; it does not rewrite the source.</p><span class="feature-horizon">NEARER TERM</span></li>
+        <li><strong>3. Shared group feed</strong><p>A shared space where members contribute items and collective activity shapes what the group sees.</p><span class="feature-horizon">NEARER TERM</span></li>
+        <li><strong>4. Share to a group</strong><p>Copy one useful item from a personal Feed into a chosen group without exposing the private conversations behind it.</p><span class="feature-horizon">NEARER TERM</span></li>
+        <li><strong>5. Invite and manage people</strong><p>Create a group Feed and give members understandable view, react, and share roles.</p><span class="feature-horizon">NEARER TERM</span></li>
+        <li><strong>6. Group learning and rules</strong><p>Use group reactions and shared items to tune ranking; later add narrow, reviewable suggestions or automatic-sharing rules.</p><span class="feature-horizon">NEARER TERM + LATER EXTENSION</span></li>
+        <li><strong>7. Budgeted physical outputs</strong><p>Give a workflow a spending limit and turn a period of life into a reviewed physical artifact such as a photo book.</p><span class="feature-horizon">FUTURE CONCEPT</span></li>
+        <li><strong>8. Human-readable agent configuration</strong><p>See what makes the Feed, how often each routine runs, its sources and likely cost, then edit or pause it without workflow code.</p><span class="feature-horizon">OPTIONAL ADVANCED CONTROL</span></li>
+      </ol>
+      <div class="why"><b>Not treated as separate features:</b> work/chat/health/calendar are examples of feeds; RSS and virality are outcomes of sharing; transcript and chat insights are the existing Feed baseline.</div>
+    </section>
+
+    <section id="hunter-features" class="flow-section feature-flow">
+      <h2>Walk through Hunter’s feature proposals</h2>
+      <p class="desc">These are mobile product explorations, not additions to the committed everyday journey. Use the segmented navigation, arrow keys, Back/Next, or swipe on the phone to compare them.</p>
+      <div class="feature-steps" id="featureSteps" role="tablist" aria-label="Hunter feature pages">
+        <button class="feature-step" type="button" role="tab" aria-selected="true" data-feature-step="0"><span class="flow-number">1</span><span class="flow-name">Feed switcher</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="1"><span class="flow-number">2</span><span class="flow-name">Discover</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="2"><span class="flow-number">3</span><span class="flow-name">Group feed</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="3"><span class="flow-number">4</span><span class="flow-name">Share</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="4"><span class="flow-number">5</span><span class="flow-name">People</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="5"><span class="flow-number">6</span><span class="flow-name">Group learning</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="6"><span class="flow-number">7</span><span class="flow-name">Physical output</span></button>
+        <button class="feature-step" type="button" role="tab" aria-selected="false" data-feature-step="7"><span class="flow-number">8</span><span class="flow-name">Feed routine</span></button>
+      </div>
+      <div class="flow-player" id="featurePanel" role="tabpanel" tabindex="0" aria-live="polite">
+        <div class="flow-device" id="featureDevice">
+          <div class="flow-device-label"><span id="featureDeviceName">Feed switcher</span><span>375×812</span></div>
+          <img id="featureImage" src="wireframes/07-feed-switcher-mobile.svg" alt="Mobile Feed switcher wireframe" />
+        </div>
+        <div class="flow-story">
+          <p class="flow-position" id="featurePosition">Feature 1 of 8 · Navigation model</p>
+          <h3 id="featureTitle">Choose a focused feed</h3>
+          <p class="flow-summary" id="featureSummary">Feeds become small, focused apps with their own sources and taste instead of one undifferentiated stream.</p>
+          <h4>Product behavior</h4>
+          <ul id="featureActions"><li>Sees personal, curated, work, and group feeds together.</li><li>Understands what sources shape each feed.</li><li>Creates a new feed without configuring infrastructure.</li></ul>
+          <div class="flow-invisible"><strong id="featureBoundaryTitle">Key product boundary</strong><p id="featureBoundary">A feed is a view plus preferences and source scope—not a separate identity or permission ceremony every time.</p></div>
+          <div class="flow-controls"><button class="flow-control" id="featureBack" type="button" disabled>Back</button><button class="flow-control primary" id="featureNext" type="button">Next</button></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="hunter-gallery">
+      <h2>Hunter feature pages · mobile gallery</h2>
+      <p class="desc">All eight pages are mobile-only and intentionally lo-fi. Click any page to inspect it at full size.</p>
+      <div class="feature-gallery">
+        <div class="wire" data-zoom data-caption="Feed switcher · mobile"><div class="label"><span>07-feed-switcher-mobile.svg</span><span>375×812</span></div><img src="wireframes/07-feed-switcher-mobile.svg" alt="Mobile Feed switcher wireframe" /><div class="feature-caption"><strong>Feed switcher</strong><span>Focused feeds with separate sources and taste.</span></div></div>
+        <div class="wire" data-zoom data-caption="Curated discovery · mobile"><div class="label"><span>08-curated-discovery-mobile.svg</span><span>375×812</span></div><img src="wireframes/08-curated-discovery-mobile.svg" alt="Mobile curated discovery wireframe" /><div class="feature-caption"><strong>Curated discovery</strong><span>Original outside sources, selected—not generated.</span></div></div>
+        <div class="wire" data-zoom data-caption="Shared group feed · mobile"><div class="label"><span>09-shared-group-feed-mobile.svg</span><span>375×812</span></div><img src="wireframes/09-shared-group-feed-mobile.svg" alt="Mobile shared group Feed wireframe" /><div class="feature-caption"><strong>Shared group feed</strong><span>Items, reactions, and a group-specific pulse.</span></div></div>
+        <div class="wire" data-zoom data-caption="Share to group · mobile"><div class="label"><span>10-share-to-group-mobile.svg</span><span>375×812</span></div><img src="wireframes/10-share-to-group-mobile.svg" alt="Mobile share-to-group wireframe" /><div class="feature-caption"><strong>Share to a group</strong><span>Copies the artifact, not private source conversations.</span></div></div>
+        <div class="wire" data-zoom data-caption="Group people · mobile"><div class="label"><span>11-group-people-mobile.svg</span><span>375×812</span></div><img src="wireframes/11-group-people-mobile.svg" alt="Mobile group people and invite wireframe" /><div class="feature-caption"><strong>Invite and manage people</strong><span>Human-readable roles scoped to one group Feed.</span></div></div>
+        <div class="wire" data-zoom data-caption="Group learning · mobile"><div class="label"><span>12-group-learning-mobile.svg</span><span>375×812</span></div><img src="wireframes/12-group-learning-mobile.svg" alt="Mobile group learning and sharing rules wireframe" /><div class="feature-caption"><strong>Group learning and rules</strong><span>Collective taste with private-by-default suggestions.</span></div></div>
+        <div class="wire" data-zoom data-caption="Physical output · future mobile"><div class="label"><span>13-physical-output-mobile.svg</span><span>375×812</span></div><img src="wireframes/13-physical-output-mobile.svg" alt="Mobile budgeted physical output wireframe" /><div class="feature-caption"><strong>Budgeted physical output</strong><span>A future review-gated path from Feed to a physical artifact.</span></div></div>
+        <div class="wire" data-zoom data-caption="Feed routine · mobile"><div class="label"><span>14-feed-routine-mobile.svg</span><span>375×812</span></div><img src="wireframes/14-feed-routine-mobile.svg" alt="Mobile human-readable Feed routine configuration wireframe" /><div class="feature-caption"><strong>Human-readable agent configuration</strong><span>Routines, cadence, sources, cost, ownership, and controls without agent files.</span></div></div>
+      </div>
+    </section>
+
+    <section id="open">
+      <h2>Open questions for critique</h2>
+      <ol class="questions">
+        <li>Should automatic setup render at all when it finishes in under two seconds, or should Feed go directly to a skeleton feed?</li>
+        <li>Should Ask Feed be a dedicated view, an inline composer above the feed, or both?</li>
+        <li>Does the “Working quietly” rail provide useful confidence, or does it already expose too much machinery?</li>
+        <li>Should turning off “Make Feed items” pause scheduled runs while preserving Ask Feed, or disable both?</li>
+        <li>Should source conversation titles be visible by default, given screen-sharing privacy?</li>
+        <li>Does Activity deserve primary navigation, or should it remain behind the account menu until there is a failure?</li>
+        <li>Should multiple feeds use a dedicated switcher page, horizontal swipe, or a compact menu from Feed home?</li>
+        <li>Should curated outside reading remain a separate Discover feed, or appear sparingly inside the personal Feed?</li>
+        <li>When an artifact is shared, is a provenance summary enough, or should the sender choose individual quoted moments to include?</li>
+        <li>How visible should collective preference learning be to group members, and who can reset or tune it?</li>
+        <li>Should automatic group sharing exist at all, or should the first version only suggest items for a person to approve?</li>
+        <li>Is budgeted physical fulfillment part of Feed’s credible horizon, or better treated as a separate agent product?</li>
+        <li>Should “Your Feed routine” live under Access &amp; automation, or deserve a direct entry from Feed home once users actively tune it?</li>
+      </ol>
+    </section>
+
+    <div class="footer">Wireframes follow the Paperclip bundled wireframe skill: black on white, 1.5px strokes, 8px grid, system font, and type sizes 12/14/20/28. Red dashed callouts are review annotations only.</div>
+  </main>
+</div>
+
+<div class="lightbox" id="lb" aria-hidden="true" role="dialog" aria-modal="true" aria-label="Wireframe zoom">
+  <button class="close" id="lbClose" aria-label="Close wireframe zoom">×</button>
+  <img id="lbImg" alt="" />
+  <div class="caption" id="lbCap"></div>
+</div>
+<script>
+  function updateFlowFocusedMode(){
+    const focused=location.hash==='#flow'||location.hash==='#hunter-features';
+    document.body.classList.toggle('flow-focused',focused);
+    if(focused)requestAnimationFrame(()=>document.querySelector(location.hash)?.scrollIntoView({block:'start'}));
+  }
+  updateFlowFocusedMode();
+  window.addEventListener('hashchange',updateFlowFocusedMode);
+
+  const flowViews=[
+    {
+      name:'Sign in', moment:'First visit', title:'Sign in once', image:'wireframes/01-sign-in-mobile.svg', alt:'Mobile Feed sign-in wireframe',
+      summary:'The user sees one product promise and one OpenKey action. Feed explains outcomes without turning authority into a setup project.',
+      actions:['Reads what Feed is for.','Signs in with OpenKey.','Sees where access can be reviewed later.'],
+      invisibleTitle:'What stays invisible', invisible:'Manifests, DIDs, bundles, capability paths, and separate service approvals.'
+    },
+    {
+      name:'Automatic setup', moment:'Immediately after sign-in', title:'Feed connects itself', image:'wireframes/02-automatic-setup-mobile.svg', alt:'Mobile automatic Feed setup wireframe',
+      summary:'If setup takes long enough to notice, Feed shows understandable milestones. There is nothing else to approve.',
+      actions:['Sees TinyCloud connect.','Sees allowed context become available.','Waits while Feed prepares the first useful items.'],
+      invisibleTitle:'What stays invisible', invisible:'Feed Host delegation and Artifactory installation happen inside the sign-in authority chain.'
+    },
+    {
+      name:'Feed home', moment:'Everyday use', title:'Read and shape the Feed', image:'wireframes/03-feed-home-mobile.svg', alt:'Mobile Feed home wireframe',
+      summary:'The normal destination is content. Each item is grounded in the user’s context and has simple controls that teach Feed what is useful.',
+      actions:['Reads generated insights and briefs.','Saves useful items.','Marks items helpful or asks for fewer like them.','Opens “Why this?” when provenance matters.'],
+      invisibleTitle:'How Artifactory appears', invisible:'Only through finished Feed items—not as a dashboard, package, or run configuration.'
+    },
+    {
+      name:'Ask Feed', moment:'Intentional request', title:'Ask Feed for something', image:'wireframes/04-ask-feed-mobile.svg', alt:'Mobile Ask Feed wireframe',
+      summary:'A question invokes Artifactory and its agent. Progress describes evidence work in plain language, while allowed context stays inspectable.',
+      actions:['Asks a question naturally.','Sees which stage the answer is in.','Can leave and find the result later.','Can inspect or change allowed context.'],
+      invisibleTitle:'What stays invisible', invisible:'Agent dispatch, tool calls, source packing, runtime policy, and model orchestration.'
+    },
+    {
+      name:'Artifact detail', moment:'Inspecting an item', title:'Understand why it exists', image:'wireframes/05-artifact-detail-mobile.svg', alt:'Mobile artifact detail wireframe',
+      summary:'The artifact is readable first. Provenance becomes source conversations and quoted moments instead of hashes and internal ledgers.',
+      actions:['Reads the synthesized artifact.','Acts on the suggested next step.','Opens the source trail for evidence.','Gives feedback without leaving the item.'],
+      invisibleTitle:'Trust boundary', invisible:'The source trail says what was used and explicitly notes when no outside sources were involved.'
+    },
+    {
+      name:'Access & automation', moment:'Optional account menu', title:'Inspect or stop automation', image:'wireframes/06-access-automation-mobile.svg', alt:'Mobile access and automation wireframe',
+      summary:'Authority stays invisible during normal use, but it is never hidden. The user can review abilities, pause Feed, or disconnect it.',
+      actions:['Reviews read-only Listen access.','Controls whether Feed makes new items.','Controls whether Feed saves state.','Pauses or disconnects Feed.'],
+      invisibleTitle:'Advanced details stay optional', invisible:'Delegations, service identities, resources, and expiry live behind one collapsed disclosure.'
+    }
+  ];
+  const flowTabs=[...document.querySelectorAll('[data-flow-step]')];
+  const flowImage=document.getElementById('flowImage');
+  const flowDeviceName=document.getElementById('flowDeviceName');
+  const flowPosition=document.getElementById('flowPosition');
+  const flowTitle=document.getElementById('flowTitle');
+  const flowSummary=document.getElementById('flowSummary');
+  const flowActions=document.getElementById('flowActions');
+  const flowInvisibleTitle=document.getElementById('flowInvisibleTitle');
+  const flowInvisible=document.getElementById('flowInvisible');
+  const flowBack=document.getElementById('flowBack');
+  const flowNext=document.getElementById('flowNext');
+  const flowDevice=document.getElementById('flowDevice');
+  let flowIndex=0;
+  let flowTouchStart=null;
+
+  function showFlowView(index,focusTab=false){
+    flowIndex=Math.max(0,Math.min(flowViews.length-1,index));
+    const view=flowViews[flowIndex];
+    flowTabs.forEach((tab,tabIndex)=>{
+      const selected=tabIndex===flowIndex;
+      tab.setAttribute('aria-selected',String(selected));
+      tab.tabIndex=selected?0:-1;
+      if(selected&&focusTab)tab.focus();
+    });
+    flowImage.src=view.image;
+    flowImage.alt=view.alt;
+    flowDeviceName.textContent=view.name;
+    flowPosition.textContent=`Step ${flowIndex+1} of ${flowViews.length} · ${view.moment}`;
+    flowTitle.textContent=view.title;
+    flowSummary.textContent=view.summary;
+    flowActions.replaceChildren(...view.actions.map((action)=>{const item=document.createElement('li');item.textContent=action;return item;}));
+    flowInvisibleTitle.textContent=view.invisibleTitle;
+    flowInvisible.textContent=view.invisible;
+    flowBack.disabled=flowIndex===0;
+    flowNext.textContent=flowIndex===flowViews.length-1?'Back to start':'Next';
+  }
+  function revealUpdatedDevice(device){
+    if(!window.matchMedia('(max-width:560px)').matches)return;
+    device.scrollIntoView({
+      block:'start',
+      behavior:window.matchMedia('(prefers-reduced-motion:reduce)').matches?'auto':'smooth'
+    });
+  }
+  flowTabs.forEach((tab)=>tab.addEventListener('click',()=>showFlowView(Number(tab.dataset.flowStep))));
+  flowBack.addEventListener('click',()=>{showFlowView(flowIndex-1);revealUpdatedDevice(flowDevice);});
+  flowNext.addEventListener('click',()=>{showFlowView(flowIndex===flowViews.length-1?0:flowIndex+1);revealUpdatedDevice(flowDevice);});
+  document.getElementById('flowSteps').addEventListener('keydown',(event)=>{
+    if(event.key==='ArrowRight'||event.key==='ArrowDown'){event.preventDefault();showFlowView(flowIndex+1,true);}
+    if(event.key==='ArrowLeft'||event.key==='ArrowUp'){event.preventDefault();showFlowView(flowIndex-1,true);}
+    if(event.key==='Home'){event.preventDefault();showFlowView(0,true);}
+    if(event.key==='End'){event.preventDefault();showFlowView(flowViews.length-1,true);}
+  });
+  flowDevice.addEventListener('touchstart',(event)=>{flowTouchStart=event.changedTouches[0].clientX;},{passive:true});
+  flowDevice.addEventListener('touchend',(event)=>{
+    if(flowTouchStart===null)return;
+    const distance=event.changedTouches[0].clientX-flowTouchStart;
+    if(Math.abs(distance)>56)showFlowView(distance<0?flowIndex+1:flowIndex-1);
+    flowTouchStart=null;
+  },{passive:true});
+
+  const featureViews=[
+    {
+      name:'Feed switcher', moment:'Navigation model', title:'Choose a focused feed', image:'wireframes/07-feed-switcher-mobile.svg', alt:'Mobile Feed switcher wireframe',
+      summary:'Feeds become small, focused apps with their own sources and taste instead of one undifferentiated stream.',
+      actions:['Sees personal, curated, work, and group feeds together.','Understands what sources shape each feed.','Creates a new feed without configuring infrastructure.'],
+      boundaryTitle:'Key product boundary', boundary:'A feed is a view plus preferences and source scope—not a separate identity or permission ceremony every time.'
+    },
+    {
+      name:'Curated discovery', moment:'Outside reading', title:'Discover, do not synthesize', image:'wireframes/08-curated-discovery-mobile.svg', alt:'Mobile curated discovery wireframe',
+      summary:'Feed finds original outside articles using learned interests while preserving the publication, author, and source link.',
+      actions:['Sees why an article was selected.','Opens the original source.','Saves, shares, or asks for fewer similar results.'],
+      boundaryTitle:'Trust and quality', boundary:'The page labels the content “curated, not generated” so selection and authorship never blur together.'
+    },
+    {
+      name:'Shared group feed', moment:'Collective space', title:'Give a group its own Feed', image:'wireframes/09-shared-group-feed-mobile.svg', alt:'Mobile shared group Feed wireframe',
+      summary:'Members share useful items into one place. Group reactions and shared content create a distinct group pulse.',
+      actions:['Reads items shared by named members.','Reacts and discusses in the group context.','Sees a group-level recap.','Starts a share from the group home.'],
+      boundaryTitle:'Shared truth', boundary:'The group Feed stores copies of shared artifacts and group interactions in a shared space; private source stores remain separate.'
+    },
+    {
+      name:'Share to group', moment:'From a personal item', title:'Share the artifact, not the private context', image:'wireframes/10-share-to-group-mobile.svg', alt:'Mobile share-to-group wireframe',
+      summary:'A user chooses a destination, previews exactly what will cross the boundary, and can explain why the group should see it.',
+      actions:['Previews the artifact.','Chooses one group Feed.','Adds an optional note.','Confirms the privacy boundary before sharing.'],
+      boundaryTitle:'Default privacy rule', boundary:'Sharing copies the finished item and readable provenance summary. It does not grant access to source conversations.'
+    },
+    {
+      name:'Group people', moment:'Membership and roles', title:'Invite people in product language', image:'wireframes/11-group-people-mobile.svg', alt:'Mobile group people and invite wireframe',
+      summary:'An owner invites a person and selects an understandable role scoped to this group Feed.',
+      actions:['Invites by a familiar identifier.','Chooses view/react/share abilities.','Reviews current people and roles.','Copies a reusable invite link when appropriate.'],
+      boundaryTitle:'What stays invisible', boundary:'Shared-space identifiers and delegations are created underneath the invite. The role is the user-facing contract.'
+    },
+    {
+      name:'Group learning', moment:'Collective preferences', title:'Let the group shape its ranking', image:'wireframes/12-group-learning-mobile.svg', alt:'Mobile group learning and sharing rules wireframe',
+      summary:'Collective reactions and shared items form group taste. Future sharing rules start as suggestions and remain reviewable.',
+      actions:['Sees the interests inferred for the group.','Controls which group signals affect ranking.','Reviews a future narrow sharing rule.','Can reset group learning.'],
+      boundaryTitle:'Safe automation default', boundary:'Private items are suggested for review, not silently copied. Any future auto-share rule must name its source and content type.'
+    },
+    {
+      name:'Physical output', moment:'Future workflow', title:'Turn a Feed period into a physical artifact', image:'wireframes/13-physical-output-mobile.svg', alt:'Mobile budgeted physical output wireframe',
+      summary:'A future workflow selects a period, an output, and a one-time budget, then prepares a proof before any purchase.',
+      actions:['Chooses a photo book or printed recap.','Selects the period and allowed sources.','Sets a hard spending limit.','Reviews a preview before ordering.'],
+      boundaryTitle:'Explicit spend gate', boundary:'The agent may prepare the artifact, but purchase, delivery address use, and final spend require a separate review.'
+    },
+    {
+      name:'Feed routine', moment:'Human-readable agent setup', title:'See and tune what makes your Feed', image:'wireframes/14-feed-routine-mobile.svg', alt:'Mobile human-readable Feed routine configuration wireframe',
+      summary:'The agent’s recurring mechanics become a readable routine: what runs, cadence, source scope, likely cost, ownership, and current status.',
+      actions:['Reviews every active routine.','Changes frequency or output volume.','Pauses or removes a routine.','Adds an available routine without editing workflow files.','Reviews access and price for a paid private routine.'],
+      boundaryTitle:'Transparency contract', boundary:'A paid or private workflow may hide its implementation, but it cannot hide who owns it, what user data it may use, when it runs, or what it can cost.'
+    }
+  ];
+  const featureTabs=[...document.querySelectorAll('[data-feature-step]')];
+  const featureImage=document.getElementById('featureImage');
+  const featureDeviceName=document.getElementById('featureDeviceName');
+  const featurePosition=document.getElementById('featurePosition');
+  const featureTitle=document.getElementById('featureTitle');
+  const featureSummary=document.getElementById('featureSummary');
+  const featureActions=document.getElementById('featureActions');
+  const featureBoundaryTitle=document.getElementById('featureBoundaryTitle');
+  const featureBoundary=document.getElementById('featureBoundary');
+  const featureBack=document.getElementById('featureBack');
+  const featureNext=document.getElementById('featureNext');
+  const featureDevice=document.getElementById('featureDevice');
+  let featureIndex=0;
+  let featureTouchStart=null;
+
+  function showFeatureView(index,focusTab=false){
+    featureIndex=Math.max(0,Math.min(featureViews.length-1,index));
+    const view=featureViews[featureIndex];
+    featureTabs.forEach((tab,tabIndex)=>{
+      const selected=tabIndex===featureIndex;
+      tab.setAttribute('aria-selected',String(selected));
+      tab.tabIndex=selected?0:-1;
+      if(selected&&focusTab)tab.focus();
+    });
+    featureImage.src=view.image;
+    featureImage.alt=view.alt;
+    featureDeviceName.textContent=view.name;
+    featurePosition.textContent=`Feature ${featureIndex+1} of ${featureViews.length} · ${view.moment}`;
+    featureTitle.textContent=view.title;
+    featureSummary.textContent=view.summary;
+    featureActions.replaceChildren(...view.actions.map((action)=>{const item=document.createElement('li');item.textContent=action;return item;}));
+    featureBoundaryTitle.textContent=view.boundaryTitle;
+    featureBoundary.textContent=view.boundary;
+    featureBack.disabled=featureIndex===0;
+    featureNext.textContent=featureIndex===featureViews.length-1?'Back to start':'Next';
+  }
+  featureTabs.forEach((tab)=>tab.addEventListener('click',()=>showFeatureView(Number(tab.dataset.featureStep))));
+  featureBack.addEventListener('click',()=>{showFeatureView(featureIndex-1);revealUpdatedDevice(featureDevice);});
+  featureNext.addEventListener('click',()=>{showFeatureView(featureIndex===featureViews.length-1?0:featureIndex+1);revealUpdatedDevice(featureDevice);});
+  document.getElementById('featureSteps').addEventListener('keydown',(event)=>{
+    if(event.key==='ArrowRight'||event.key==='ArrowDown'){event.preventDefault();showFeatureView(featureIndex+1,true);}
+    if(event.key==='ArrowLeft'||event.key==='ArrowUp'){event.preventDefault();showFeatureView(featureIndex-1,true);}
+    if(event.key==='Home'){event.preventDefault();showFeatureView(0,true);}
+    if(event.key==='End'){event.preventDefault();showFeatureView(featureViews.length-1,true);}
+  });
+  featureDevice.addEventListener('touchstart',(event)=>{featureTouchStart=event.changedTouches[0].clientX;},{passive:true});
+  featureDevice.addEventListener('touchend',(event)=>{
+    if(featureTouchStart===null)return;
+    const distance=event.changedTouches[0].clientX-featureTouchStart;
+    if(Math.abs(distance)>56)showFeatureView(distance<0?featureIndex+1:featureIndex-1);
+    featureTouchStart=null;
+  },{passive:true});
+  const requestedFeature=Number(new URLSearchParams(location.search).get('feature'));
+  if(Number.isInteger(requestedFeature)&&requestedFeature>=1&&requestedFeature<=featureViews.length){
+    showFeatureView(requestedFeature-1);
+  }
+
+  const lb=document.getElementById('lb');
+  const lbImg=document.getElementById('lbImg');
+  const lbCap=document.getElementById('lbCap');
+  const closeButton=document.getElementById('lbClose');
+  let returnFocus=null;
+  document.querySelectorAll('[data-zoom]').forEach((el)=>{
+    el.tabIndex=0;
+    const open=()=>{ const target=el.tagName==='IMG'?el:el.querySelector('img'); if(!target)return; returnFocus=document.activeElement; lbImg.src=target.src; lbImg.alt=target.alt; lbCap.textContent=el.dataset.caption||target.alt||''; lb.classList.add('open'); lb.setAttribute('aria-hidden','false'); closeButton.focus(); };
+    el.addEventListener('click',open);
+    el.addEventListener('keydown',(event)=>{ if(event.key==='Enter'||event.key===' '){event.preventDefault();open();} });
+  });
+  function close(){ lb.classList.remove('open'); lb.setAttribute('aria-hidden','true'); if(returnFocus instanceof HTMLElement)returnFocus.focus(); }
+  lb.addEventListener('click',(event)=>{ if(event.target===lb)close(); });
+  closeButton.addEventListener('click',close);
+  document.addEventListener('keydown',(event)=>{ if(event.key==='Escape'&&lb.classList.contains('open'))close(); });
+  const toc=document.querySelector('details.toc');
+  if(toc){ const mq=window.matchMedia('(max-width:900px)'); const apply=()=>{toc.open=!mq.matches;}; apply(); mq.addEventListener('change',apply); toc.querySelectorAll('.toc-body a').forEach((a)=>a.addEventListener('click',()=>{if(mq.matches)toc.open=false;})); }
+</script>
+</body>
+</html>
