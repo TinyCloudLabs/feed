@@ -23,6 +23,9 @@ resources live in Artifactory and are applied by the Feed Host path.
 
 ## Local Feed Host
 
+For a complete manual and injected-Ethereum walkthrough, see
+[Hunter's local Feed testing guide](docs/hunter-local-testing.md).
+
 Run the TinyCloud-backed Feed Host and app in separate terminals:
 
 ```sh
@@ -46,12 +49,13 @@ POST /admin/seed
 ```
 
 The app does not treat OpenKey sign-in as Feed Host authority. On startup it
-fetches `GET /delegation-policy`, includes the Feed Host delegate DID/resources
-in the TinyCloud manifest before sign-in, creates portable delegations with
-`space("default").delegations.create(...)`, and submits them with `POST
-/delegations`. Feed reads, artifact hydration, feedback, and control intents are
-rejected until the host has accepted the complete Feed v1 SQL/KV delegation set
-for the actor.
+fetches `GET /delegation-policy` and composes the Feed Host delegate
+DID/resources into the TinyCloud capability request before sign-in. It then
+materializes one multi-resource delegation from the signed-in session key and
+submits it once with `POST /api/delegations`. No additional wallet approval is
+required. Feed reads, artifact hydration, feedback, and control intents are
+rejected until the host has accepted the complete Feed v1 SQL/KV delegation
+set for the actor.
 
 For local development, the Feed Host can use a generated session DID. Hosted
 deployments should set `FEED_HOST_PRIVATE_KEY` (the env var only — never commit
