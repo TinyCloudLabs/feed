@@ -98,6 +98,7 @@ describe("Feed Host server", () => {
     expect(notModified.status).toBe(304);
 
     const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    expect(policy.delegateDID).not.toContain("#");
     expect(policy.resources.map((resource) => resource.path)).toEqual(FEED_HOST_DELEGATION_RESOURCES.map((resource) => resource.path));
     expect(policy.resources).toContainEqual({
       service: "tinycloud.sql",

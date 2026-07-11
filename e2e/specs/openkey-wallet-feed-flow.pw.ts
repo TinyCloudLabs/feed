@@ -33,6 +33,7 @@ function exposeTestShadowRoots() {
 function mockBrowserWalletProvider() {
   return ({ address, privateKey, walletName }: { address: string; privateKey: string; walletName: string }) => {
     const requests: string[] = [];
+    const signedMessages: string[] = [];
     const ethers = (window as any).ethers;
     const wallet = new ethers.Wallet(privateKey);
     const provider = {
@@ -49,7 +50,16 @@ function mockBrowserWalletProvider() {
           case "personal_sign": {
             const message = params?.[0];
             if (typeof message !== "string") throw new Error("personal_sign missing message");
-            if (message.startsWith("0x")) return wallet.signMessage(ethers.utils.arrayify(message));
+            if (message.startsWith("0x")) {
+              const bytes = ethers.utils.arrayify(message);
+              try {
+                signedMessages.push(ethers.utils.toUtf8String(bytes));
+              } catch {
+                signedMessages.push(message);
+              }
+              return wallet.signMessage(bytes);
+            }
+            signedMessages.push(message);
             return wallet.signMessage(message);
           }
           case "wallet_getPermissions":
@@ -84,6 +94,7 @@ function mockBrowserWalletProvider() {
 
     Object.defineProperty(window, "ethereum", { value: provider, configurable: true });
     Object.defineProperty(window, "__walletRequests", { value: requests, configurable: true });
+    Object.defineProperty(window, "__walletSignedMessages", { value: signedMessages, configurable: true });
     window.addEventListener("eip6963:requestProvider", announceProvider);
     announceProvider();
   };
@@ -116,8 +127,12 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   const wallet = createTestWallet();
   const actorId = wallet.actorId;
   await installWallet(page, wallet);
+  const policy = await page.request.get(`${FEED_HOST_URL}/delegation-policy`).then((response) => response.json()) as {
+    delegateDID: string;
+  };
 
   let feedRequests = 0;
+  let delegationSubmissions = 0;
   let releaseFirstFeed: (() => void) | undefined;
   const firstFeedReady = new Promise<void>((resolve) => {
     releaseFirstFeed = resolve;
@@ -135,6 +150,10 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
     }
     await route.fallback();
   });
+  await page.route(/\/api\/delegations$/, async (route) => {
+    if (route.request().method() === "POST") delegationSubmissions += 1;
+    await route.fallback();
+  });
 
   await page.goto("/");
   await signInWithWallet(page, wallet);
@@ -149,6 +168,13 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
   await expect(page.getByText(/same decision appears across your recent conversations/i)).toBeVisible();
   await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
+  await expect.poll(() => delegationSubmissions).toBe(1);
+  const feedHostSignaturePrompts = await page.evaluate(
+    (delegateDID) => ((window as any).__walletSignedMessages as string[])
+      .filter((message) => message.includes(`URI: ${delegateDID}`)),
+    policy.delegateDID,
+  );
+  expect(feedHostSignaturePrompts).toHaveLength(0);
 
   await page.getByRole("button", { name: "Access & automation", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Access & automation" })).toBeVisible();
@@ -238,7 +264,7 @@ test("Feed failure state only clears after a successful reload", async ({ page }
   expect(feedRequests).toBe(3);
 });
 
-test("a restored session with stale access asks for one clear reconnect", async ({ page }) => {
+test("a restored session repairs stale cached access without another wallet prompt", async ({ page }) => {
   const wallet = createTestWallet();
   await installWallet(page, wallet);
 
@@ -251,8 +277,10 @@ test("a restored session with stale access asks for one clear reconnect", async 
   });
   await page.reload();
 
-  await expect(page.getByRole("heading", { name: /your private context, made useful/i })).toBeVisible();
-  await expect(page.getByRole("alert")).toHaveText(/saved Feed access needs to be refreshed/i);
-  await expect(page.getByRole("alert")).not.toContainText(/tinycloud\.kv|delegation|bundle|manifest/i);
-  await expect(page.getByRole("button", { name: /sign in with openkey/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (
+    ((window as any).__walletRequests as string[]).filter((method) => method === "personal_sign").length
+  ))).toBe(0);
 });

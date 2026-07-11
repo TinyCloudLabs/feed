@@ -1,11 +1,10 @@
 import {
   BrowserSessionStorage,
+  composeManifestRequest,
   serializeDelegation,
   TinyCloudWeb,
   type Config,
-  type Delegation,
   type Manifest,
-  type PortableDelegation,
 } from "@tinycloud/web-sdk";
 import type { providers } from "ethers";
 import { TINYCLOUD_HOST } from "./config.ts";
@@ -22,7 +21,6 @@ const LAST_ADDRESS_KEY = "feed:v1:lastAddress";
 const DELEGATION_CACHE_KEY = "feed:v1:hostDelegations";
 
 let instance: TinyCloudWeb | null = null;
-let walletMode = false;
 
 export type FeedSession = {
   address: string;
@@ -35,12 +33,13 @@ type CachedFeedHostDelegation = {
   resources: Array<{
     path: string;
     actions: string[];
-    serializedDelegation: string;
   }>;
+  serializedDelegation: string;
 };
 
 function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
   return {
+    manifest_version: 1,
     app_id: "xyz.tinycloud.feed.host",
     name: "TinyFeed Host",
     description: "Delegated Feed Host access to Feed v1 resources.",
@@ -58,11 +57,17 @@ function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
   };
 }
 
+function feedCapabilityRequest(policy: FeedHostDelegationPolicy) {
+  return composeManifestRequest([FEED_MANIFEST, delegationManifest(policy)]);
+}
+
 function buildConfig(web3Provider?: providers.Web3Provider, policy?: FeedHostDelegationPolicy): Config {
   return {
     ...(web3Provider ? { providers: { web3: { driver: web3Provider } } } : {}),
     tinycloudHosts: [TINYCLOUD_HOST],
-    manifest: policy ? [FEED_MANIFEST, delegationManifest(policy)] : FEED_MANIFEST,
+    ...(policy
+      ? { capabilityRequest: feedCapabilityRequest(policy) }
+      : { manifest: FEED_MANIFEST }),
     sessionStorage: new BrowserSessionStorage(),
     sessionExpirationMs: SESSION_EXPIRATION_MS,
   };
@@ -81,7 +86,6 @@ export async function signIn(policy: FeedHostDelegationPolicy): Promise<FeedSess
   const tc = new TinyCloudWeb(buildConfig(web3Provider, policy));
   await tc.signIn();
   instance = tc;
-  walletMode = true;
   try {
     localStorage.setItem(LAST_ADDRESS_KEY, address);
   } catch {
@@ -104,7 +108,6 @@ export async function restoreSession(policy?: FeedHostDelegationPolicy): Promise
     return null;
   }
   instance = tc;
-  walletMode = false;
   return { address, readerDid: tc.did };
 }
 
@@ -117,34 +120,31 @@ export async function submitFeedHostDelegations(input: {
   const cached = cachedDelegations(input.actorId, input.policy);
   if (cached) {
     try {
-      return await submitCachedDelegations(input.client, input.actorId, cached);
+      return [await input.client.submitDelegation({
+        actorId: input.actorId,
+        serializedDelegation: cached.serializedDelegation,
+      })];
     } catch (error) {
       clearCachedDelegations();
-      if (!walletMode) throw reconnectRequiredError(error);
+      throw reconnectRequiredError(error);
     }
   }
-  if (!walletMode) throw reconnectRequiredError();
 
-  const receipts: FeedHostDelegationReceipt[] = [];
-  const cachedResources: CachedFeedHostDelegation["resources"] = [];
-  for (const resource of input.policy.resources) {
-    const result = await instance.space("default").delegations.create({
-      delegateDID: input.policy.delegateDID,
-      path: resource.path,
-      actions: resource.actions,
-      expiry: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
-    });
-    if (!result.ok) throw new Error(result.error.message);
-    const serializedDelegation = serializeDelegation(toPortableDelegation(result.data, instance));
-    cachedResources.push({ path: resource.path, actions: resource.actions, serializedDelegation });
-    receipts.push(await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation }));
+  const result = await instance.materializeDelegation(
+    input.policy.delegateDID,
+    feedCapabilityRequest(input.policy),
+  );
+  if (result.prompted) {
+    throw new Error("Feed Host delegation unexpectedly required another wallet approval");
   }
+  const serializedDelegation = serializeDelegation(result.delegation);
   saveCachedDelegations({
     actorId: input.actorId,
     delegateDID: input.policy.delegateDID,
-    resources: cachedResources,
+    resources: input.policy.resources.map(({ path, actions }) => ({ path, actions })),
+    serializedDelegation,
   });
-  return receipts;
+  return [await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation })];
 }
 
 export async function signOut(): Promise<void> {
@@ -152,7 +152,6 @@ export async function signOut(): Promise<void> {
     await instance?.signOut();
   } finally {
     instance = null;
-    walletMode = false;
     try {
       localStorage.removeItem(LAST_ADDRESS_KEY);
       localStorage.removeItem(DELEGATION_CACHE_KEY);
@@ -160,19 +159,6 @@ export async function signOut(): Promise<void> {
       // No-op.
     }
   }
-}
-
-function toPortableDelegation(delegation: Delegation, tc: TinyCloudWeb): PortableDelegation {
-  const { isRevoked: _isRevoked, ...rest } = delegation;
-  return {
-    ...rest,
-    delegationHeader: {
-      Authorization: delegation.authHeader || `Bearer ${delegation.cid}`,
-    },
-    ownerAddress: tc.address() ?? "",
-    chainId: tc.chainId() ?? 1,
-    host: TINYCLOUD_HOST,
-  };
 }
 
 function cachedDelegations(actorId: string, policy: FeedHostDelegationPolicy): CachedFeedHostDelegation | null {
@@ -184,25 +170,18 @@ function cachedDelegations(actorId: string, policy: FeedHostDelegationPolicy): C
     clearCachedDelegations();
     return null;
   }
-  if (!cached || cached.actorId !== actorId || cached.delegateDID !== policy.delegateDID) return null;
+  if (
+    !cached ||
+    cached.actorId !== actorId ||
+    cached.delegateDID !== policy.delegateDID ||
+    typeof cached.serializedDelegation !== "string"
+  ) return null;
   const cachedByPath = new Map(cached.resources.map((resource) => [resource.path, resource]));
   for (const resource of policy.resources) {
     const match = cachedByPath.get(resource.path);
     if (!match || !sameActions(match.actions, resource.actions)) return null;
   }
   return cached;
-}
-
-async function submitCachedDelegations(
-  client: FeedV1HostClient,
-  actorId: string,
-  cached: CachedFeedHostDelegation,
-): Promise<FeedHostDelegationReceipt[]> {
-  const receipts: FeedHostDelegationReceipt[] = [];
-  for (const resource of cached.resources) {
-    receipts.push(await client.submitDelegation({ actorId, serializedDelegation: resource.serializedDelegation }));
-  }
-  return receipts;
 }
 
 function saveCachedDelegations(cached: CachedFeedHostDelegation): void {

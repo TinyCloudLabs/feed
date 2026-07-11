@@ -1,5 +1,6 @@
 import {
   deserializeDelegation,
+  principalDid,
   principalDidEquals,
   TinyCloudNode,
   type DelegatedAccess,
@@ -140,7 +141,7 @@ export function actorIdsMatch(a: string, b: string): boolean {
 
 export function createFeedHostPolicy(delegateDID: string): FeedHostDelegationPolicy {
   return {
-    delegateDID,
+    delegateDID: principalDid(delegateDID),
     resources: FEED_HOST_DELEGATION_RESOURCES,
   };
 }
