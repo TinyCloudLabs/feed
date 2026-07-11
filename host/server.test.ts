@@ -99,6 +99,18 @@ describe("Feed Host server", () => {
 
     const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
     expect(policy.resources.map((resource) => resource.path)).toEqual(FEED_HOST_DELEGATION_RESOURCES.map((resource) => resource.path));
+    expect(policy.resources).toContainEqual({
+      service: "tinycloud.sql",
+      serviceShort: "sql",
+      path: "xyz.tinycloud.listen/conversations",
+      actions: ["tinycloud.sql/read"],
+    });
+    expect(policy.resources).toContainEqual({
+      service: "tinycloud.kv",
+      serviceShort: "kv",
+      path: "xyz.tinycloud.listen/transcript/",
+      actions: ["tinycloud.kv/get", "tinycloud.kv/list"],
+    });
 
     const openApi = await getJson<{ paths: Record<string, unknown> }>(`${runtime.url}/api/openapi.json`);
     expect(Object.keys(openApi.paths).sort()).toEqual(
