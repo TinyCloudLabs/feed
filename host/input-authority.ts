@@ -18,6 +18,7 @@ export type InputAuthorityLineage = {
 export type InspectedInputAuthority = InputAuthorityLineage & {
   actorId: string;
   audienceDID: string;
+  canonicalPortableDelegation: string;
   revoked?: boolean;
 };
 
@@ -84,7 +85,14 @@ export class InputAuthorityRegistry {
       expectedHost: input.expectedHost,
       now: this.now(),
     });
-    if (inspected.childCid !== request.childCid) throw invalidInspection();
+    const canonical = validateTerminalChildTransport(inspected.canonicalPortableDelegation);
+    if (inspected.childCid !== request.childCid || canonical.cid !== inspected.childCid) throw invalidInspection();
+    if (
+      canonical.delegateDID !== inspected.audienceDID || normalizeHost(canonical.host) !== normalizeHost(inspected.host) ||
+      canonical.spaceId !== inspected.space || canonical.path !== inspected.path ||
+      !sameStrings(canonical.actions, inspected.actions) || canonical.expiry !== inspected.expiry ||
+      canonical.parentCid !== inspected.parentCid
+    ) throw invalidInspection();
     const records = await this.read(input.actor);
     if (records.some((record) => record.sourceId === request.sourceId)) {
       throw new FeedHostError("input authority sourceId already exists", 409, "input_authority_conflict");
@@ -93,16 +101,16 @@ export class InputAuthorityRegistry {
       sourceId: request.sourceId,
       displayName: request.displayName,
       actorId: normalizeActorId(input.actor.actorId),
-      portableDelegation: request.portableDelegation,
-      childCid: inspected.childCid,
-      host: normalizeHost(inspected.host),
-      space: inspected.space,
-      path: inspected.path,
-      actions: [...inspected.actions],
-      expiry: inspected.expiry,
-      ...(inspected.parentCid ? { parentCid: inspected.parentCid } : {}),
+      portableDelegation: inspected.canonicalPortableDelegation,
+      childCid: canonical.cid,
+      host: normalizeHost(canonical.host),
+      space: canonical.spaceId,
+      path: canonical.path,
+      actions: [...canonical.actions],
+      expiry: canonical.expiry,
+      parentCid: canonical.parentCid,
       ...(inspected.parentLineage ? { parentLineage: [...inspected.parentLineage] } : {}),
-      agentDID: inspected.agentDID,
+      agentDID: canonical.delegateDID,
       attachedAt: this.now().toISOString(),
     };
     await this.write(input.actor, [...records, record]);
@@ -240,37 +248,91 @@ export function validateAttachBody(value: unknown): {
   const displayName = typeof record.displayName === "string" ? record.displayName.trim() : "";
   const portableDelegation = typeof record.portableDelegation === "string" ? record.portableDelegation.trim() : "";
   if (!SOURCE_ID.test(sourceId)) throw new FeedHostError("sourceId is invalid", 400, "invalid_input_authority");
-  if (!displayName || displayName.length > 100) throw new FeedHostError("displayName is invalid", 400, "invalid_input_authority");
+  if (!displayName || displayName.length > 100 || credentialShapedString(displayName)) {
+    throw new FeedHostError("displayName is invalid", 400, "invalid_input_authority");
+  }
   if (!portableDelegation || portableDelegation.length > 65_536 || portableDelegation.startsWith("tc1:")) {
     throw new FeedHostError("a child portable delegation is required", 400, "invalid_input_authority");
   }
-  const childCid = validateTerminalChildTransport(portableDelegation);
-  return { sourceId, displayName, portableDelegation, childCid };
+  const child = validateTerminalChildTransport(portableDelegation);
+  return { sourceId, displayName, portableDelegation, childCid: child.cid };
 }
 
-function validateTerminalChildTransport(serialized: string): string {
+type TerminalChildTransport = {
+  cid: string;
+  delegateDID: string;
+  delegatorDID: string;
+  spaceId: string;
+  path: string;
+  actions: string[];
+  expiry: string;
+  parentCid: string;
+  host: string;
+};
+
+function validateTerminalChildTransport(serialized: string): TerminalChildTransport {
   let value: unknown;
   try {
     value = JSON.parse(serialized);
   } catch {
     throw invalidTransport();
   }
-  if (!isPlainRecord(value) || !hasExactKeys(value, CHILD_FIELDS)) throw invalidTransport();
+  if (!isPlainRecord(value) || !hasExactKeys(value, CHILD_FIELDS) || containsCredentialShapedString(value)) throw invalidTransport();
   const header = value.delegationHeader;
   const resources = value.resources;
   if (
     !nonEmptyString(value.cid) || !nonEmptyString(value.delegateDID) || !nonEmptyString(value.delegatorDID) ||
     !nonEmptyString(value.spaceId) || !nonEmptyString(value.path) || !stringArray(value.actions) ||
-    !nonEmptyString(value.expiry) || value.isRevoked !== false || value.allowSubDelegation !== false ||
-    !nonEmptyString(value.parentCid) || !nonEmptyString(value.createdAt) ||
-    !nonEmptyString(value.ownerAddress) || typeof value.chainId !== "number" || !Number.isInteger(value.chainId) ||
+    !validIsoDate(value.expiry) || value.isRevoked !== false || value.allowSubDelegation !== false ||
+    !nonEmptyString(value.parentCid) || !validIsoDate(value.createdAt) ||
+    typeof value.ownerAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(value.ownerAddress) ||
+    typeof value.chainId !== "number" || !Number.isSafeInteger(value.chainId) ||
     !nonEmptyString(value.host) || value.disableSubDelegation !== true ||
-    !isPlainRecord(header) || !hasExactKeys(header, CHILD_HEADER_FIELDS) || !nonEmptyString(header.Authorization) ||
+    !isPlainRecord(header) || !hasExactKeys(header, CHILD_HEADER_FIELDS) || !validCompactJwt(header.Authorization) ||
+    typeof value.delegateDID !== "string" || !/^did:(?:key|pkh):[^\s]+$/.test(value.delegateDID) ||
+    typeof value.delegatorDID !== "string" || !/^did:(?:key|pkh):[^\s]+$/.test(value.delegatorDID) ||
     !Array.isArray(resources) || resources.length === 0 || !resources.every(validChildResource)
   ) {
     throw invalidTransport();
   }
-  return value.cid;
+  return value as unknown as TerminalChildTransport;
+}
+
+function containsCredentialShapedString(value: unknown, path: string[] = []): boolean {
+  if (typeof value === "string") {
+    if (path.join(".") === "delegationHeader.Authorization") return false;
+    return credentialShapedString(value);
+  }
+  if (Array.isArray(value)) return value.some((item, index) => containsCredentialShapedString(item, [...path, String(index)]));
+  if (!isPlainRecord(value)) return false;
+  return Object.entries(value).some(([key, item]) => {
+    const nextPath = [...path, key];
+    const authorization = nextPath.join(".") === "delegationHeader.Authorization";
+    return (!authorization && (FORBIDDEN_CREDENTIAL_FIELD.test(key) || /publicDelegation|companionDelegation/i.test(key))) ||
+      containsCredentialShapedString(item, nextPath);
+  });
+}
+
+function credentialShapedString(value: string): boolean {
+  if (/(?:^|\s)(?:tc1:|bearer\s)|private.?jwk|private.?key|parent.?bearer|raw.?credential|publicDelegation|companionDelegation|secret/i.test(value)) {
+    return true;
+  }
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return Boolean(parsed) && typeof parsed === "object";
+  } catch {
+    return false;
+  }
+}
+
+function validCompactJwt(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+}
+
+function validIsoDate(value: unknown): value is string {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 }
 
 function validChildResource(value: unknown): boolean {
@@ -297,6 +359,10 @@ function stringArray(value: unknown): value is string[] {
 
 function invalidTransport(): FeedHostError {
   return new FeedHostError("a terminal child portable delegation is required", 400, "invalid_input_authority");
+}
+
+function sameStrings(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 export function validateInspection(
@@ -372,7 +438,7 @@ function validStoredRecord(value: unknown, actorId: string): value is StoredInpu
 
 function terminalChildCid(serialized: string): string | null {
   try {
-    return validateTerminalChildTransport(serialized);
+    return validateTerminalChildTransport(serialized).cid;
   } catch {
     return null;
   }

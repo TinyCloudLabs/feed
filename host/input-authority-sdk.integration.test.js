@@ -79,13 +79,16 @@ describe("approved TinyCloud SDK input-authority integration", () => {
     });
     expect(submission.portableDelegation).not.toContain(shareKeyJwk.d);
     expect(submission.portableDelegation).not.toContain(parentSession.delegationHeader.Authorization);
+    const callerTransport = JSON.parse(submission.portableDelegation);
+    callerTransport.delegatorDID = "did:key:zCallerMetadata";
+    callerTransport.createdAt = "2026-01-01T00:00:00.000Z";
 
-    const { actor } = fakeActor(`did:pkh:eip155:1:${owner.address}`);
+    const { actor, data } = fakeActor(`did:pkh:eip155:1:${owner.address}`);
     const registry = new InputAuthorityRegistry();
     const feedHostPrincipal = feedHost.did.split("#")[0];
     const attached = await registry.attach({
       actor,
-      body: submission,
+      body: { ...submission, portableDelegation: JSON.stringify(callerTransport) },
       expectedAudienceDID: feedHostPrincipal,
       expectedHost: host,
       inspect: async ({ portableDelegation, expectedAudienceDID, expectedHost }) => {
@@ -94,7 +97,8 @@ describe("approved TinyCloud SDK input-authority integration", () => {
           expectedDelegateDID: expectedAudienceDID,
           expectedHost,
         });
-        await feedHost.useDelegation(inspected.portableDelegation);
+        const access = await feedHost.useDelegation(inspected.portableDelegation);
+        expect(access.delegation.cid).toBe(inspected.childCid);
         const { portableDelegation: _portable, ...lineage } = inspected;
         return lineage;
       },
@@ -107,6 +111,10 @@ describe("approved TinyCloud SDK input-authority integration", () => {
       parentCid: parentSession.delegationCid,
       agentDID: feedHostPrincipal,
     });
+    const stored = JSON.stringify([...data.values()]);
+    expect(stored).not.toContain("zCallerMetadata");
+    expect(stored).not.toContain("2026-01-01T00:00:00.000Z");
+    expect(stored).toContain(shareKeyDid);
   });
 });
 
@@ -127,5 +135,6 @@ function fakeActor(actorId) {
         },
       },
     },
+    data,
   };
 }

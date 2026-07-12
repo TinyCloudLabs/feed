@@ -249,6 +249,7 @@ describe("Feed Host server", () => {
         inspections += 1;
         return {
           childCid: "bafy-child",
+          canonicalPortableDelegation: childTransport(),
           actorId: ACTOR_ID,
           audienceDID: expectedAudienceDID,
           host: "https://node.tinycloud.xyz",
@@ -2401,7 +2402,7 @@ function childTransport(): string {
     allowSubDelegation: false,
     parentCid: "bafy-parent",
     createdAt: "2026-07-19T00:00:00.000Z",
-    delegationHeader: { Authorization: "Bearer child.jwt.signature" },
+    delegationHeader: { Authorization: "child.jwt.signature" },
     ownerAddress: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
     chainId: 1,
     host: "https://node.tinycloud.xyz",

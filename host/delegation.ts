@@ -261,6 +261,7 @@ export function validateInputAuthorityDelegation(input: {
   now?: Date;
 }): {
   portableDelegation: PortableDelegation;
+  canonicalPortableDelegation: string;
   childCid: string;
   actorId: string;
   audienceDID: string;
@@ -274,6 +275,7 @@ export function validateInputAuthorityDelegation(input: {
   agentDID: string;
   revoked: boolean;
 } {
+  const inspectedAt = input.now ?? new Date();
   let delegation: DelegationLike;
   try {
     delegation = deserializeDelegation(input.serializedDelegation) as DelegationLike;
@@ -293,7 +295,7 @@ export function validateInputAuthorityDelegation(input: {
   if (!signedExpiry || Number.isNaN(signedExpiry.getTime())) {
     throw new FeedDelegationError("input authority signed expiry is invalid", "malformed");
   }
-  if (signedExpiry <= (input.now ?? new Date())) throw new FeedDelegationError("input authority is expired", "expired");
+  if (signedExpiry <= inspectedAt) throw new FeedDelegationError("input authority is expired", "expired");
   const grants = signedGrantsFromDelegation(delegation);
   if (grants.length !== 1) throw new FeedDelegationError("input authority must grant one transcript resource", "insufficient_policy");
   const grant = grants[0]!;
@@ -312,8 +314,34 @@ export function validateInputAuthorityDelegation(input: {
   if (normalizeOrigin(host) !== normalizeOrigin(input.expectedHost)) {
     throw new FeedDelegationError("input authority host is not allowlisted", "insufficient_policy");
   }
+  const issuerDID = typeof payload.iss === "string" ? principalDid(payload.iss) : "";
+  if (!issuerDID) throw new FeedDelegationError("input authority signed issuer is missing", "malformed");
+  const owner = ownerFromActorId(actorId);
+  if (!owner) throw new FeedDelegationError("input authority owner is malformed", "actor_mismatch");
+  const authorization = delegation.delegationHeader?.Authorization;
+  if (!authorization) throw new FeedDelegationError("input authority authorization is missing", "malformed");
+  const canonicalPortableDelegation = JSON.stringify({
+    cid: delegation.cid,
+    delegateDID: audienceDID,
+    delegatorDID: issuerDID,
+    spaceId: grant.space,
+    path: grant.path,
+    actions: [...grant.actions],
+    expiry: signedExpiry.toISOString(),
+    isRevoked: false,
+    allowSubDelegation: false,
+    parentCid: delegation.parentCid,
+    createdAt: inspectedAt.toISOString(),
+    delegationHeader: { Authorization: authorization },
+    ownerAddress: owner.address,
+    chainId: owner.chainId,
+    host: normalizeOrigin(input.expectedHost),
+    resources: [{ service: grant.service, space: grant.space, path: grant.path, actions: [...grant.actions] }],
+    disableSubDelegation: true,
+  });
   return {
     portableDelegation: delegation,
+    canonicalPortableDelegation,
     childCid: delegation.cid,
     actorId,
     audienceDID,
@@ -327,6 +355,13 @@ export function validateInputAuthorityDelegation(input: {
     agentDID: principalDid(input.expectedDelegateDID),
     revoked: delegation.isRevoked === true,
   };
+}
+
+function ownerFromActorId(actorId: string): { chainId: number; address: string } | null {
+  const match = actorId.match(/^did:pkh:eip155:(\d+):(0x[a-fA-F0-9]{40})$/);
+  if (!match) return null;
+  const chainId = Number(match[1]);
+  return Number.isSafeInteger(chainId) ? { chainId, address: match[2]! } : null;
 }
 
 export function hasCompleteFeedHostDelegation<T extends AcceptedFeedDelegation>(

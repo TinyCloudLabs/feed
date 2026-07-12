@@ -172,7 +172,10 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       expectedDelegateDID: input.expectedAudienceDID,
       expectedHost: input.expectedHost,
     });
-    await hostNode.useDelegation(inspected.portableDelegation);
+    const access = await hostNode.useDelegation(inspected.portableDelegation);
+    if (access.delegation.cid !== inspected.childCid) {
+      throw new FeedDelegationError("input authority activation CID does not match the signed child", "malformed");
+    }
     const { portableDelegation: _portableDelegation, ...lineage } = inspected;
     return lineage;
   });

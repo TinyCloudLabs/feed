@@ -16,7 +16,10 @@ describe("named input authorities", () => {
   test("stores only a child delegation and returns redacted non-secret lineage", async () => {
     const { actor, data } = fakeActor(ACTOR);
     const registry = new InputAuthorityRegistry(() => NOW);
-    const portableDelegation = childTransport();
+    const portableDelegation = childTransport({
+      delegatorDID: "did:key:zCallerMetadata",
+      createdAt: "2026-07-18T00:00:00.000Z",
+    });
     const view = await registry.attach({
       actor,
       body: { sourceId: "team-listen", displayName: "Team Listen", portableDelegation },
@@ -37,6 +40,9 @@ describe("named input authorities", () => {
     expect(JSON.stringify(view)).not.toContain("child.jwt.signature");
     expect(JSON.stringify(view)).not.toContain("tc1:");
     expect(JSON.stringify([...data.values()])).toContain("child.jwt.signature");
+    expect(JSON.stringify([...data.values()])).not.toContain("zCallerMetadata");
+    expect(JSON.stringify([...data.values()])).not.toContain("2026-07-18T00:00:00.000Z");
+    expect(JSON.stringify([...data.values()])).toContain("did:key:zShare");
     expect([...data.keys()]).toEqual([
       `xyz.tinycloud.feed/settings/input-authorities/${encodeURIComponent(ACTOR.toLowerCase())}.json`,
     ]);
@@ -74,6 +80,7 @@ describe("named input authorities", () => {
       { sourceId: "raw", displayName: "Raw", portableDelegation: "child", clientPrivateJwk: { d: "secret" } },
       { sourceId: "raw", displayName: "Raw", portableDelegation: "child", parentBearer: "Bearer secret" },
       { sourceId: "raw", displayName: "Raw", portableDelegation: "tc1:super-secret" },
+      { sourceId: "raw", displayName: JSON.stringify({ privateJwk: { d: "super-secret" } }), portableDelegation: childTransport() },
     ]) {
       const error = await registry.attach({
         actor,
@@ -103,6 +110,8 @@ describe("named input authorities", () => {
       { ...valid, companionDelegation: { ...valid } },
       { ...valid, delegationHeader: { ...(valid.delegationHeader as object), privateJwk: { d: "nested-secret" } } },
       { ...valid, resources: [{ ...resource, parentBearer: "Bearer nested-secret" }] },
+      { ...valid, createdAt: JSON.stringify({ privateJwk: { d: "nested-secret" } }) },
+      { ...valid, delegatorDID: "Bearer nested-secret" },
       { ...valid, disableSubDelegation: false },
       { ...valid, allowSubDelegation: true },
     ];
@@ -178,6 +187,7 @@ describe("named input authorities", () => {
 function inspection(overrides: Partial<InspectedInputAuthority> = {}): InspectedInputAuthority {
   return {
     childCid: "bafy-child",
+    canonicalPortableDelegation: childTransport({ cid: overrides.childCid ?? "bafy-child" }),
     actorId: ACTOR,
     audienceDID: HOST_DID,
     host: HOST,
@@ -205,7 +215,7 @@ function childTransport(overrides: Record<string, unknown> = {}): string {
     allowSubDelegation: false,
     parentCid: "bafy-parent",
     createdAt: "2026-07-19T00:00:00.000Z",
-    delegationHeader: { Authorization: "Bearer child.jwt.signature" },
+    delegationHeader: { Authorization: "child.jwt.signature" },
     ownerAddress: "0x1111111111111111111111111111111111111111",
     chainId: 1,
     host: HOST,
