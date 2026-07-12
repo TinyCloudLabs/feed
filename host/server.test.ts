@@ -619,6 +619,7 @@ describe("Feed Host server", () => {
 
     await grantAllDelegations(runtime, ACTOR_ID);
 
+    const createdAt = new Date().toISOString();
     const intent = await postJson(
       `${runtime.url}/control-intents`,
       {
@@ -628,7 +629,7 @@ describe("Feed Host server", () => {
         intentKind: "ask_feed",
         targetRef: "feed",
         payload: { prompt: "Summarize my week" },
-        createdAt: "2026-07-10T22:00:00.000Z",
+        createdAt,
       },
       { "x-feed-actor-id": ACTOR_ID },
     );
