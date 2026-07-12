@@ -4,6 +4,7 @@ import { FeedHostError, type FeedHostActorStorage } from "./storage.ts";
 export type InputAuthorityState = "active" | "expired" | "revoked" | "unavailable";
 
 export type InputAuthorityLineage = {
+  childCid: string;
   host: string;
   space: string;
   path: string;
@@ -26,6 +27,12 @@ export type InputAuthorityInspector = (input: {
   expectedHost: string;
 }) => Promise<InspectedInputAuthority>;
 
+export type InputAuthorityTruthCheck = (input: {
+  childCid: string;
+}) => Promise<InputAuthorityState>;
+
+export type InputAuthorityRevoker = (input: { childCid: string }) => Promise<boolean>;
+
 export type StoredInputAuthority = InputAuthorityLineage & {
   sourceId: string;
   displayName: string;
@@ -47,6 +54,13 @@ const SOURCE_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
 const ALLOWED_ACTIONS = new Set(["tinycloud.sql/read", "tinycloud.kv/get", "tinycloud.kv/list"]);
 const REQUEST_FIELDS = new Set(["sourceId", "displayName", "portableDelegation"]);
 const FORBIDDEN_CREDENTIAL_FIELD = /(tc1|private.?jwk|private.?key|parent.?bearer|raw.?credential|authorization|secret)/i;
+const CHILD_FIELDS = new Set([
+  "cid", "delegateDID", "delegatorDID", "spaceId", "path", "actions", "expiry", "isRevoked",
+  "allowSubDelegation", "parentCid", "createdAt", "delegationHeader", "ownerAddress", "chainId", "host",
+  "resources", "disableSubDelegation",
+]);
+const CHILD_HEADER_FIELDS = new Set(["Authorization"]);
+const CHILD_RESOURCE_FIELDS = new Set(["service", "space", "path", "actions"]);
 
 export class InputAuthorityRegistry {
   constructor(private readonly now: () => Date = () => new Date()) {}
@@ -70,6 +84,7 @@ export class InputAuthorityRegistry {
       expectedHost: input.expectedHost,
       now: this.now(),
     });
+    if (inspected.childCid !== request.childCid) throw invalidInspection();
     const records = await this.read(input.actor);
     if (records.some((record) => record.sourceId === request.sourceId)) {
       throw new FeedHostError("input authority sourceId already exists", 409, "input_authority_conflict");
@@ -79,6 +94,7 @@ export class InputAuthorityRegistry {
       displayName: request.displayName,
       actorId: normalizeActorId(input.actor.actorId),
       portableDelegation: request.portableDelegation,
+      childCid: inspected.childCid,
       host: normalizeHost(inspected.host),
       space: inspected.space,
       path: inspected.path,
@@ -90,21 +106,27 @@ export class InputAuthorityRegistry {
       attachedAt: this.now().toISOString(),
     };
     await this.write(input.actor, [...records, record]);
-    return toView(record, this.now());
+    return toView(record, this.now(), "active");
   }
 
-  async list(actor: FeedHostActorStorage): Promise<InputAuthorityView[]> {
-    return (await this.read(actor)).map((record) => toView(record, this.now()));
+  async list(actor: FeedHostActorStorage, check?: InputAuthorityTruthCheck): Promise<InputAuthorityView[]> {
+    const views: InputAuthorityView[] = [];
+    for (const record of await this.read(actor)) views.push(await this.refresh(record, actor, check));
+    return views;
   }
 
-  async get(actor: FeedHostActorStorage, sourceId: string): Promise<InputAuthorityView> {
-    return toView(await this.requireRecord(actor, sourceId), this.now());
+  async get(actor: FeedHostActorStorage, sourceId: string, check?: InputAuthorityTruthCheck): Promise<InputAuthorityView> {
+    return this.refresh(await this.requireRecord(actor, sourceId), actor, check);
   }
 
-  async revoke(actor: FeedHostActorStorage, sourceId: string): Promise<InputAuthorityView> {
+  async revoke(actor: FeedHostActorStorage, sourceId: string, revoke: InputAuthorityRevoker): Promise<InputAuthorityView> {
     const records = await this.read(actor);
     const index = records.findIndex((record) => record.sourceId === sourceId);
     if (index < 0) throw new FeedHostError("input authority not found", 404, "not_found");
+    const confirmed = await revoke({ childCid: records[index]!.childCid }).catch(() => false);
+    if (!confirmed) {
+      throw new FeedHostError("input authority revocation was not confirmed by TinyCloud", 502, "input_authority_unavailable");
+    }
     const next = { ...records[index]!, revokedAt: this.now().toISOString() };
     records[index] = next;
     await this.write(actor, records);
@@ -138,6 +160,42 @@ export class InputAuthorityRegistry {
     return record;
   }
 
+  private async refresh(
+    record: StoredInputAuthority,
+    actor: FeedHostActorStorage,
+    check?: InputAuthorityTruthCheck,
+  ): Promise<InputAuthorityView> {
+    if (record.revokedAt) return toView(record, this.now(), "revoked");
+    if (Date.parse(record.expiry) <= this.now().getTime()) return toView(record, this.now(), "expired");
+    if (!check) return toView(record, this.now(), "unavailable");
+    const state = await check({ childCid: record.childCid }).catch(() => "unavailable" as const);
+    if (state === "revoked") {
+      const next = { ...record, revokedAt: this.now().toISOString() };
+      await this.replace(actor, next);
+      return toView(next, this.now(), "revoked");
+    }
+    if (state === "unavailable") {
+      const next = { ...record, unavailableAt: this.now().toISOString(), unavailableReason: "TinyCloud status unavailable" };
+      await this.replace(actor, next);
+      return toView(next, this.now(), "unavailable");
+    }
+    if (state === "expired") return toView(record, this.now(), "expired");
+    if (record.unavailableAt) {
+      const { unavailableAt: _unavailableAt, unavailableReason: _unavailableReason, ...available } = record;
+      await this.replace(actor, available);
+      return toView(available, this.now(), "active");
+    }
+    return toView(record, this.now(), "active");
+  }
+
+  private async replace(actor: FeedHostActorStorage, next: StoredInputAuthority): Promise<void> {
+    const records = await this.read(actor);
+    const index = records.findIndex((record) => record.sourceId === next.sourceId);
+    if (index < 0) return;
+    records[index] = next;
+    await this.write(actor, records);
+  }
+
   private async read(actor: FeedHostActorStorage): Promise<StoredInputAuthority[]> {
     const result = await actor.settings.kv.get<StoredInputAuthority[] | string>(keyFor(actor.actorId));
     if (!result.ok) {
@@ -168,6 +226,7 @@ export function validateAttachBody(value: unknown): {
   sourceId: string;
   displayName: string;
   portableDelegation: string;
+  childCid: string;
 } {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new FeedHostError("input authority body must be an object", 400, "invalid_input_authority");
@@ -185,7 +244,59 @@ export function validateAttachBody(value: unknown): {
   if (!portableDelegation || portableDelegation.length > 65_536 || portableDelegation.startsWith("tc1:")) {
     throw new FeedHostError("a child portable delegation is required", 400, "invalid_input_authority");
   }
-  return { sourceId, displayName, portableDelegation };
+  const childCid = validateTerminalChildTransport(portableDelegation);
+  return { sourceId, displayName, portableDelegation, childCid };
+}
+
+function validateTerminalChildTransport(serialized: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw invalidTransport();
+  }
+  if (!isPlainRecord(value) || !hasExactKeys(value, CHILD_FIELDS)) throw invalidTransport();
+  const header = value.delegationHeader;
+  const resources = value.resources;
+  if (
+    !nonEmptyString(value.cid) || !nonEmptyString(value.delegateDID) || !nonEmptyString(value.delegatorDID) ||
+    !nonEmptyString(value.spaceId) || !nonEmptyString(value.path) || !stringArray(value.actions) ||
+    !nonEmptyString(value.expiry) || value.isRevoked !== false || value.allowSubDelegation !== false ||
+    !nonEmptyString(value.parentCid) || !nonEmptyString(value.createdAt) ||
+    !nonEmptyString(value.ownerAddress) || typeof value.chainId !== "number" || !Number.isInteger(value.chainId) ||
+    !nonEmptyString(value.host) || value.disableSubDelegation !== true ||
+    !isPlainRecord(header) || !hasExactKeys(header, CHILD_HEADER_FIELDS) || !nonEmptyString(header.Authorization) ||
+    !Array.isArray(resources) || resources.length === 0 || !resources.every(validChildResource)
+  ) {
+    throw invalidTransport();
+  }
+  return value.cid;
+}
+
+function validChildResource(value: unknown): boolean {
+  return isPlainRecord(value) && hasExactKeys(value, CHILD_RESOURCE_FIELDS) &&
+    nonEmptyString(value.service) && nonEmptyString(value.space) && nonEmptyString(value.path) && stringArray(value.actions);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value) && Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function hasExactKeys(value: Record<string, unknown>, allowed: Set<string>): boolean {
+  const keys = Object.keys(value);
+  return keys.length === allowed.size && keys.every((key) => allowed.has(key));
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 && value.every(nonEmptyString);
+}
+
+function invalidTransport(): FeedHostError {
+  return new FeedHostError("a terminal child portable delegation is required", 400, "invalid_input_authority");
 }
 
 export function validateInspection(
@@ -222,15 +333,15 @@ export function validateInspection(
   }
 }
 
-function toView(record: StoredInputAuthority, now: Date): InputAuthorityView {
+function toView(record: StoredInputAuthority, now: Date, confirmedState?: InputAuthorityState): InputAuthorityView {
   const { portableDelegation: _portableDelegation, unavailableReason: _unavailableReason, ...safe } = record;
-  const state: InputAuthorityState = record.revokedAt
+  const state: InputAuthorityState = confirmedState ?? (record.revokedAt
     ? "revoked"
     : Date.parse(record.expiry) <= now.getTime()
       ? "expired"
       : record.unavailableAt
         ? "unavailable"
-        : "active";
+        : "unavailable");
   return { ...safe, hasPortableDelegation: true, state };
 }
 
@@ -249,13 +360,22 @@ function validStoredRecord(value: unknown, actorId: string): value is StoredInpu
     typeof record.sourceId === "string" && SOURCE_ID.test(record.sourceId) &&
     typeof record.displayName === "string" &&
     typeof record.actorId === "string" && normalizeActorId(record.actorId) === normalizeActorId(actorId) &&
-    typeof record.portableDelegation === "string" && record.portableDelegation.length <= 65_536 && !record.portableDelegation.startsWith("tc1:") &&
+    typeof record.portableDelegation === "string" && record.portableDelegation.length <= 65_536 && terminalChildCid(record.portableDelegation) === record.childCid &&
+    typeof record.childCid === "string" && record.childCid.length > 0 &&
     typeof record.host === "string" && typeof record.space === "string" &&
     typeof record.path === "string" && Array.isArray(record.actions) && isAllowedTranscriptGrant(record.path, record.actions) &&
     typeof record.expiry === "string" && typeof record.parentCid === "string" && record.parentCid.length > 0 &&
     Array.isArray(record.parentLineage) && record.parentLineage.length > 0 && record.parentLineage.every((cid) => typeof cid === "string") &&
     typeof record.agentDID === "string" && typeof record.attachedAt === "string"
   );
+}
+
+function terminalChildCid(serialized: string): string | null {
+  try {
+    return validateTerminalChildTransport(serialized);
+  } catch {
+    return null;
+  }
 }
 
 function isAllowedTranscriptGrant(path: string, actions: unknown[]): actions is string[] {

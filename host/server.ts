@@ -44,6 +44,8 @@ import { levelForStatus, logEvent } from "./log.ts";
 import {
   InputAuthorityRegistry,
   type InputAuthorityInspector,
+  type InputAuthorityRevoker,
+  type InputAuthorityTruthCheck,
 } from "./input-authority.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
@@ -73,6 +75,8 @@ export type FeedHostServerOptions = {
     expectedDelegateDID: string;
   }) => Promise<ActivatedFeedDelegation>;
   inspectInputAuthority?: InputAuthorityInspector;
+  checkInputAuthority?: InputAuthorityTruthCheck;
+  revokeInputAuthority?: InputAuthorityRevoker;
   inputAuthorityExpectedHost?: string;
 };
 
@@ -102,6 +106,8 @@ type FeedHostContext = {
   enableDevPublisher: boolean;
   inputAuthorities: InputAuthorityRegistry;
   inspectInputAuthority: InputAuthorityInspector;
+  checkInputAuthority: InputAuthorityTruthCheck;
+  revokeInputAuthority: InputAuthorityRevoker;
   inputAuthorityExpectedHost: string;
 };
 
@@ -170,6 +176,19 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     const { portableDelegation: _portableDelegation, ...lineage } = inspected;
     return lineage;
   });
+  const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
+    const result = await hostNode.listDelegations();
+    if (!result.ok) return "unavailable";
+    const child = result.data.find((delegation) => delegation.cid === childCid);
+    if (!child) return "unavailable";
+    if (child.isRevoked) return "revoked";
+    if (child.expiry.getTime() <= Date.now()) return "expired";
+    return "active";
+  });
+  const revokeInputAuthority: InputAuthorityRevoker = options.revokeInputAuthority ?? (async ({ childCid }) => {
+    const result = await hostNode.revokeDelegation(childCid);
+    return result.ok;
+  });
   let context: FeedHostContext | null = null;
 
   const getContext = async (): Promise<FeedHostContext> => {
@@ -187,6 +206,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       enableDevPublisher: options.enableDevPublisher === true,
       inputAuthorities,
       inspectInputAuthority,
+      checkInputAuthority,
+      revokeInputAuthority,
       inputAuthorityExpectedHost: options.inputAuthorityExpectedHost ?? options.tinycloudHost ?? "https://node.tinycloud.xyz",
     };
     return context;
@@ -261,6 +282,8 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     delegationStore,
     inputAuthorities,
     inspectInputAuthority,
+    checkInputAuthority,
+    revokeInputAuthority,
     inputAuthorityExpectedHost,
   } = context;
   const url = new URL(request.url);
@@ -363,7 +386,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (url.pathname === "/input-authorities" && request.method === "GET") {
     const actor = await requireCompleteActor(request, context);
-    return json({ items: await inputAuthorities.list(actorStorage(actor)) });
+    return json({ items: await inputAuthorities.list(actorStorage(actor), checkInputAuthority) });
   }
 
   if (url.pathname === "/input-authorities" && request.method === "POST") {
@@ -385,14 +408,14 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const sourceId = decodeURIComponent(inputAuthorityMatch[1]);
     const action = inputAuthorityMatch[2];
     if (request.method === "GET" && action === undefined) {
-      return json(await inputAuthorities.get(actorStorage(actor), sourceId));
+      return json(await inputAuthorities.get(actorStorage(actor), sourceId, checkInputAuthority));
     }
     if (request.method === "GET" && action === "status") {
-      const item = await inputAuthorities.get(actorStorage(actor), sourceId);
+      const item = await inputAuthorities.get(actorStorage(actor), sourceId, checkInputAuthority);
       return json({ sourceId: item.sourceId, state: item.state, expiry: item.expiry, revokedAt: item.revokedAt });
     }
     if (request.method === "POST" && action === "revoke") {
-      return json({ revoked: true, item: await inputAuthorities.revoke(actorStorage(actor), sourceId) });
+      return json({ revoked: true, item: await inputAuthorities.revoke(actorStorage(actor), sourceId, revokeInputAuthority) });
     }
     if (request.method === "DELETE" && action === undefined) {
       await inputAuthorities.remove(actorStorage(actor), sourceId);

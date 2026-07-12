@@ -120,6 +120,9 @@ type DelegationLike = PortableDelegation & {
   host?: string;
   parentCid?: string;
   isRevoked?: boolean;
+  cid?: string;
+  allowSubDelegation?: boolean;
+  disableSubDelegation?: boolean;
 };
 
 export class FeedDelegationError extends Error {
@@ -258,6 +261,7 @@ export function validateInputAuthorityDelegation(input: {
   now?: Date;
 }): {
   portableDelegation: PortableDelegation;
+  childCid: string;
   actorId: string;
   audienceDID: string;
   host: string;
@@ -301,12 +305,16 @@ export function validateInputAuthorityDelegation(input: {
   if (!delegation.parentCid || proofs.length === 0 || proofs[0] !== delegation.parentCid) {
     throw new FeedDelegationError("input authority parent lineage does not match signed proof", "malformed");
   }
+  if (!delegation.cid || delegation.disableSubDelegation !== true || delegation.allowSubDelegation !== false) {
+    throw new FeedDelegationError("input authority is not a terminal child delegation", "malformed");
+  }
   const host = typeof delegation.host === "string" ? delegation.host : "";
   if (normalizeOrigin(host) !== normalizeOrigin(input.expectedHost)) {
     throw new FeedDelegationError("input authority host is not allowlisted", "insufficient_policy");
   }
   return {
     portableDelegation: delegation,
+    childCid: delegation.cid,
     actorId,
     audienceDID,
     host,
