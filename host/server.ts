@@ -1,8 +1,12 @@
 import type { DelegatedAccess, TinyCloudNode } from "@tinycloud/node-sdk";
 import type {
   ControlIntentEvent,
+  FeedArtifact,
   FeedbackEvent,
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type { FeedControlIntentInput, FeedControlIntentKind, FeedGenerationRequestRecord } from "./logic.ts";
+import { validateFeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import { artifactIndexRow } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import {
   buildOpenApiDocument,
   buildServerInfo,
@@ -18,6 +22,7 @@ import {
   FEED_HOST_ARTIFACT_DOC_PREFIX,
   FEED_HOST_ARTIFACTS_DB_PATH,
   FEED_HOST_FEED_DB_PATH,
+  FEED_HOST_FEED_SETTINGS_PREFIX,
   hasCompleteFeedHostDelegation,
   normalizeActorId,
   type AcceptedFeedDelegation,
@@ -29,6 +34,7 @@ import {
   LEGACY_INTERACTIONS_DB_PATH,
 } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
+import { levelForStatus, logEvent } from "./log.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
   FeedHostError,
@@ -50,6 +56,7 @@ export type FeedHostServerOptions = {
   seedOnStart?: boolean;
   storage?: FeedHostStorage;
   hostNode?: TinyCloudNode;
+  enableDevPublisher?: boolean;
   delegationStore?: FeedHostDelegationStore | null;
   activateDelegation?: (input: {
     serializedDelegation: string;
@@ -80,6 +87,7 @@ type FeedHostContext = {
   activateDelegation: NonNullable<FeedHostServerOptions["activateDelegation"]>;
   seedOnStart: boolean;
   delegationStore: FeedHostDelegationStore | null;
+  enableDevPublisher: boolean;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -150,6 +158,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       activateDelegation,
       seedOnStart: options.seedOnStart !== false,
       delegationStore,
+      enableDevPublisher: options.enableDevPublisher === true,
     };
     return context;
   };
@@ -165,15 +174,31 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       }
 
       const url = new URL(request.url);
+      const startedAt = performance.now();
+      const logRequest = (response: Response, errorCode?: string) => {
+        if (request.method === "GET" && PUBLIC_PATHS.has(url.pathname)) return response;
+        logEvent(levelForStatus(response.status), "http_request", {
+          method: request.method,
+          path: url.pathname,
+          status: response.status,
+          ms: Math.round(performance.now() - startedAt),
+          actor: request.headers.get("x-feed-actor-id") ?? undefined,
+          ...(errorCode ? { code: errorCode } : {}),
+        });
+        return response;
+      };
+
       const publicRoute = PUBLIC_PATHS.has(url.pathname);
       if (!publicRoute && !authorized(request, options.token)) {
-        return jsonError(401, "unauthorized", "missing or invalid bearer token");
+        return logRequest(jsonError(401, "unauthorized", "missing or invalid bearer token"), "unauthorized");
       }
 
       try {
-        return await route(request, await getContext());
+        return logRequest(await route(request, await getContext()));
       } catch (error) {
-        return mapError(error, url.pathname);
+        const errorCode =
+          error instanceof FeedHostError ? error.code : error instanceof FeedDelegationError ? error.code : "internal_error";
+        return logRequest(mapError(error, url.pathname), errorCode);
       }
     },
   });
@@ -185,10 +210,12 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 
+  const hostname = server.hostname ?? options.hostname;
+  const port = server.port ?? options.port;
   return {
-    hostname: server.hostname,
-    port: server.port,
-    url: `http://${server.hostname}:${server.port}`,
+    hostname,
+    port,
+    url: `http://${hostname}:${port}`,
     stop,
   };
 }
@@ -293,6 +320,30 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     });
   }
 
+  // Browser-side failures (sign-in, delegation minting, feed setup) happen
+  // before any delegation exists, so this ingestion route needs no actor —
+  // it only feeds the structured log stream. Input is tightly bounded.
+  if (request.method === "POST" && url.pathname === "/api/client-events") {
+    const body = await readJsonObject(request, "invalid_client_event", "client event body must be JSON");
+    const entries = Array.isArray(body.events) ? body.events.slice(0, 20) : [body];
+    const actor = optionalString(request.headers.get("x-feed-actor-id"));
+    let accepted = 0;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      const record = entry as Record<string, unknown>;
+      const eventName = optionalString(record.event);
+      if (!eventName) continue;
+      const level = record.level === "error" || record.level === "warn" ? record.level : "info";
+      logEvent(level, `client_${eventName.slice(0, 64)}`, {
+        source: "web",
+        ...(actor ? { actor } : {}),
+        ...(optionalString(record.detail) ? { detail: optionalString(record.detail)!.slice(0, 500) } : {}),
+      });
+      accepted += 1;
+    }
+    return json({ accepted });
+  }
+
   if (request.method === "GET" && url.pathname === "/admin/state") {
     const actor = await requireCompleteActor(request, context);
     return json(await storage.debugState(actorStorage(actor)));
@@ -303,6 +354,73 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     await seedDefaultFeed(storage, actorStorage(actor));
     await storage.reconcileFeedProjection(actorStorage(actor));
     return json({ ok: true, state: await storage.debugState(actorStorage(actor)) });
+  }
+
+  if (request.method === "POST" && url.pathname === "/admin/dev/publish-artifact") {
+    if (!context.enableDevPublisher) {
+      throw new FeedHostError("dev artifact publishing is disabled", 404, "not_found");
+    }
+    const actor = await requireDevPublisherActor(request, context);
+    const body = await readJsonObject(request, "invalid_artifact", "artifact body must be JSON");
+    const artifact = normalizeDevPublishArtifact(body);
+    const access = actorStorage(actor);
+    await storage.writeArtifactDocument(access, artifact);
+    await storage.insertSeedRows(access, "artifacts_index", [artifactIndexRow(artifact)]);
+    await storage.reconcileFeedProjection(access);
+    logEvent("info", "artifact_published", {
+      artifactId: artifact.artifactId,
+      artifactType: artifact.artifactType,
+      packageId: artifact.producedBy.packageId,
+      runId: artifact.producedBy.runId,
+      actor: actor.actorId,
+      via: "dev_publisher",
+    });
+    return json({
+      accepted: true,
+      artifactId: artifact.artifactId,
+      state: await storage.debugState(access),
+    });
+  }
+
+  if (request.method === "GET" && url.pathname === "/admin/dev/generation-requests") {
+    if (!context.enableDevPublisher) {
+      throw new FeedHostError("dev generation endpoints are disabled", 404, "not_found");
+    }
+    const actor = await requireDevPublisherActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
+    const status = optionalString(url.searchParams.get("status"));
+    const items = await storage.listGenerationRequests(actorStorage(actor), limit, {
+      status,
+      excludeExpired: status !== undefined,
+      order: "asc",
+    });
+    return json({ items: items.map(normalizeGenerationRequestRecord) });
+  }
+
+  const generationStatusMatch = url.pathname.match(/^\/admin\/dev\/generation-requests\/([^/]+)\/status$/);
+  if (request.method === "POST" && generationStatusMatch) {
+    if (!context.enableDevPublisher) {
+      throw new FeedHostError("dev generation endpoints are disabled", 404, "not_found");
+    }
+    const actor = await requireDevPublisherActor(request, context);
+    const requestId = decodeURIComponent(generationStatusMatch[1]);
+    const body = await readJsonObject(request, "invalid_generation_status", "status body must be JSON");
+    const status = readGenerationRequestStatus(body.status);
+    const expectedStatus = body.expectedStatus === undefined ? undefined : readGenerationRequestStatus(body.expectedStatus);
+    const record = await storage.updateGenerationRequestStatus(actorStorage(actor), {
+      requestId,
+      status,
+      expectedStatus,
+      updatedAt: new Date().toISOString(),
+    });
+    logEvent("info", "generation_request_status", {
+      requestId,
+      status,
+      expectedStatus,
+      actor: actor.actorId,
+      note: optionalString(body.note),
+    });
+    return json({ updated: true, request: record });
   }
 
   if (request.method === "GET" && url.pathname === "/feed") {
@@ -414,6 +532,13 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const actor = await requireDelegationAndReady(context, actorId);
     const event = normalizeControlIntentEvent(body, actorId);
     const result = await storage.recordControlIntent(actorStorage(actor), event);
+    if (result.requestId && !result.duplicate) {
+      logEvent("info", "generation_request_accepted", {
+        requestId: result.requestId,
+        intentKind: event.intentKind,
+        actor: actorId,
+      });
+    }
     return json(
       {
         accepted: true,
@@ -467,6 +592,17 @@ function authorized(request: Request, token: string | undefined): boolean {
 async function requireCompleteActor(request: Request, context: FeedHostContext): Promise<ActorState> {
   const actorId = requireRequestActorId(request);
   return requireDelegationAndReady(context, actorId);
+}
+
+async function requireDevPublisherActor(request: Request, context: FeedHostContext): Promise<ActorState> {
+  const actorId = request.headers.get("x-feed-actor-id");
+  if (actorId) return requireDelegationAndReady(context, actorId);
+  if (context.actors.size === 1) {
+    const actor = [...context.actors.values()][0]!;
+    await ensureActorReady(context.storage, actor, context.seedOnStart);
+    return actor;
+  }
+  throw new FeedHostError("x-feed-actor-id is required unless exactly one actor is active", 401, "unauthorized");
 }
 
 async function requireDelegationAndReady(context: FeedHostContext, actorId: string): Promise<ActorState> {
@@ -651,7 +787,10 @@ async function restoreActorFromStore(
     const resources: string[] = [];
     let actorId = actorKey;
     let acceptedAt = new Date().toISOString();
-    for (const resource of live) {
+    // A multi-resource delegation is persisted as one record per covered
+    // path, all sharing the same serialized blob — activate each blob once.
+    const uniqueDelegations = [...new Map(live.map((resource) => [resource.serializedDelegation, resource])).values()];
+    for (const resource of uniqueDelegations) {
       const accepted = await context.activateDelegation({
         serializedDelegation: resource.serializedDelegation,
         expectedDelegateDID: context.policy.delegateDID,
@@ -686,15 +825,19 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
   if (actor.storageAccess) return actor.storageAccess;
   const artifacts = actor.accessByResource.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feed = actor.accessByResource.get(FEED_HOST_FEED_DB_PATH);
+  const settings = actor.accessByResource.get(FEED_HOST_FEED_SETTINGS_PREFIX);
   const documents = actor.accessByResource.get(FEED_HOST_ARTIFACT_DOC_PREFIX);
-  if (!artifacts || !feed || !documents) {
+  if (!artifacts || !feed || !settings || !documents) {
     throw new FeedDelegationError("Feed Host delegation is missing activated TinyCloud access", "insufficient_policy");
   }
   actor.storageAccess = {
     actorId: actor.actorId,
     artifacts,
     feed,
+    settings,
     documents,
+    legacyArtifacts: actor.accessByResource.get(LEGACY_FEED_DB_PATH),
+    legacyInteractions: actor.accessByResource.get(LEGACY_INTERACTIONS_DB_PATH),
   };
   return actor.storageAccess;
 }
@@ -767,7 +910,16 @@ function normalizeSkillCredentialsPatch(body: Record<string, unknown>): FeedHost
   return patch;
 }
 
-function normalizeControlIntentEvent(body: Record<string, unknown>, actorId: string): ControlIntentEvent {
+function normalizeDevPublishArtifact(body: Record<string, unknown>): FeedArtifact {
+  const candidate = body.artifact ?? body;
+  const result = validateFeedArtifact(candidate);
+  if (!result.ok) {
+    throw new FeedHostError(`invalid Feed v1 artifact: ${result.errors.join("; ")}`, 400, "invalid_artifact");
+  }
+  return result.value;
+}
+
+function normalizeControlIntentEvent(body: Record<string, unknown>, actorId: string): FeedControlIntentInput {
   return {
     eventId: readString(body, "eventId", "invalid_intent", "eventId is required"),
     actorId,
@@ -867,7 +1019,25 @@ function extractFeedbackNote(payload: unknown): string | undefined {
   return trimmed.slice(0, FEEDBACK_NOTE_MAX_CHARS);
 }
 
-function readControlIntentKind(value: unknown): ControlIntentEvent["intentKind"] {
+function readGenerationRequestStatus(value: unknown): FeedGenerationRequestRecord["status"] {
+  if (
+    value === "accepted" ||
+    value === "pending" ||
+    value === "blocked" ||
+    value === "rejected" ||
+    value === "consumed" ||
+    value === "expired"
+  ) {
+    return value;
+  }
+  throw new FeedHostError(
+    "status must be one of accepted|pending|blocked|rejected|consumed|expired",
+    400,
+    "invalid_generation_status",
+  );
+}
+
+function readControlIntentKind(value: unknown): FeedControlIntentKind {
   if (
     value === "enable_package" ||
     value === "pause_package" ||
@@ -999,6 +1169,7 @@ function optionsFromEnv(): FeedHostServerOptions {
     tinycloudHost: process.env.TINYCLOUD_HOST || process.env.VITE_TINYCLOUD_HOST || undefined,
     hostPrivateKey: process.env.FEED_HOST_PRIVATE_KEY || undefined,
     seedOnStart: process.env.FEED_HOST_SEED !== "0",
+    enableDevPublisher: process.env.FEED_HOST_DEV_PUBLISH === "1",
   };
 }
 

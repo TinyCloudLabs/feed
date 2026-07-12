@@ -198,7 +198,12 @@ export type FeedHostActorStorage = {
 
 export type FeedHostStorageOptions = {
   migrateLegacyData?: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
+  // Intake backpressure: reject new generation requests once an actor has this
+  // many live (accepted/pending, unexpired) requests waiting for a worker.
+  maxPendingGenerationRequests?: number;
 };
+
+export const DEFAULT_MAX_PENDING_GENERATION_REQUESTS = 8;
 
 export class FeedHostError extends Error {
   constructor(
@@ -220,9 +225,13 @@ const DB_PATHS: Record<FeedV1SqlResourceName, string> = {
 export class FeedHostStorage {
   private readonly bootstrapped = new WeakSet<object>();
   private readonly migrateLegacyDataHook: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
+  private readonly maxPendingGenerationRequests: number;
 
   constructor(options: FeedHostStorageOptions = {}) {
     this.migrateLegacyDataHook = options.migrateLegacyData ?? ((actor) => this.performLegacyMigration(actor));
+    this.maxPendingGenerationRequests =
+      options.maxPendingGenerationRequests ??
+      Number(process.env.FEED_HOST_MAX_PENDING_GENERATION ?? DEFAULT_MAX_PENDING_GENERATION_REQUESTS);
   }
 
   async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
@@ -553,17 +562,70 @@ export class FeedHostStorage {
     return rows;
   }
 
-  async listGenerationRequests(actor: FeedHostActorStorage, limit = 100): Promise<GenerationRequestRow[]> {
+  async listGenerationRequests(
+    actor: FeedHostActorStorage,
+    limit = 100,
+    filter: { status?: string; excludeExpired?: boolean; order?: "asc" | "desc" } = {},
+  ): Promise<GenerationRequestRow[]> {
+    const conditions = ["actor_id = ?"];
+    const params: SqlValue[] = [normalizeActorId(actor.actorId)];
+    if (filter.status !== undefined) {
+      conditions.push("status = ?");
+      params.push(filter.status);
+    }
+    if (filter.excludeExpired) {
+      conditions.push("expires_at > ?");
+      params.push(new Date().toISOString());
+    }
+    params.push(Math.max(1, Math.min(limit, 500)));
     const rows = await queryRows<GenerationRequestRow>(
       this.db(actor, "feed_index"),
       `SELECT request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key, prompt, expires_at, created_at, updated_at
          FROM generation_request
-        WHERE actor_id = ?
-        ORDER BY created_at DESC
+        WHERE ${conditions.join(" AND ")}
+        ORDER BY created_at ${filter.order === "asc" ? "ASC" : "DESC"}
         LIMIT ?`,
-      [normalizeActorId(actor.actorId), Math.max(1, Math.min(limit, 500))],
+      params,
     );
     return rows;
+  }
+
+  async updateGenerationRequestStatus(
+    actor: FeedHostActorStorage,
+    input: {
+      requestId: string;
+      status: FeedGenerationRequestRecord["status"];
+      expectedStatus?: FeedGenerationRequestRecord["status"];
+      updatedAt: string;
+    },
+  ): Promise<FeedGenerationRequestRecord> {
+    const normalizedActorId = normalizeActorId(actor.actorId);
+    const rows = await queryRows<GenerationRequestRow>(
+      this.db(actor, "feed_index"),
+      `SELECT request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key, prompt, expires_at, created_at, updated_at
+         FROM generation_request
+        WHERE actor_id = ? AND request_id = ?
+        LIMIT 1`,
+      [normalizedActorId, input.requestId],
+    );
+    const row = rows[0];
+    if (!row) {
+      throw new FeedHostError(`generation request not found: ${input.requestId}`, 404, "not_found");
+    }
+    if (input.expectedStatus !== undefined && row.status !== input.expectedStatus) {
+      throw new FeedHostError(
+        `generation request status is ${row.status}, expected ${input.expectedStatus}`,
+        409,
+        "status_conflict",
+      );
+    }
+    await batch(this.db(actor, "feed_index"), [
+      {
+        sql: `UPDATE generation_request SET status = ?, updated_at = ? WHERE actor_id = ? AND request_id = ?`,
+        params: [input.status, input.updatedAt, normalizedActorId, input.requestId],
+      },
+    ]);
+    return generationRequestFromRow({ ...row, status: input.status, updated_at: input.updatedAt });
   }
 
   async listSkills(
@@ -756,7 +818,22 @@ export class FeedHostStorage {
       if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") return { kind: "not_found" };
       throw new Error(`Failed to read artifact document: ${resultError(result)}`);
     }
-    return hydrateArtifactDocument(result.data.data);
+    const hydrated = hydrateArtifactDocument(result.data.data);
+    if (hydrated.kind === "malformed") return { kind: "malformed", docKey, error: hydrated.error };
+    if (hydrated.kind === "schema_mismatch") return { kind: "schema_mismatch", docKey, errors: hydrated.errors };
+    return hydrated;
+  }
+
+  private async readProjectionByArtifactId(
+    actor: FeedHostActorStorage,
+    artifactId: string,
+  ): Promise<{ package_id: string } | null> {
+    const rows = await queryRows<{ package_id: string }>(
+      this.db(actor, "feed_index"),
+      `SELECT package_id FROM feed_artifact_projection WHERE artifact_id = ? LIMIT 1`,
+      [artifactId],
+    );
+    return rows[0] ?? null;
   }
 
   private async readPreferenceProfileByActor(
@@ -965,6 +1042,22 @@ export class FeedHostStorage {
     );
     const row = existing[0];
     if (row) return generationRequestFromRow(row);
+    const pending = await queryRows<{ pending_count: number }>(
+      this.db(actor, "feed_index"),
+      `SELECT COUNT(*) AS pending_count
+         FROM generation_request
+        WHERE actor_id = ? AND status IN ('accepted', 'pending') AND expires_at > ?`,
+      [input.actorId, input.createdAt],
+    );
+    const pendingCount = Number(pending[0]?.pending_count ?? 0);
+    if (pendingCount >= this.maxPendingGenerationRequests) {
+      throw new FeedHostError(
+        `generation backlog is full (${pendingCount} pending); retry after requests complete`,
+        429,
+        "generation_backlog_full",
+        { pendingCount, limit: this.maxPendingGenerationRequests },
+      );
+    }
     const expiresAt = new Date(Date.parse(input.createdAt) + 24 * 60 * 60 * 1000).toISOString();
     return {
       requestId: input.eventId,

@@ -141,6 +141,9 @@ export function actorIdsMatch(a: string, b: string): boolean {
 
 export function createFeedHostPolicy(delegateDID: string): FeedHostDelegationPolicy {
   return {
+    // The node SDK reports its DID as a DID URL with a verification-method
+    // fragment (did:key:z6Mk...#z6Mk...). UCAN audiences must be the bare
+    // principal DID — the capability-chain signer rejects fragments.
     delegateDID: principalDid(delegateDID),
     resources: FEED_HOST_DELEGATION_RESOURCES,
   };
@@ -245,7 +248,9 @@ export async function activateFeedHostDelegation(input: {
   return { ...accepted, access };
 }
 
-export function hasCompleteFeedHostDelegation(accepted: AcceptedFeedDelegation | undefined): boolean {
+export function hasCompleteFeedHostDelegation<T extends AcceptedFeedDelegation>(
+  accepted: T | undefined,
+): accepted is T {
   if (!accepted) return false;
   const granted = new Set(accepted.resources);
   return FEED_HOST_DELEGATION_RESOURCES.every((resource) => granted.has(resource.path));

@@ -15,7 +15,7 @@
     "test": "bun test --preload ./host/no-spend-setup.ts web/src host",
     "test:e2e": "playwright test",
     "test:smoke": "playwright test e2e/specs/openkey-wallet-feed-flow.pw.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.host.json"
   },
   "dependencies": {
     "@openkey/sdk": "^0.8.4",
@@ -28,6 +28,7 @@
   "devDependencies": {
     "@playwright/test": "^1.61.1",
     "@tinycloud/cli": "0.6.0-beta.11",
+    "@types/bun": "^1.3.14",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
