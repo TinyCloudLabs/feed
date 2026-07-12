@@ -7,6 +7,7 @@ import {
 import { delegateInputAuthorityLocally } from "../web/src/inputAuthority.ts";
 import { InputAuthorityRegistry } from "./input-authority.ts";
 import { validateInputAuthorityDelegation } from "./delegation.ts";
+import { createInputAuthorityInspector } from "./server.ts";
 
 const originalFetch = globalThis.fetch;
 
@@ -16,16 +17,43 @@ afterEach(() => {
 
 describe("approved TinyCloud SDK input-authority integration", () => {
   test("real SDK attenuates a received share and the exact child passes Host attach", async () => {
-    globalThis.fetch = mock(async () => new Response(
-      JSON.stringify({ activated: ["child"] }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    ));
+    let registeredChildCid = "";
+    globalThis.fetch = mock(async (request, init) => {
+      if (String(request).endsWith("/info")) {
+        return new Response(JSON.stringify({ protocol: 1, version: "test", features: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (String(request).endsWith("/delegation/status")) {
+        const cid = JSON.parse(String(init?.body)).cid;
+        const active = cid === registeredChildCid;
+        return new Response(JSON.stringify({
+          cid,
+          status: active ? "active" : "not_found",
+          exists: active,
+          active,
+          revoked: false,
+          expired: false,
+        }), { status: active ? 200 : 404, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ activated: ["child"] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
     const host = "https://node.tinycloud.xyz";
     const browserBindings = new NodeWasmBindings();
     const hostBindings = new NodeWasmBindings();
     const browser = new TinyCloudNode({ host, wasmBindings: browserBindings });
-    const feedHost = new TinyCloudNode({ host, wasmBindings: hostBindings });
-    const owner = new Wallet("0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d");
+    const hostWallet = Wallet.createRandom();
+    const feedHost = new TinyCloudNode({
+      host,
+      wasmBindings: hostBindings,
+      privateKey: hostWallet.privateKey,
+    });
+    await feedHost.signIn();
+    const owner = Wallet.createRandom();
     const manager = browserBindings.createSessionManager();
     const shareKeyId = manager.createSessionKey("feed-input-parent");
     const shareKeyDid = manager.getDID(shareKeyId).split("#")[0];
@@ -79,6 +107,7 @@ describe("approved TinyCloud SDK input-authority integration", () => {
     });
     expect(submission.portableDelegation).not.toContain(shareKeyJwk.d);
     expect(submission.portableDelegation).not.toContain(parentSession.delegationHeader.Authorization);
+    registeredChildCid = JSON.parse(submission.portableDelegation).cid;
     const callerTransport = JSON.parse(submission.portableDelegation);
     callerTransport.delegatorDID = "did:key:zCallerMetadata";
     callerTransport.createdAt = "2026-01-01T00:00:00.000Z";
@@ -91,17 +120,7 @@ describe("approved TinyCloud SDK input-authority integration", () => {
       body: { ...submission, portableDelegation: JSON.stringify(callerTransport) },
       expectedAudienceDID: feedHostPrincipal,
       expectedHost: host,
-      inspect: async ({ portableDelegation, expectedAudienceDID, expectedHost }) => {
-        const inspected = validateInputAuthorityDelegation({
-          serializedDelegation: portableDelegation,
-          expectedDelegateDID: expectedAudienceDID,
-          expectedHost,
-        });
-        const access = await feedHost.useDelegation(inspected.portableDelegation);
-        expect(access.delegation.cid).toBe(inspected.childCid);
-        const { portableDelegation: _portable, ...lineage } = inspected;
-        return lineage;
-      },
+      inspect: createInputAuthorityInspector(feedHost),
     });
     expect(attached).toMatchObject({
       sourceId: "team-meeting",
@@ -115,6 +134,53 @@ describe("approved TinyCloud SDK input-authority integration", () => {
     expect(stored).not.toContain("zCallerMetadata");
     expect(stored).not.toContain("2026-01-01T00:00:00.000Z");
     expect(stored).toContain(shareKeyDid);
+
+    const original = JSON.parse(submission.portableDelegation);
+    const mismatchedCid = {
+      ...original,
+      cid: "bafkr4iesnyviiybec3hbn63d2rdoavuu3s2n5pyz5gixl5pabqqnzazjfi",
+    };
+    expect(() => validateInputAuthorityDelegation({
+      serializedDelegation: JSON.stringify(mismatchedCid),
+      expectedDelegateDID: feedHostPrincipal,
+      expectedHost: host,
+      computeDelegationCid: (authorization) => feedHost.computeDelegationCid(authorization),
+    })).toThrow("CID does not match");
+
+    const token = original.delegationHeader.Authorization;
+    const [header, payload, signature] = token.split(".");
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    claims.prf.push(JSON.stringify({ parentBearer: "Bearer smuggled" }));
+    const multiProofToken = `${header}.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${signature}`;
+    const multiProof = {
+      ...original,
+      cid: feedHost.computeDelegationCid(multiProofToken),
+      delegationHeader: { Authorization: multiProofToken },
+    };
+    expect(() => validateInputAuthorityDelegation({
+      serializedDelegation: JSON.stringify(multiProof),
+      expectedDelegateDID: feedHostPrincipal,
+      expectedHost: host,
+      computeDelegationCid: (authorization) => feedHost.computeDelegationCid(authorization),
+    })).toThrow("exactly one canonical parent proof");
+
+    const forgedToken = `${header}.${payload}.${signature.slice(0, -1)}${signature.endsWith("a") ? "b" : "a"}`;
+    const forgedCid = feedHost.computeDelegationCid(forgedToken);
+    expect(forgedCid).not.toBe(registeredChildCid);
+    const forgedTransport = JSON.stringify({
+      ...original,
+      cid: forgedCid,
+      delegationHeader: { Authorization: forgedToken },
+    });
+    await expect(createInputAuthorityInspector(feedHost)({
+      portableDelegation: forgedTransport,
+      expectedAudienceDID: feedHostPrincipal,
+      expectedHost: host,
+    })).rejects.toMatchObject({ code: "input_authority_unavailable" });
+    expect(await feedHost.getDelegationStatus(forgedCid)).toMatchObject({
+      ok: true,
+      data: { cid: forgedCid, status: "not_found", active: false },
+    });
   });
 });
 

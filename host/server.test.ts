@@ -45,6 +45,8 @@ process.env.FEED_HOST_LOG = "0";
 
 const ACTOR_ID = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const OTHER_ACTOR_ID = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+const INPUT_CHILD_CID = "bafkr4ie6h4l4tcmrkube2fehu5lloyo4ijh2lzvdfpywj4uj6tyaurbcau";
+const INPUT_PARENT_CID = "bafkr4ihl32taldpsemg4ew32pr5uq62hbriiylqkkem4s2etyrb54ou6pe";
 const MUTATING_ROUTES = ["/feedback", "/control-intents"] as const;
 // Stable host identity used for restart coverage. In production this comes
 // from FEED_HOST_PRIVATE_KEY: the host signs in and its did:pkh stays stable.
@@ -223,12 +225,19 @@ describe("Feed Host server", () => {
     let nodeRevoked = false;
     const hostNode = {
       did: "did:key:zFeedHost",
-      listDelegations: async () => ({
+      getDelegationStatus: async (childCid: string) => ({
         ok: true as const,
-        data: [{ cid: "bafy-child", isRevoked: nodeRevoked, expiry: new Date("2099-01-01T00:00:00.000Z") }],
+        data: {
+          cid: childCid,
+          status: nodeRevoked ? "revoked" : "active",
+          exists: true,
+          active: !nodeRevoked,
+          revoked: nodeRevoked,
+          expired: false,
+        },
       }),
       revokeDelegation: async (childCid: string) => {
-        expect(childCid).toBe("bafy-child");
+        expect(childCid).toBe(INPUT_CHILD_CID);
         revocations += 1;
         nodeRevoked = true;
         return { ok: true as const, data: undefined };
@@ -248,7 +257,7 @@ describe("Feed Host server", () => {
       inspectInputAuthority: async ({ expectedAudienceDID }) => {
         inspections += 1;
         return {
-          childCid: "bafy-child",
+          childCid: INPUT_CHILD_CID,
           canonicalPortableDelegation: childTransport(),
           actorId: ACTOR_ID,
           audienceDID: expectedAudienceDID,
@@ -257,8 +266,7 @@ describe("Feed Host server", () => {
           path: "xyz.tinycloud.listen/conversations",
           actions: ["tinycloud.sql/read"],
           expiry: "2099-01-01T00:00:00.000Z",
-          parentCid: "bafy-parent",
-          parentLineage: ["bafy-root", "bafy-parent"],
+          parentCid: INPUT_PARENT_CID,
           agentDID: expectedAudienceDID,
         };
       },
@@ -2391,7 +2399,7 @@ function emptyMigrationSummary(): FeedV1MigrationSummary {
 
 function childTransport(): string {
   return JSON.stringify({
-    cid: "bafy-child",
+    cid: INPUT_CHILD_CID,
     delegateDID: "did:key:zFeedHost",
     delegatorDID: "did:key:zShare",
     spaceId: "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:applications",
@@ -2400,7 +2408,7 @@ function childTransport(): string {
     expiry: "2099-01-01T00:00:00.000Z",
     isRevoked: false,
     allowSubDelegation: false,
-    parentCid: "bafy-parent",
+    parentCid: INPUT_PARENT_CID,
     createdAt: "2026-07-19T00:00:00.000Z",
     delegationHeader: { Authorization: "child.jwt.signature" },
     ownerAddress: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",

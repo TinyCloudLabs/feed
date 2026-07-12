@@ -1,4 +1,4 @@
-import { FEED_HOST_FEED_SETTINGS_PREFIX, normalizeActorId } from "./delegation.ts";
+import { FEED_HOST_FEED_SETTINGS_PREFIX, isCanonicalDelegationCid, normalizeActorId } from "./delegation.ts";
 import { FeedHostError, type FeedHostActorStorage } from "./storage.ts";
 
 export type InputAuthorityState = "active" | "expired" | "revoked" | "unavailable";
@@ -10,8 +10,7 @@ export type InputAuthorityLineage = {
   path: string;
   actions: string[];
   expiry: string;
-  parentCid?: string;
-  parentLineage?: string[];
+  parentCid: string;
   agentDID: string;
 };
 
@@ -109,7 +108,6 @@ export class InputAuthorityRegistry {
       actions: [...canonical.actions],
       expiry: canonical.expiry,
       parentCid: canonical.parentCid,
-      ...(inspected.parentLineage ? { parentLineage: [...inspected.parentLineage] } : {}),
       agentDID: canonical.delegateDID,
       attachedAt: this.now().toISOString(),
     };
@@ -212,9 +210,10 @@ export class InputAuthorityRegistry {
     }
     try {
       const value = typeof result.data.data === "string" ? JSON.parse(result.data.data) : result.data.data;
-      return Array.isArray(value)
-        ? value.filter((record): record is StoredInputAuthority => validStoredRecord(record, actor.actorId))
-        : [];
+      if (!Array.isArray(value)) return [];
+      return value
+        .filter((record): record is StoredInputAuthority => validStoredRecord(record, actor.actorId))
+        .map(stripLegacyProofLineage);
     } catch {
       throw new FeedHostError("input authority storage is malformed", 500, "internal_error");
     }
@@ -224,6 +223,11 @@ export class InputAuthorityRegistry {
     const result = await actor.settings.kv.put(keyFor(actor.actorId), records, { contentType: "application/json" });
     if (!result.ok) throw new FeedHostError("input authority storage write failed", 500, "internal_error");
   }
+}
+
+function stripLegacyProofLineage(record: StoredInputAuthority): StoredInputAuthority {
+  const { parentLineage: _parentLineage, ...safe } = record as StoredInputAuthority & { parentLineage?: unknown };
+  return safe;
 }
 
 function isNotFound(error: { code?: unknown; message?: unknown }): boolean {
@@ -281,10 +285,10 @@ function validateTerminalChildTransport(serialized: string): TerminalChildTransp
   const header = value.delegationHeader;
   const resources = value.resources;
   if (
-    !nonEmptyString(value.cid) || !nonEmptyString(value.delegateDID) || !nonEmptyString(value.delegatorDID) ||
+    !isCanonicalDelegationCid(value.cid) || !nonEmptyString(value.delegateDID) || !nonEmptyString(value.delegatorDID) ||
     !nonEmptyString(value.spaceId) || !nonEmptyString(value.path) || !stringArray(value.actions) ||
     !validIsoDate(value.expiry) || value.isRevoked !== false || value.allowSubDelegation !== false ||
-    !nonEmptyString(value.parentCid) || !validIsoDate(value.createdAt) ||
+    !isCanonicalDelegationCid(value.parentCid) || !validIsoDate(value.createdAt) ||
     typeof value.ownerAddress !== "string" || !/^0x[a-fA-F0-9]{40}$/.test(value.ownerAddress) ||
     typeof value.chainId !== "number" || !Number.isSafeInteger(value.chainId) ||
     !nonEmptyString(value.host) || value.disableSubDelegation !== true ||
@@ -386,9 +390,7 @@ export function validateInspection(
     throw new FeedHostError("input authority permissions are broader than transcript read", 403, "broad_permissions");
   }
   if (
-    typeof value.parentCid !== "string" || !value.parentCid.trim() ||
-    !Array.isArray(value.parentLineage) || value.parentLineage.length === 0 ||
-    value.parentLineage.some((cid) => typeof cid !== "string" || !cid.trim())
+    !isCanonicalDelegationCid(value.parentCid)
   ) {
     throw new FeedHostError("input authority parent lineage is missing", 400, "invalid_input_authority");
   }
@@ -430,8 +432,7 @@ function validStoredRecord(value: unknown, actorId: string): value is StoredInpu
     typeof record.childCid === "string" && record.childCid.length > 0 &&
     typeof record.host === "string" && typeof record.space === "string" &&
     typeof record.path === "string" && Array.isArray(record.actions) && isAllowedTranscriptGrant(record.path, record.actions) &&
-    typeof record.expiry === "string" && typeof record.parentCid === "string" && record.parentCid.length > 0 &&
-    Array.isArray(record.parentLineage) && record.parentLineage.length > 0 && record.parentLineage.every((cid) => typeof cid === "string") &&
+    typeof record.expiry === "string" && isCanonicalDelegationCid(record.parentCid) &&
     typeof record.agentDID === "string" && typeof record.attachedAt === "string"
   );
 }

@@ -139,6 +139,37 @@ const SSE_HEADERS = {
   "x-accel-buffering": "no",
 };
 
+type InputAuthorityVerificationNode = Pick<TinyCloudNode, "useDelegation"> & {
+  computeDelegationCid?: (authorization: string) => string;
+  getDelegationStatus?: (cid: string) => Promise<{
+    ok: boolean;
+    data?: { cid: string; status: string; active: boolean };
+  }>;
+};
+
+export function createInputAuthorityInspector(hostNode: InputAuthorityVerificationNode): InputAuthorityInspector {
+  return async (input) => {
+    if (!hostNode.computeDelegationCid || !hostNode.getDelegationStatus) {
+      throw new FeedHostError("TinyCloud input-authority verification is unavailable", 503, "input_authority_unavailable");
+    }
+    const inspected = validateInputAuthorityDelegation({
+      serializedDelegation: input.portableDelegation,
+      expectedDelegateDID: input.expectedAudienceDID,
+      expectedHost: input.expectedHost,
+      computeDelegationCid: (authorization) => hostNode.computeDelegationCid!(authorization),
+    });
+    // Activate the recomputed, identity-bound token so the node can sign the
+    // target-status request. No caller-supplied activation metadata is trusted.
+    await hostNode.useDelegation(inspected.portableDelegation);
+    const status = await hostNode.getDelegationStatus(inspected.childCid);
+    if (!status.ok || status.data?.cid !== inspected.childCid || status.data.status !== "active" || !status.data.active) {
+      throw new FeedHostError("TinyCloud did not confirm an active input authority", 409, "input_authority_unavailable");
+    }
+    const { portableDelegation: _portableDelegation, ...lineage } = inspected;
+    return lineage;
+  };
+}
+
 export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const storage = options.storage ?? new FeedHostStorage();
   const hostNode =
@@ -166,27 +197,18 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         : null;
   const actors = new Map<string, ActorState>();
   const inputAuthorities = new InputAuthorityRegistry();
-  const inspectInputAuthority: InputAuthorityInspector = options.inspectInputAuthority ?? (async (input) => {
-    const inspected = validateInputAuthorityDelegation({
-      serializedDelegation: input.portableDelegation,
-      expectedDelegateDID: input.expectedAudienceDID,
-      expectedHost: input.expectedHost,
-    });
-    const access = await hostNode.useDelegation(inspected.portableDelegation);
-    if (access.delegation.cid !== inspected.childCid) {
-      throw new FeedDelegationError("input authority activation CID does not match the signed child", "malformed");
-    }
-    const { portableDelegation: _portableDelegation, ...lineage } = inspected;
-    return lineage;
-  });
+  const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
   const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
-    const result = await hostNode.listDelegations();
-    if (!result.ok) return "unavailable";
-    const child = result.data.find((delegation) => delegation.cid === childCid);
-    if (!child) return "unavailable";
-    if (child.isRevoked) return "revoked";
-    if (child.expiry.getTime() <= Date.now()) return "expired";
-    return "active";
+    const authorityNode = hostNode as TinyCloudNode & {
+      getDelegationStatus?: (cid: string) => Promise<{ ok: boolean; data?: { cid: string; status: string } }>;
+    };
+    if (!authorityNode.getDelegationStatus) return "unavailable";
+    const result = await authorityNode.getDelegationStatus(childCid);
+    if (!result.ok || result.data?.cid !== childCid) return "unavailable";
+    if (result.data.status === "active" || result.data.status === "revoked" || result.data.status === "expired") {
+      return result.data.status;
+    }
+    return "unavailable";
   });
   const revokeInputAuthority: InputAuthorityRevoker = options.revokeInputAuthority ?? (async ({ childCid }) => {
     const result = await hostNode.revokeDelegation(childCid);

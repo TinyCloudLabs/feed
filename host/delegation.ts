@@ -258,6 +258,7 @@ export function validateInputAuthorityDelegation(input: {
   serializedDelegation: string;
   expectedDelegateDID: string;
   expectedHost: string;
+  computeDelegationCid: (authorization: string) => string;
   now?: Date;
 }): {
   portableDelegation: PortableDelegation;
@@ -271,7 +272,6 @@ export function validateInputAuthorityDelegation(input: {
   actions: string[];
   expiry: string;
   parentCid: string;
-  parentLineage: string[];
   agentDID: string;
   revoked: boolean;
 } {
@@ -301,13 +301,14 @@ export function validateInputAuthorityDelegation(input: {
   const grant = grants[0]!;
   const actorId = signedOwnerDid(grants);
   if (!actorId) throw new FeedDelegationError("input authority carries no signed owner space", "actor_mismatch");
-  const proofs = Array.isArray(payload.prf) && payload.prf.every((cid) => typeof cid === "string")
-    ? payload.prf as string[]
-    : [];
-  if (!delegation.parentCid || proofs.length === 0 || proofs[0] !== delegation.parentCid) {
+  const proofs = payload.prf;
+  if (!Array.isArray(proofs) || proofs.length !== 1 || !isCanonicalDelegationCid(proofs[0])) {
+    throw new FeedDelegationError("input authority must carry exactly one canonical parent proof", "malformed");
+  }
+  if (!isCanonicalDelegationCid(delegation.parentCid) || proofs[0] !== delegation.parentCid) {
     throw new FeedDelegationError("input authority parent lineage does not match signed proof", "malformed");
   }
-  if (!delegation.cid || delegation.disableSubDelegation !== true || delegation.allowSubDelegation !== false) {
+  if (!isCanonicalDelegationCid(delegation.cid) || delegation.disableSubDelegation !== true || delegation.allowSubDelegation !== false) {
     throw new FeedDelegationError("input authority is not a terminal child delegation", "malformed");
   }
   const host = typeof delegation.host === "string" ? delegation.host : "";
@@ -320,6 +321,15 @@ export function validateInputAuthorityDelegation(input: {
   if (!owner) throw new FeedDelegationError("input authority owner is malformed", "actor_mismatch");
   const authorization = delegation.delegationHeader?.Authorization;
   if (!authorization) throw new FeedDelegationError("input authority authorization is missing", "malformed");
+  let computedCid: string;
+  try {
+    computedCid = input.computeDelegationCid(authorization);
+  } catch {
+    throw new FeedDelegationError("input authority CID could not be computed", "malformed");
+  }
+  if (computedCid !== delegation.cid) {
+    throw new FeedDelegationError("input authority CID does not match its authorization", "malformed");
+  }
   const canonicalPortableDelegation = JSON.stringify({
     cid: delegation.cid,
     delegateDID: audienceDID,
@@ -330,7 +340,7 @@ export function validateInputAuthorityDelegation(input: {
     expiry: signedExpiry.toISOString(),
     isRevoked: false,
     allowSubDelegation: false,
-    parentCid: delegation.parentCid,
+    parentCid: proofs[0],
     createdAt: inspectedAt.toISOString(),
     delegationHeader: { Authorization: authorization },
     ownerAddress: owner.address,
@@ -350,11 +360,31 @@ export function validateInputAuthorityDelegation(input: {
     path: grant.path,
     actions: [...grant.actions],
     expiry: signedExpiry.toISOString(),
-    parentCid: delegation.parentCid,
-    parentLineage: [...proofs],
+    parentCid: proofs[0],
     agentDID: principalDid(input.expectedDelegateDID),
     revoked: delegation.isRevoked === true,
   };
+}
+
+export function isCanonicalDelegationCid(value: unknown): value is string {
+  if (typeof value !== "string" || !/^b[a-z2-7]{58}$/.test(value)) return false;
+  const alphabet = "abcdefghijklmnopqrstuvwxyz234567";
+  const bytes: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const character of value.slice(1)) {
+    const digit = alphabet.indexOf(character);
+    if (digit < 0) return false;
+    buffer = (buffer << 5) | digit;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  return bits === 2 && buffer === 0 && bytes.length === 36 &&
+    bytes[0] === 0x01 && bytes[1] === 0x55 && bytes[2] === 0x1e && bytes[3] === 0x20;
 }
 
 function ownerFromActorId(actorId: string): { chainId: number; address: string } | null {

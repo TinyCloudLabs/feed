@@ -11,6 +11,8 @@ const OTHER_ACTOR = "did:pkh:eip155:1:0x2222222222222222222222222222222222222222
 const HOST_DID = "did:key:zFeedHost";
 const HOST = "https://node.tinycloud.xyz";
 const NOW = new Date("2026-07-20T00:00:00.000Z");
+const CHILD_CID = "bafkr4ie6h4l4tcmrkube2fehu5lloyo4ijh2lzvdfpywj4uj6tyaurbcau";
+const PARENT_CID = "bafkr4ihl32taldpsemg4ew32pr5uq62hbriiylqkkem4s2etyrb54ou6pe";
 
 describe("named input authorities", () => {
   test("stores only a child delegation and returns redacted non-secret lineage", async () => {
@@ -33,16 +35,17 @@ describe("named input authorities", () => {
       state: "active",
       hasPortableDelegation: true,
       path: "xyz.tinycloud.listen/conversations",
-      parentCid: "bafy-parent",
-      parentLineage: ["bafy-root", "bafy-parent"],
+      parentCid: PARENT_CID,
       agentDID: HOST_DID,
     });
     expect(JSON.stringify(view)).not.toContain("child.jwt.signature");
     expect(JSON.stringify(view)).not.toContain("tc1:");
+    expect(JSON.stringify(view)).not.toContain("parentLineage");
     expect(JSON.stringify([...data.values()])).toContain("child.jwt.signature");
     expect(JSON.stringify([...data.values()])).not.toContain("zCallerMetadata");
     expect(JSON.stringify([...data.values()])).not.toContain("2026-07-18T00:00:00.000Z");
     expect(JSON.stringify([...data.values()])).toContain("did:key:zShare");
+    expect(JSON.stringify([...data.values()])).not.toContain("parentLineage");
     expect([...data.keys()]).toEqual([
       `xyz.tinycloud.feed/settings/input-authorities/${encodeURIComponent(ACTOR.toLowerCase())}.json`,
     ]);
@@ -53,7 +56,9 @@ describe("named input authorities", () => {
     const { actor } = fakeActor(ACTOR);
     const registry = new InputAuthorityRegistry(() => now);
     for (const sourceId of ["team", "personal"]) {
-      const childCid = `bafy-${sourceId}`;
+      const childCid = sourceId === "team"
+        ? "bafkr4iesnyviiybec3hbn63d2rdoavuu3s2n5pyz5gixl5pabqqnzazjfi"
+        : "bafkr4idl2237i2uioo5vjiddhl6otmuz3t2ahidvyz7kehgjqsdoxltb7i";
       await registry.attach({
         actor,
         body: { sourceId, displayName: sourceId, portableDelegation: childTransport({ cid: childCid }) },
@@ -186,8 +191,8 @@ describe("named input authorities", () => {
 
 function inspection(overrides: Partial<InspectedInputAuthority> = {}): InspectedInputAuthority {
   return {
-    childCid: "bafy-child",
-    canonicalPortableDelegation: childTransport({ cid: overrides.childCid ?? "bafy-child" }),
+    childCid: CHILD_CID,
+    canonicalPortableDelegation: childTransport({ cid: overrides.childCid ?? CHILD_CID }),
     actorId: ACTOR,
     audienceDID: HOST_DID,
     host: HOST,
@@ -195,8 +200,7 @@ function inspection(overrides: Partial<InspectedInputAuthority> = {}): Inspected
     path: "xyz.tinycloud.listen/conversations",
     actions: ["tinycloud.sql/read"],
     expiry: "2026-08-01T00:00:00.000Z",
-    parentCid: "bafy-parent",
-    parentLineage: ["bafy-root", "bafy-parent"],
+    parentCid: PARENT_CID,
     agentDID: HOST_DID,
     ...overrides,
   };
@@ -204,7 +208,7 @@ function inspection(overrides: Partial<InspectedInputAuthority> = {}): Inspected
 
 function childTransport(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
-    cid: "bafy-child",
+    cid: CHILD_CID,
     delegateDID: HOST_DID,
     delegatorDID: "did:key:zShare",
     spaceId: "tinycloud:pkh:eip155:1:0x1111111111111111111111111111111111111111:applications",
@@ -213,7 +217,7 @@ function childTransport(overrides: Record<string, unknown> = {}): string {
     expiry: "2026-08-01T00:00:00.000Z",
     isRevoked: false,
     allowSubDelegation: false,
-    parentCid: "bafy-parent",
+    parentCid: PARENT_CID,
     createdAt: "2026-07-19T00:00:00.000Z",
     delegationHeader: { Authorization: "child.jwt.signature" },
     ownerAddress: "0x1111111111111111111111111111111111111111",
