@@ -20,10 +20,12 @@ describe("FeedV1HostClient", () => {
       baseUrl: "https://feed.example.test/",
       token: "token-1",
       actorId: "did:pkh:eip155:1:0xabc",
+      traceId: () => "feed_trace_1",
       fetchImpl: async (input, init) => {
         calls.push(String(input));
         expect((init?.headers as Headers).get("authorization")).toBe("Bearer token-1");
         expect((init?.headers as Headers).get("x-feed-actor-id")).toBe("did:pkh:eip155:1:0xabc");
+        expect((init?.headers as Headers).get("x-feed-trace-id")).toBe("feed_trace_1");
         return jsonResponse({ items: [], nextCursor: "next" });
       },
     });

@@ -4,23 +4,40 @@
 // makes them show up next to the host's own request logs.
 
 import { FEED_HOST_URL } from "./config.ts";
+import type { StartupTimingEvent } from "./startupTiming.ts";
 
 export type ClientLogLevel = "info" | "warn" | "error";
 
-export function reportClientEvent(level: ClientLogLevel, event: string, detail?: string, actorId?: string): void {
+export function reportClientEvent(
+  level: ClientLogLevel,
+  event: string,
+  detail?: string,
+  actorId?: string,
+  timing?: StartupTimingEvent,
+): void {
   try {
     void fetch(`${FEED_HOST_URL.replace(/\/+$/, "")}/api/client-events`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         ...(actorId ? { "x-feed-actor-id": actorId } : {}),
+        ...(timing ? { "x-feed-trace-id": timing.traceId } : {}),
       },
-      body: JSON.stringify({ level, event, detail: detail?.slice(0, 500) }),
+      body: JSON.stringify({
+        level,
+        event,
+        detail: detail?.slice(0, 500),
+        ...(timing ?? {}),
+      }),
       keepalive: true,
     }).catch(() => undefined);
   } catch {
     // Reporting must never break the app.
   }
+}
+
+export function reportStartupTiming(timing: StartupTimingEvent): void {
+  reportClientEvent(timing.outcome === "error" ? "warn" : "info", "startup_timing", undefined, undefined, timing);
 }
 
 export function errorDetail(error: unknown): string {

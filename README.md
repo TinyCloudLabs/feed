@@ -83,3 +83,27 @@ delegations, hydrates the seeded feed item, posts feedback, and persists an Ask
 Feed control intent. Set `FEED_SMOKE_HOST_PORT` / `FEED_SMOKE_WEB_PORT` to run
 the smoke stack on alternate ports when the defaults (8787/4199) are held by
 live dev services.
+
+## Startup timing logs
+
+Feed Host emits one-line JSON logs by default. Set `FEED_HOST_LOG=0` to disable
+them. Browser startup events and Host requests share a generated `traceId`, so
+one startup can be reconstructed from the Host terminal or a log collector:
+
+```sh
+bun run host 2>&1 | jq -R 'fromjson? | select(.traceId != null)'
+```
+
+The `client_startup_timing` events include the browser timestamp (`clientTs`),
+flow (`session_restore`, `interactive_sign_in`, or `delegation_recovery`),
+stage, phase, elapsed time from the start of the flow, and stage duration. The
+final `startup_total` event records time through the first committed Feed
+render. Correlated `http_request` events add Host-side status and request
+duration.
+
+Measured stages include policy fetch, wallet connection, TinyCloud sign-in or
+session restoration, cached or newly materialized Feed Host delegation,
+delegation submission, first Feed page fetch, artifact hydration, and first
+render. Timing fields are allowlisted at ingestion; wallet responses,
+serialized delegations, tokens, transcript contents, and arbitrary client
+details are not accepted as timing fields.
