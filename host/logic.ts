@@ -594,6 +594,20 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       "/api/delegations/status": {
         get: { responses: { 200: { description: "delegation status", content: jsonResponse } } },
       },
+      "/input-authorities": {
+        get: { responses: { 200: { description: "named input authorities", content: jsonResponse } } },
+        post: { responses: { 201: { description: "input authority attached", content: jsonResponse } } },
+      },
+      "/input-authorities/{sourceId}": {
+        get: { responses: { 200: { description: "input authority lineage", content: jsonResponse } } },
+        delete: { responses: { 204: { description: "input authority removed" } } },
+      },
+      "/input-authorities/{sourceId}/status": {
+        get: { responses: { 200: { description: "input authority status", content: jsonResponse } } },
+      },
+      "/input-authorities/{sourceId}/revoke": {
+        post: { responses: { 200: { description: "input authority revoked", content: jsonResponse } } },
+      },
       "/api/openapi.json": {
         get: { security: [], responses: { 200: { description: "openapi", content: jsonResponse } } },
       },

@@ -194,6 +194,38 @@ describe("FeedV1HostClient", () => {
     });
   });
 
+  test("manages named input authorities without sending a raw share", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const client = new FeedV1HostClient({
+      baseUrl: "https://feed.example.test",
+      actorId: "did:pkh:reader",
+      fetchImpl: async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        return jsonResponse({ items: [], attached: true, revoked: true, item: { sourceId: "team", state: "active" } });
+      },
+    });
+    await client.listInputAuthorities();
+    await client.attachInputAuthority({ sourceId: "team", displayName: "Team", portableDelegation: "child-only" });
+    await client.inspectInputAuthority("team");
+    await client.inputAuthorityStatus("team");
+    await client.revokeInputAuthority("team");
+    await client.removeInputAuthority("team");
+
+    expect(JSON.stringify(calls)).not.toContain("tc1:");
+    expect(calls.map(({ url, method }) => [url, method])).toEqual([
+      ["https://feed.example.test/input-authorities", "GET"],
+      ["https://feed.example.test/input-authorities", "POST"],
+      ["https://feed.example.test/input-authorities/team", "GET"],
+      ["https://feed.example.test/input-authorities/team/status", "GET"],
+      ["https://feed.example.test/input-authorities/team/revoke", "POST"],
+      ["https://feed.example.test/input-authorities/team", "DELETE"],
+    ]);
+  });
+
   test("surfaces non-2xx host responses", async () => {
     const client = new FeedV1HostClient({
       baseUrl: "https://feed.example.test",

@@ -129,6 +129,10 @@ describe("Feed Host server", () => {
         "/api/server-info",
         "/api/delegations",
         "/api/delegations/status",
+        "/input-authorities",
+        "/input-authorities/{sourceId}",
+        "/input-authorities/{sourceId}/status",
+        "/input-authorities/{sourceId}/revoke",
         "/api/openapi.json",
         "/admin/state",
         "/admin/seed",
@@ -194,6 +198,89 @@ describe("Feed Host server", () => {
       headers: { "x-feed-actor-id": ACTOR_ID },
     });
     expect(blockedFeed.status).toBe(403);
+  });
+
+  test("attaches, inspects, revokes, and removes a redacted named input authority", async () => {
+    const data = new Map<string, unknown>();
+    const access = {
+      kv: {
+        get: async (key: string) => data.has(key)
+          ? { ok: true, data: { data: data.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+        put: async (key: string, value: unknown) => {
+          data.set(key, value);
+          return { ok: true, data: undefined };
+        },
+        delete: async (key: string) => {
+          data.delete(key);
+          return { ok: true, data: undefined };
+        },
+      },
+    } as unknown as ActivatedFeedDelegation["access"];
+    let inspections = 0;
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      inputAuthorityExpectedHost: "https://node.tinycloud.xyz",
+      activateDelegation: async ({ serializedDelegation }) => ({
+        ...fakeActivatedDelegation(serializedDelegation),
+        access,
+      }),
+      inspectInputAuthority: async ({ expectedAudienceDID }) => {
+        inspections += 1;
+        return {
+          actorId: ACTOR_ID,
+          audienceDID: expectedAudienceDID,
+          host: "https://node.tinycloud.xyz",
+          space: "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:applications",
+          path: "xyz.tinycloud.listen/conversations",
+          actions: ["tinycloud.sql/read"],
+          expiry: "2099-01-01T00:00:00.000Z",
+          parentCid: "bafy-parent",
+          parentLineage: ["bafy-root", "bafy-parent"],
+          agentDID: expectedAudienceDID,
+        };
+      },
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+    const headers = { "x-feed-actor-id": ACTOR_ID };
+
+    const rejectedRaw = await postJson(`${runtime.url}/input-authorities`, {
+      sourceId: "raw",
+      displayName: "Raw",
+      portableDelegation: "child",
+      tc1Link: "tc1:must-not-leak",
+    }, headers);
+    expect(rejectedRaw.status).toBe(400);
+    expect(await rejectedRaw.text()).not.toContain("must-not-leak");
+    expect(inspections).toBe(0);
+
+    const attached = await postJson(`${runtime.url}/input-authorities`, {
+      sourceId: "team-listen",
+      displayName: "Team Listen",
+      portableDelegation: "child-portable-secret",
+    }, headers);
+    expect(attached.status).toBe(201);
+    expect(await attached.json()).toMatchObject({
+      attached: true,
+      item: { sourceId: "team-listen", state: "active", hasPortableDelegation: true },
+    });
+    expect(JSON.stringify(await getJson(`${runtime.url}/input-authorities/team-listen`, headers))).not.toContain("child-portable-secret");
+    const crossActor = await fetch(`${runtime.url}/input-authorities`, {
+      headers: { "x-feed-actor-id": OTHER_ACTOR_ID },
+    });
+    expect(crossActor.status).toBe(403);
+    expect(await getJson(`${runtime.url}/input-authorities/team-listen/status`, headers)).toMatchObject({
+      sourceId: "team-listen",
+      state: "active",
+    });
+    const revoked = await postJson(`${runtime.url}/input-authorities/team-listen/revoke`, {}, headers);
+    expect(await revoked.json()).toMatchObject({ revoked: true, item: { state: "revoked" } });
+    const removed = await fetch(`${runtime.url}/input-authorities/team-listen`, { method: "DELETE", headers });
+    expect(removed.status).toBe(204);
+    expect(await getJson<{ items: unknown[] }>(`${runtime.url}/input-authorities`, headers)).toEqual({ items: [] });
   });
 
   test("rejects expired live delegations after their expiresAt passes", async () => {

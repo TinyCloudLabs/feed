@@ -13,6 +13,7 @@ import { TINYCLOUD_HOST } from "./config.ts";
 import type { FeedHostDelegationPolicy, FeedHostDelegationReceipt } from "./delegation.ts";
 import { FeedV1HostClient } from "./feedV1HostClient.ts";
 import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import { delegateInputAuthorityLocally } from "./inputAuthority.ts";
 import { connectWallet } from "./openkey.ts";
 import {
   FEED_MANIFEST,
@@ -157,6 +158,25 @@ export async function submitFeedHostDelegations(input: {
     serializedDelegation,
   });
   return [await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation })];
+}
+
+export async function attachReceivedInputAuthority(input: {
+  client: FeedV1HostClient;
+  policy: FeedHostDelegationPolicy;
+  sourceId: string;
+  displayName: string;
+  tc1Link: string;
+}): Promise<void> {
+  if (!instance) throw new Error("TinyCloud session is required before attaching an input source");
+  const submission = await delegateInputAuthorityLocally({
+    sdk: instance,
+    tc1Link: input.tc1Link,
+    sourceId: input.sourceId,
+    displayName: input.displayName,
+    delegateDID: input.policy.delegateDID,
+    expectedHost: TINYCLOUD_HOST,
+  });
+  await input.client.attachInputAuthority(submission);
 }
 
 // Session-scope failures (recap doesn't cover the policy, or the session is

@@ -30,6 +30,7 @@ import {
   FEED_HOST_FEED_SETTINGS_PREFIX,
   hasCompleteFeedHostDelegation,
   normalizeActorId,
+  validateInputAuthorityDelegation,
   type AcceptedFeedDelegation,
   type ActivatedFeedDelegation,
   type FeedHostDelegationPolicy,
@@ -40,6 +41,10 @@ import {
 } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
 import { levelForStatus, logEvent } from "./log.ts";
+import {
+  InputAuthorityRegistry,
+  type InputAuthorityInspector,
+} from "./input-authority.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
   FeedHostError,
@@ -67,6 +72,8 @@ export type FeedHostServerOptions = {
     serializedDelegation: string;
     expectedDelegateDID: string;
   }) => Promise<ActivatedFeedDelegation>;
+  inspectInputAuthority?: InputAuthorityInspector;
+  inputAuthorityExpectedHost?: string;
 };
 
 export type FeedHostRuntime = {
@@ -93,6 +100,9 @@ type FeedHostContext = {
   seedOnStart: boolean;
   delegationStore: FeedHostDelegationStore | null;
   enableDevPublisher: boolean;
+  inputAuthorities: InputAuthorityRegistry;
+  inspectInputAuthority: InputAuthorityInspector;
+  inputAuthorityExpectedHost: string;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -149,6 +159,17 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         ? new FeedHostDelegationStore(hostNode)
         : null;
   const actors = new Map<string, ActorState>();
+  const inputAuthorities = new InputAuthorityRegistry();
+  const inspectInputAuthority: InputAuthorityInspector = options.inspectInputAuthority ?? (async (input) => {
+    const inspected = validateInputAuthorityDelegation({
+      serializedDelegation: input.portableDelegation,
+      expectedDelegateDID: input.expectedAudienceDID,
+      expectedHost: input.expectedHost,
+    });
+    await hostNode.useDelegation(inspected.portableDelegation);
+    const { portableDelegation: _portableDelegation, ...lineage } = inspected;
+    return lineage;
+  });
   let context: FeedHostContext | null = null;
 
   const getContext = async (): Promise<FeedHostContext> => {
@@ -164,6 +185,9 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       seedOnStart: options.seedOnStart !== false,
       delegationStore,
       enableDevPublisher: options.enableDevPublisher === true,
+      inputAuthorities,
+      inspectInputAuthority,
+      inputAuthorityExpectedHost: options.inputAuthorityExpectedHost ?? options.tinycloudHost ?? "https://node.tinycloud.xyz",
     };
     return context;
   };
@@ -226,7 +250,19 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
 }
 
 async function route(request: Request, context: FeedHostContext): Promise<Response> {
-  const { storage, policy, policyHash, serverInfo, actors, activateDelegation, seedOnStart, delegationStore } = context;
+  const {
+    storage,
+    policy,
+    policyHash,
+    serverInfo,
+    actors,
+    activateDelegation,
+    seedOnStart,
+    delegationStore,
+    inputAuthorities,
+    inspectInputAuthority,
+    inputAuthorityExpectedHost,
+  } = context;
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/health") {
@@ -323,6 +359,45 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       policyHash,
       status: hasCompleteFeedHostDelegation(state) ? "active" : "activation_pending",
     });
+  }
+
+  if (url.pathname === "/input-authorities" && request.method === "GET") {
+    const actor = await requireCompleteActor(request, context);
+    return json({ items: await inputAuthorities.list(actorStorage(actor)) });
+  }
+
+  if (url.pathname === "/input-authorities" && request.method === "POST") {
+    const actor = await requireCompleteActor(request, context);
+    const body = await readJsonObject(request, "invalid_input_authority", "input authority body must be JSON");
+    const item = await inputAuthorities.attach({
+      actor: actorStorage(actor),
+      body,
+      expectedAudienceDID: policy.delegateDID,
+      expectedHost: inputAuthorityExpectedHost,
+      inspect: inspectInputAuthority,
+    });
+    return json({ attached: true, item }, 201);
+  }
+
+  const inputAuthorityMatch = url.pathname.match(/^\/input-authorities\/([^/]+)(?:\/(status|revoke))?$/);
+  if (inputAuthorityMatch) {
+    const actor = await requireCompleteActor(request, context);
+    const sourceId = decodeURIComponent(inputAuthorityMatch[1]);
+    const action = inputAuthorityMatch[2];
+    if (request.method === "GET" && action === undefined) {
+      return json(await inputAuthorities.get(actorStorage(actor), sourceId));
+    }
+    if (request.method === "GET" && action === "status") {
+      const item = await inputAuthorities.get(actorStorage(actor), sourceId);
+      return json({ sourceId: item.sourceId, state: item.state, expiry: item.expiry, revokedAt: item.revokedAt });
+    }
+    if (request.method === "POST" && action === "revoke") {
+      return json({ revoked: true, item: await inputAuthorities.revoke(actorStorage(actor), sourceId) });
+    }
+    if (request.method === "DELETE" && action === undefined) {
+      await inputAuthorities.remove(actorStorage(actor), sourceId);
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
   }
 
   // Browser-side failures (sign-in, delegation minting, feed setup) happen

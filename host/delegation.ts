@@ -117,6 +117,9 @@ type DelegationLike = PortableDelegation & {
   expiry?: string | Date;
   path?: string;
   actions?: string[];
+  host?: string;
+  parentCid?: string;
+  isRevoked?: boolean;
 };
 
 export class FeedDelegationError extends Error {
@@ -248,6 +251,76 @@ export async function activateFeedHostDelegation(input: {
   return { ...accepted, access };
 }
 
+export function validateInputAuthorityDelegation(input: {
+  serializedDelegation: string;
+  expectedDelegateDID: string;
+  expectedHost: string;
+  now?: Date;
+}): {
+  portableDelegation: PortableDelegation;
+  actorId: string;
+  audienceDID: string;
+  host: string;
+  space: string;
+  path: string;
+  actions: string[];
+  expiry: string;
+  parentCid: string;
+  parentLineage: string[];
+  agentDID: string;
+  revoked: boolean;
+} {
+  let delegation: DelegationLike;
+  try {
+    delegation = deserializeDelegation(input.serializedDelegation) as DelegationLike;
+  } catch {
+    throw new FeedDelegationError("input authority could not be deserialized", "malformed");
+  }
+  const payload = decodeJwtPayload(delegation.delegationHeader?.Authorization ?? "");
+  const audienceDID = typeof payload.aud === "string" ? principalDid(payload.aud) : "";
+  if (
+    !delegation.delegateDID ||
+    !principalDidEquals(delegation.delegateDID, input.expectedDelegateDID) ||
+    !principalDidEquals(audienceDID, input.expectedDelegateDID)
+  ) {
+    throw new FeedDelegationError("input authority audience does not match Feed Host DID", "wrong_delegatee");
+  }
+  const signedExpiry = typeof payload.exp === "number" ? new Date(payload.exp * 1000) : null;
+  if (!signedExpiry || Number.isNaN(signedExpiry.getTime())) {
+    throw new FeedDelegationError("input authority signed expiry is invalid", "malformed");
+  }
+  if (signedExpiry <= (input.now ?? new Date())) throw new FeedDelegationError("input authority is expired", "expired");
+  const grants = signedGrantsFromDelegation(delegation);
+  if (grants.length !== 1) throw new FeedDelegationError("input authority must grant one transcript resource", "insufficient_policy");
+  const grant = grants[0]!;
+  const actorId = signedOwnerDid(grants);
+  if (!actorId) throw new FeedDelegationError("input authority carries no signed owner space", "actor_mismatch");
+  const proofs = Array.isArray(payload.prf) && payload.prf.every((cid) => typeof cid === "string")
+    ? payload.prf as string[]
+    : [];
+  if (!delegation.parentCid || proofs.length === 0 || proofs[0] !== delegation.parentCid) {
+    throw new FeedDelegationError("input authority parent lineage does not match signed proof", "malformed");
+  }
+  const host = typeof delegation.host === "string" ? delegation.host : "";
+  if (normalizeOrigin(host) !== normalizeOrigin(input.expectedHost)) {
+    throw new FeedDelegationError("input authority host is not allowlisted", "insufficient_policy");
+  }
+  return {
+    portableDelegation: delegation,
+    actorId,
+    audienceDID,
+    host,
+    space: grant.space,
+    path: grant.path,
+    actions: [...grant.actions],
+    expiry: signedExpiry.toISOString(),
+    parentCid: delegation.parentCid,
+    parentLineage: [...proofs],
+    agentDID: principalDid(input.expectedDelegateDID),
+    revoked: delegation.isRevoked === true,
+  };
+}
+
 export function hasCompleteFeedHostDelegation<T extends AcceptedFeedDelegation>(
   accepted: T | undefined,
 ): accepted is T {
@@ -349,4 +422,13 @@ function ownerDidFromDelegation(delegation: DelegationLike): string | null {
   }
   if (typeof delegation.chainId !== "number" || !Number.isInteger(delegation.chainId)) return null;
   return `did:pkh:eip155:${delegation.chainId}:${delegation.ownerAddress}`;
+}
+
+function normalizeOrigin(value: string): string {
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`.toLowerCase();
+  } catch {
+    return "invalid-origin";
+  }
 }

@@ -351,6 +351,15 @@ button:disabled {
   padding: 20px;
 }
 
+.settings-subsection {
+  padding-block: 1rem;
+  border-block: 1px solid var(--line);
+}
+
+.settings-subsection h3 {
+  margin: 0 0 0.35rem;
+}
+
 .panel-copy h2,
 .notice-panel h2,
 .empty-panel h2,
