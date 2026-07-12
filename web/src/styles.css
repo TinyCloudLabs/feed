@@ -435,6 +435,66 @@ button:disabled {
   color: #3f4851;
 }
 
+.post-body {
+  max-width: 64ch;
+  margin: 10px 0 16px;
+  color: #25292e;
+  font-size: 1.04rem;
+  line-height: 1.58;
+  text-wrap: pretty;
+}
+
+.artifact-expansion {
+  margin: 16px 0 4px;
+}
+
+.artifact-expansion summary {
+  width: fit-content;
+  min-height: 44px;
+  padding: 10px 2px;
+  color: var(--focus);
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.artifact-expansion[open] summary {
+  margin-bottom: 8px;
+}
+
+.artifact-content {
+  padding: 18px 0 2px;
+  border-top: 1px solid var(--soft-line);
+}
+
+.artifact-label {
+  margin: 0 0 8px;
+  color: var(--quiet);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.artifact-section {
+  max-width: 68ch;
+  margin: 16px 0;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: var(--soft);
+}
+
+.artifact-section:focus {
+  outline: 2px solid currentColor;
+  outline-offset: 3px;
+}
+
+.artifact-section strong {
+  font-size: 13px;
+}
+
+.artifact-section p {
+  margin: 5px 0 0;
+  color: #343a41;
+}
+
 pre {
   max-height: 280px;
   margin: 18px 0;

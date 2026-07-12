@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   ControlIntentEvent,
-  FeedArtifactProjection,
   FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import { artifactExpansionSection, type FeedItemProjection } from "../../shared/feed-item.ts";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
   restoreSession,
@@ -20,7 +20,7 @@ import {
   FeedV1HostError,
   type FeedHostSkillState,
 } from "./feedV1HostClient.ts";
-import { bodyPreview, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
+import { bodyPreview, hydrateFeedItems, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
@@ -108,17 +108,7 @@ export function App() {
     setLoadState("loading");
     try {
       const page = await client.listFeed({ limit: 40 });
-      const hydrated = await Promise.all(
-        page.items.map(async (projection): Promise<FeedItem> => {
-          try {
-            const artifact = await client.getArtifact(projection.artifactId);
-            return { projection, artifact };
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            return { projection, artifact: null, error: message };
-          }
-        }),
-      );
+      const hydrated = await hydrateFeedItems(page.items, (artifactId) => client.getArtifact(artifactId));
       setItems(sortedFeed(hydrated));
       setLoadError(null);
       setLoadState("ready");
@@ -248,14 +238,14 @@ export function App() {
     }
   };
 
-  const sendFeedback = async (projection: FeedArtifactProjection, signal: FeedbackEvent["signal"]) => {
+  const sendFeedback = async (projection: FeedItemProjection, signal: FeedbackEvent["signal"]) => {
     if (!session || feedState !== "running") return;
-    const actionId = `${projection.artifactId}:${signal}`;
+    const actionId = `${projection.feedItemId}:${signal}`;
     setBusyAction(actionId);
     try {
       await client.postFeedback({
         eventId: crypto.randomUUID(),
-        artifactId: projection.artifactId,
+        target: { kind: "feed_item", feedItemId: projection.feedItemId },
         actorId: session.readerDid,
         readerNonce: newNonce(),
         signal,
@@ -354,7 +344,7 @@ export function App() {
 
         <div className="feed-list">
           {items.map((item) => (
-            <FeedCard key={item.projection.artifactId} item={item} busyAction={busyAction} onFeedback={sendFeedback} />
+            <FeedCard key={item.projection.feedItemId} item={item} busyAction={busyAction} onFeedback={sendFeedback} />
           ))}
         </div>
       </main>
@@ -490,18 +480,52 @@ function FeedCard({
 }: {
   item: FeedItem;
   busyAction: string | null;
-  onFeedback: (projection: FeedArtifactProjection, signal: FeedbackEvent["signal"]) => Promise<void>;
+  onFeedback: (projection: FeedItemProjection, signal: FeedbackEvent["signal"]) => Promise<void>;
 }) {
   const artifact = item.artifact;
+  const isPost = Boolean(item.projection.postBody);
+  const expansionSection = artifact ? artifactExpansionSection(artifact, item.projection.sectionRef) : undefined;
+  const expansionAnchorId = expansionSection
+    ? `artifact-section-${encodeURIComponent(item.projection.feedItemId)}-${encodeURIComponent(expansionSection.sectionId)}`
+    : undefined;
   return (
     <article className={item.projection.disposition === "hidden" ? "feed-card hidden-card" : "feed-card"}>
       <div className="card-meta">
         <span>{artifact?.artifactType ?? "artifact"}</span>
         <span>{projectionLabel(item.projection)}</span>
       </div>
-      <h2>{artifact?.title ?? item.projection.artifactId}</h2>
-      {artifact?.summary && <p className="summary">{artifact.summary}</p>}
-      <pre>{bodyPreview(artifact)}</pre>
+      <h2>{item.projection.postTitle ?? artifact?.title ?? item.projection.target.artifactId}</h2>
+      {isPost ? (
+        <>
+          <p className="post-body">{item.projection.postBody}</p>
+          <details
+            className="artifact-expansion"
+            onToggle={(event) => {
+              if (event.currentTarget.open && expansionAnchorId) {
+                requestAnimationFrame(() => document.getElementById(expansionAnchorId)?.focus());
+              }
+            }}
+          >
+            <summary>Open full artifact</summary>
+            <div className="artifact-content">
+              <p className="artifact-label">From {artifact?.title ?? item.projection.target.artifactId}</p>
+              {artifact?.summary && <p className="summary">{artifact.summary}</p>}
+              {expansionSection && (
+                <section id={expansionAnchorId} className="artifact-section" aria-label="Relevant section" tabIndex={-1}>
+                  <strong>{expansionSection.title ?? "Related section"}</strong>
+                  <p>{expansionSection.text}</p>
+                </section>
+              )}
+              <pre>{bodyPreview(artifact)}</pre>
+            </div>
+          </details>
+        </>
+      ) : (
+        <>
+          {artifact?.summary && <p className="summary">{artifact.summary}</p>}
+          <pre>{bodyPreview(artifact)}</pre>
+        </>
+      )}
       {item.error && <p className="error">Hydration failed: {item.error}</p>}
       <dl className="provenance">
         <div>
@@ -521,7 +545,7 @@ function FeedCard({
         {(["save", "hide", "helpful", "unhelpful", "show_fewer"] as const).map((signal) => (
           <button
             key={signal}
-            disabled={busyAction === `${item.projection.artifactId}:${signal}`}
+            disabled={busyAction === `${item.projection.feedItemId}:${signal}`}
             onClick={() => void onFeedback(item.projection, signal)}
           >
             {feedbackLabel(signal)}

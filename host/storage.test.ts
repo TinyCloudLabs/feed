@@ -1,10 +1,18 @@
 import { expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { FEED_HOST_ARTIFACT_DOC_PREFIX, FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_FEED_DB_PATH } from "./delegation.ts";
 import type { FeedHostActorStorage } from "./storage.ts";
 import { FeedHostStorage } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import type { FeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
-import { seedDefaultFeed, SEEDED_ARTIFACT_ID } from "./seed.ts";
+import { seedDefaultFeed } from "./seed.ts";
+import {
+  FEED_V1_LEGACY_PROJECTION_PARITY_SQL,
+  FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL,
+  FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL,
+  FEED_POST_MIGRATION,
+  withFeedHostMigrations,
+} from "./feed-schema.ts";
 
 // Real SDK failures surface as plain service-error objects, not Error instances.
 const MULTI_RESOURCE_ERROR = {
@@ -90,13 +98,75 @@ test("bootstraps schema with per-migration batches when migrations.apply cannot 
   expect(artifactLog?.applies).toBe(1);
   expect(feedLog?.applies).toBe(1);
   expect(artifactLog?.batches.length).toBe(1);
-  expect(feedLog?.batches.length).toBe(1);
+  expect(feedLog?.batches.length).toBe(2);
   expect(artifactLog?.batches[0]?.length).toBe(7);
   expect(feedLog?.batches[0]?.length).toBe(6);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
+  expect(feedLog?.batches[1]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
+  expect(feedLog?.batches[1]?.some((statement) => statement.sql.includes("CREATE TABLE IF NOT EXISTS feed_targeted_interaction_event"))).toBe(true);
   expect(artifactLog?.executes.length).toBe(0);
-  expect(feedLog?.executes.length).toBe(0);
+  expect(feedLog?.executes.length).toBe(2);
+  expect(feedLog?.executes[0]).toContain("ON CONFLICT(feed_item_id) DO UPDATE");
+});
+
+test("converges with the canonical post migration without duplicating it", () => {
+  const canonical = { ...FEED_POST_MIGRATION, description: "canonical Artifactory migration" };
+  const merged = withFeedHostMigrations([
+    { id: "001_feed_index", description: "base", sql: [] },
+    canonical,
+  ]);
+
+  expect(merged.map((migration) => migration.id)).toEqual([
+    "001_feed_index",
+    "002_post_feed_items",
+  ]);
+  expect(merged.filter((migration) => migration.id === "002_post_feed_items")).toHaveLength(1);
+  expect(merged.find((migration) => migration.id === "002_post_feed_items")?.description).toBe(
+    "canonical Artifactory migration",
+  );
+  expect(FEED_POST_MIGRATION.sql.join("\n")).toContain("'legacy:' || artifact_id");
+  expect(FEED_POST_MIGRATION.sql.every((sql) => !sql.startsWith("ALTER TABLE"))).toBe(true);
+});
+
+test("reconciliation is monotonic, repairs both rollout directions, and closes the parity gate", () => {
+  const db = new Database(":memory:");
+  db.exec(`CREATE TABLE feed_artifact_projection (
+    artifact_id TEXT PRIMARY KEY, rank_score REAL NOT NULL, disposition TEXT NOT NULL,
+    visibility TEXT NOT NULL, freshness_label TEXT NOT NULL, reason_codes_json TEXT NOT NULL,
+    package_id TEXT NOT NULL, source_fingerprint TEXT NOT NULL,
+    published_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  )`);
+  for (const sql of FEED_POST_MIGRATION.sql.slice(0, 2)) db.exec(sql);
+  const insertLegacy = db.prepare(`INSERT OR REPLACE INTO feed_artifact_projection VALUES (?, ?, 'default', 'ranked', 'fresh', '[]', 'pkg', 'sha256:source', ?, ?)`);
+  insertLegacy.run("late", 0.4, "2026-07-01T00:00:00.000Z", "2026-07-01T00:00:00.000Z");
+  db.exec(FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+  expect(db.query<{ feed_item_id: string }, []>("SELECT feed_item_id FROM feed_item_projection WHERE artifact_id = 'late'").get()?.feed_item_id).toBe("legacy:late");
+
+  db.exec(`UPDATE feed_item_projection SET rank_score = 0.9, updated_at = '2026-07-03T00:00:00.000Z' WHERE feed_item_id = 'legacy:late'`);
+  insertLegacy.run("late", 0.2, "2026-07-01T00:00:00.000Z", "2026-07-02T00:00:00.000Z");
+  db.exec(FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+  expect(db.query<{ rank_score: number }, []>("SELECT rank_score FROM feed_item_projection WHERE feed_item_id = 'legacy:late'").get()?.rank_score).toBe(0.9);
+  db.exec(FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
+  expect(db.query<{ rank_score: number }, []>("SELECT rank_score FROM feed_artifact_projection WHERE artifact_id = 'late'").get()?.rank_score).toBe(0.9);
+
+  insertLegacy.run("late", 0.7, "2026-07-01T00:00:00.000Z", "2026-07-04T00:00:00.000Z");
+  db.exec(FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+  expect(db.query<{ rank_score: number }, []>("SELECT rank_score FROM feed_item_projection WHERE feed_item_id = 'legacy:late'").get()?.rank_score).toBe(0.7);
+  const parity = db.query<{ mismatch_count: number }, []>(FEED_V1_LEGACY_PROJECTION_PARITY_SQL).get();
+  expect(Number(parity?.mismatch_count)).toBe(0);
+
+  db.exec(`UPDATE feed_item_projection SET published_at = '2026-07-09T00:00:00.000Z' WHERE feed_item_id = 'legacy:late'`);
+  expect(Number(db.query<{ mismatch_count: number }, []>(FEED_V1_LEGACY_PROJECTION_PARITY_SQL).get()?.mismatch_count)).toBe(1);
+  db.exec(FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+  expect(Number(db.query<{ mismatch_count: number }, []>(FEED_V1_LEGACY_PROJECTION_PARITY_SQL).get()?.mismatch_count)).toBe(0);
+
+  db.exec(`INSERT INTO feed_item_projection VALUES (
+    'legacy:orphan', 'artifact_preview', 'orphan', NULL, 0.1, 'default', 'ranked',
+    'fresh', '[]', 'pkg', 'sha256:orphan', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z'
+  )`);
+  expect(Number(db.query<{ mismatch_count: number }, []>(FEED_V1_LEGACY_PROJECTION_PARITY_SQL).get()?.mismatch_count)).toBe(1);
+  db.close();
 });
 
 test("falls back to statement-by-statement execution when batches cannot mix actions either", async () => {
@@ -108,9 +178,10 @@ test("falls back to statement-by-statement execution when batches cannot mix act
   const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
   expect(artifactLog?.executes.length).toBe(7);
-  expect(feedLog?.executes.length).toBe(6);
+  expect(feedLog?.executes.length).toBe(12);
   expect(artifactLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
+  expect(feedLog?.executes[6]).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
 });
 
 test("hydrates corrupt artifact docs defensively and audits invalid fixtures", async () => {
@@ -150,12 +221,26 @@ test("hydrates corrupt artifact docs defensively and audits invalid fixtures", a
     expect(malformedRead.kind).toBe("hydration_failed");
 
     const plan = await storage.reconcileFeedProjection(actor);
-    expect(plan.upserts.map((row) => row.artifactId).sort()).toEqual(["malformed-artifact", "schema-mismatch-artifact"]);
+    expect(plan.upserts.map((row) => row.target.artifactId).sort()).toEqual(["malformed-artifact", "schema-mismatch-artifact"]);
     expect(plan.upserts.every((row) => row.visibility === "repair_only")).toBe(true);
     expect(warn).toHaveBeenCalledTimes(2);
   } finally {
     warn.mockRestore();
   }
+});
+
+test("rejects feedback for a missing artifact before writing either interaction table", async () => {
+  const storage = new FeedHostStorage();
+  const actor = makeHydrationActor({ artifacts: [], docs: {} });
+
+  await expect(storage.recordFeedback(actor, {
+    eventId: "dangling-artifact-feedback",
+    actorId: actor.actorId,
+    readerNonce: "dangling-artifact-feedback",
+    target: { kind: "artifact", artifactId: "missing-artifact" },
+    signal: "helpful",
+    createdAt: "2026-07-11T12:00:00.000Z",
+  })).rejects.toMatchObject({ status: 400, code: "invalid_feedback_target" });
 });
 
 function artifactDocKey(docKey: string): string {
@@ -182,6 +267,9 @@ function makeHydrationActor(input: {
         apply: async () => ({ ok: false, error: MULTI_RESOURCE_ERROR }),
       },
       query: async (sql: string, params: Array<string | number>) => {
+        if (path === FEED_HOST_FEED_DB_PATH && sql.includes("artifact_index")) {
+          throw new Error("feed_index queries must not join the distinct artifacts_index database");
+        }
         if (path === FEED_HOST_ARTIFACTS_DB_PATH && sql.includes("WHERE artifact_id = ?")) {
           const artifactId = String(params[0]);
           return {
@@ -299,11 +387,11 @@ test("bootstraps legacy rows when the actor can read the old SQL resources", asy
   const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
   expect(artifactLog?.batches.length).toBe(2);
-  expect(feedLog?.batches.length).toBe(2);
+  expect(feedLog?.batches.length).toBe(3);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(artifactLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO artifact_index");
-  expect(feedLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_artifact_projection");
+  expect(feedLog?.batches[2]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_artifact_projection");
 });
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {
@@ -322,7 +410,7 @@ function emptyMigrationSummary(): FeedV1MigrationSummary {
   };
 }
 
-test("seeds the reviewed artifact at the canonical artifacts/{artifactId}.json KV path", async () => {
+test("seeds the canonical rich artifact at its declared document path", async () => {
   const documentKeys: string[] = [];
   const seedRows: Array<{ dbName: string; rows: Array<{ table: string; values: Record<string, string | number | null> }> }> = [];
   const hostStorage = new FeedHostStorage();
@@ -354,6 +442,6 @@ test("seeds the reviewed artifact at the canonical artifacts/{artifactId}.json K
     seedRows
       .find(({ dbName }) => dbName === "artifacts_index")
       ?.rows.find((row) => row.table === "artifact_index")?.values.doc_key,
-  ).toBe(`xyz.tinycloud.artifacts/artifacts/${SEEDED_ARTIFACT_ID}.json`);
-  expect(documentKeys).toEqual([`xyz.tinycloud.artifacts/artifacts/${SEEDED_ARTIFACT_ID}.json`]);
+  ).toBe("runs/run-weekly-product-brief/brief.json");
+  expect(documentKeys).toEqual(["xyz.tinycloud.artifacts/artifacts/runs/run-weekly-product-brief/brief.json"]);
 });

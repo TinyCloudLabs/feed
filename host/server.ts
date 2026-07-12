@@ -5,6 +5,11 @@ import type {
   FeedbackEvent,
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import type { FeedControlIntentInput, FeedControlIntentKind, FeedGenerationRequestRecord } from "./logic.ts";
+import {
+  validateFeedTargetedInteractionEvent,
+  type FeedInteractionTarget,
+  type FeedTargetedInteractionEvent,
+} from "../shared/feed-item.ts";
 import { validateFeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { artifactIndexRow } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import {
@@ -425,6 +430,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed") {
     const actor = await requireCompleteActor(request, context);
+    await storage.reconcileFeedProjection(actorStorage(actor));
     const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
@@ -435,6 +441,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed/events") {
     const actor = await requireCompleteActor(request, context);
+    await storage.reconcileFeedProjection(actorStorage(actor));
     const body = await storage.listFeedEvents(actorStorage(actor), optionalString(request.headers.get("last-event-id")));
     return new Response(body, { status: 200, headers: SSE_HEADERS });
   }
@@ -869,17 +876,44 @@ async function readJsonObject(request: Request, code: string, message: string): 
   return body as Record<string, unknown>;
 }
 
-function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string): FeedbackEvent {
+function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string): FeedTargetedInteractionEvent {
   const signal = readSignal(body.signal);
-  return {
+  const event: FeedTargetedInteractionEvent = {
     eventId: readString(body, "eventId", "invalid_feedback", "eventId is required"),
-    artifactId: readString(body, "artifactId", "invalid_feedback", "artifactId is required"),
+    target: normalizeInteractionTarget(body.target, body.artifactId),
     actorId,
     readerNonce: readString(body, "readerNonce", "invalid_feedback", "readerNonce is required"),
     signal,
     payload: sanitizeFeedbackPayload(signal, body.payload),
     createdAt: readString(body, "createdAt", "invalid_feedback", "createdAt is required"),
   };
+  const validated = validateFeedTargetedInteractionEvent(event);
+  if (!validated.ok) throw new FeedHostError(validated.errors.join("; "), 400, "invalid_feedback");
+  return validated.value;
+}
+
+function normalizeInteractionTarget(value: unknown, legacyArtifactId: unknown): FeedInteractionTarget {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      kind: "artifact",
+      artifactId: readString({ artifactId: legacyArtifactId }, "artifactId", "invalid_feedback", "target or artifactId is required"),
+    };
+  }
+  const target = value as Record<string, unknown>;
+  if (target.kind === "artifact") {
+    return { kind: "artifact", artifactId: readString(target, "artifactId", "invalid_feedback", "target.artifactId is required") };
+  }
+  if (target.kind === "post") {
+    return {
+      kind: "post",
+      artifactId: readString(target, "artifactId", "invalid_feedback", "target.artifactId is required"),
+      postId: readString(target, "postId", "invalid_feedback", "target.postId is required"),
+    };
+  }
+  if (target.kind === "feed_item") {
+    return { kind: "feed_item", feedItemId: readString(target, "feedItemId", "invalid_feedback", "target.feedItemId is required") };
+  }
+  throw new FeedHostError("target.kind is invalid", 400, "invalid_feedback");
 }
 
 function normalizeSkillCredentialsPatch(body: Record<string, unknown>): FeedHostSkillCredentialsPatch {

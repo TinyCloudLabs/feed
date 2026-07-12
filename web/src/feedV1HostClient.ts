@@ -2,9 +2,8 @@ import type {
   ControlIntentEvent,
   CredentialMode,
   FeedArtifact,
-  FeedArtifactProjection,
-  FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../../shared/feed-item.ts";
 import type {
   FeedHostDelegationPolicy,
   FeedHostDelegationReceipt,
@@ -12,7 +11,7 @@ import type {
 } from "./delegation.ts";
 
 export type FeedV1Page = {
-  items: FeedArtifactProjection[];
+  items: FeedItemProjection[];
   nextCursor?: string;
 };
 
@@ -151,7 +150,7 @@ export class FeedV1HostClient {
     );
   }
 
-  async postFeedback(event: FeedbackEvent): Promise<{ accepted: true; eventId: string }> {
+  async postFeedback(event: FeedTargetedInteractionEvent): Promise<{ accepted: true; eventId: string }> {
     return this.request<{ accepted: true; eventId: string }>("/feedback", {
       method: "POST",
       body: JSON.stringify(event),

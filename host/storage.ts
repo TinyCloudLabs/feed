@@ -54,9 +54,26 @@ import {
   sanitizePreferenceValue,
   FEED_HOST_PREFERENCES_SCOPE,
 } from "./logic.ts";
+import {
+  postsFromArtifact,
+  validateFeedItemProjection,
+  validateFeedItemProjectionJoin,
+  type FeedInteractionTarget,
+  type FeedItemProjection,
+  type FeedTargetedInteractionEvent,
+} from "../shared/feed-item.ts";
+import {
+  FEED_V1_LEGACY_PROJECTION_PARITY_SQL,
+  FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL,
+  FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL,
+  withFeedHostMigrations,
+} from "./feed-schema.ts";
 
 type ProjectionRow = {
+  feed_item_id: string;
+  target_kind: "post" | "artifact_preview";
   artifact_id: string;
+  post_id: string | null;
   artifact_type: string;
   rank_score: number;
   disposition: FeedArtifactProjection["disposition"];
@@ -80,8 +97,17 @@ type ArtifactIndexRow = {
 };
 
 type FeedbackRow = {
+  target: FeedInteractionTarget;
+  signal: FeedbackEvent["signal"];
+  createdAt: string;
+};
+
+type FeedbackDbRow = {
   eventId: string;
-  artifactId: string;
+  targetKind: FeedInteractionTarget["kind"];
+  artifactId: string | null;
+  postId: string | null;
+  feedItemId: string | null;
   signal: FeedbackEvent["signal"];
   createdAt: string;
 };
@@ -203,6 +229,13 @@ export type FeedHostStorageOptions = {
   maxPendingGenerationRequests?: number;
 };
 
+export type FeedProjectionParity = {
+  legacyRows: number;
+  matchingRows: number;
+  mismatchedRows: number;
+  readyToRetireLegacyReads: boolean;
+};
+
 export const DEFAULT_MAX_PENDING_GENERATION_REQUESTS = 8;
 
 export class FeedHostError extends Error {
@@ -241,10 +274,14 @@ export class FeedHostStorage {
       const db = this.db(actor, plan.dbName);
       const migrated = await applyMigrations(db, {
         namespace: plan.namespace,
-        migrations: plan.migrations,
+        migrations: plan.dbName === "feed_index"
+          ? withFeedHostMigrations(plan.migrations)
+          : plan.migrations,
       });
       if (!migrated.ok) throw new Error(`Failed to initialize ${plan.dbName}: ${resultError(migrated)}`);
     }
+    await execute(this.db(actor, "feed_index"), FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+    await execute(this.db(actor, "feed_index"), FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
     const migrationSummary = await this.migrateLegacyDataHook(actor);
     this.bootstrapped.add(actor);
     return migrationSummary;
@@ -276,7 +313,7 @@ export class FeedHostStorage {
   async listFeed(
     actor: FeedHostActorStorage,
     input: { limit: number; cursor?: string },
-  ): Promise<{ items: FeedArtifactProjection[]; nextCursor?: string }> {
+  ): Promise<{ items: FeedItemProjection[]; nextCursor?: string }> {
     const offset = input.cursor ? Number(input.cursor) : 0;
     if (!Number.isInteger(offset) || offset < 0) throw new Error("cursor must be a non-negative integer offset");
     const limit = Math.max(1, Math.min(input.limit, 100));
@@ -285,16 +322,43 @@ export class FeedHostStorage {
       this.readFeedbackRows(actor),
       this.listPreferenceProfiles(actor),
     ]);
+    const postArtifactIds = new Set(
+      projectionRows.filter((row) => row.target.kind === "post").map((row) => row.target.artifactId),
+    );
+    const composedRows = projectionRows.filter(
+      (row) => row.target.kind !== "artifact_preview" || !postArtifactIds.has(row.target.artifactId),
+    );
     const ranked = rankFeedProjections({
-      items: projectionRows,
+      items: composedRows,
       feedbackByArtifact: summarizeFeedbackEvents(feedbackRows),
       preferences: mergeFeedPreferences(preferenceRows),
     });
     const page = ranked.slice(offset, offset + limit);
+    const artifacts = new Map<string, Promise<FeedArtifact | null>>();
+    const items = await Promise.all(page.map(async (row) => {
+      const artifactId = row.target.artifactId;
+      let artifactRequest = artifacts.get(artifactId);
+      if (!artifactRequest) {
+        artifactRequest = this.getArtifact(actor, artifactId);
+        artifacts.set(artifactId, artifactRequest);
+      }
+      return stripProjectionState(row, await artifactRequest);
+    }));
     return {
-      items: page.map(stripProjectionState),
+      items,
       nextCursor: ranked.length > offset + limit ? String(offset + limit) : undefined,
     };
+  }
+
+  async checkProjectionParity(actor: FeedHostActorStorage): Promise<FeedProjectionParity> {
+    const rows = await queryRows<{ legacy_rows: number; matching_rows: number; mismatch_count: number }>(
+      this.db(actor, "feed_index"),
+      FEED_V1_LEGACY_PROJECTION_PARITY_SQL,
+    );
+    const legacyRows = Number(rows[0]?.legacy_rows ?? 0);
+    const matchingRows = Number(rows[0]?.matching_rows ?? 0);
+    const mismatchedRows = Number(rows[0]?.mismatch_count ?? Math.max(0, legacyRows - matchingRows));
+    return { legacyRows, matchingRows, mismatchedRows, readyToRetireLegacyReads: mismatchedRows === 0 };
   }
 
   async readArtifact(
@@ -405,10 +469,15 @@ export class FeedHostStorage {
   }
 
   async reconcileFeedProjection(actor: FeedHostActorStorage): Promise<FeedReconcilePlan> {
-    const [currentRows, artifactRows] = await Promise.all([this.readProjectionStates(actor), this.readArtifactIndexRows(actor)]);
+    // Rolling compatibility: old writers remain authoritative only when their
+    // updated_at is newer. This also repairs partial old->new writes.
+    await execute(this.db(actor, "feed_index"), FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+    await execute(this.db(actor, "feed_index"), FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
+    const artifactRows = await this.readArtifactIndexRows(actor);
+    const currentRows = await this.readProjectionStates(actor, artifactRows);
     const artifacts: FeedReconcileArtifact[] = [];
     for (const artifactRow of artifactRows) {
-      const current = currentRows.find((row) => row.artifactId === artifactRow.artifact_id);
+      const current = currentRows.find((row) => row.target.artifactId === artifactRow.artifact_id);
       const artifactResult = await this.readArtifactDocument(actor, artifactRow.doc_key);
       if (artifactResult.kind === "malformed" || artifactResult.kind === "schema_mismatch") {
         console.warn("Feed Host skipped invalid artifact doc during hydration", {
@@ -427,17 +496,35 @@ export class FeedHostStorage {
         updatedAt: artifactRow.updated_at,
         freshnessLabel: artifactResult.kind === "found" ? artifactResult.artifact.freshness.label : current?.freshnessLabel ?? "source_unavailable",
         docMissing: artifactResult.kind !== "found",
+        posts: artifactResult.kind === "found" ? postsFromArtifact(artifactResult.artifact) : [],
+        surfaceMode: artifactResult.kind === "found"
+          ? (artifactResult.artifact as unknown as { feedSurface?: { mode?: "posts" | "artifact_preview" | "none" } }).feedSurface?.mode
+          : undefined,
       });
     }
     const plan = reconcileFeedProjections({ artifacts, projections: currentRows });
-    if (plan.upserts.length === 0 && plan.deletions.length === 0) return plan;
-
-    const statements: SqlStatement[] = plan.upserts.map(projectionSqlRow);
+    const statements: SqlStatement[] = plan.upserts.flatMap((row) => [
+      projectionSqlRow(row),
+      ...(row.target.kind === "artifact_preview" ? [legacyProjectionSqlRow(row)] : []),
+    ]);
+    const mirrored = new Set(plan.upserts.filter((row) => row.target.kind === "artifact_preview").map((row) => row.feedItemId));
+    for (const row of plan.desired) {
+      if (row.target.kind === "artifact_preview" && !mirrored.has(row.feedItemId)) statements.push(legacyProjectionSqlRow(row));
+    }
     if (plan.deletions.length > 0) {
       statements.push({
-        sql: `DELETE FROM feed_artifact_projection WHERE artifact_id IN (${plan.deletions.map(() => "?").join(", ")})`,
+        sql: `DELETE FROM feed_item_projection WHERE feed_item_id IN (${plan.deletions.map(() => "?").join(", ")})`,
         params: plan.deletions,
       });
+      const deletedArtifactIds = currentRows
+        .filter((row) => plan.deletions.includes(row.feedItemId) && row.target.kind === "artifact_preview")
+        .map((row) => row.target.artifactId);
+      if (deletedArtifactIds.length > 0) {
+        statements.push({
+          sql: `DELETE FROM feed_artifact_projection WHERE artifact_id IN (${deletedArtifactIds.map(() => "?").join(", ")})`,
+          params: deletedArtifactIds,
+        });
+      }
     }
     statements.push({
       sql: `INSERT OR REPLACE INTO projection_checkpoint (
@@ -452,26 +539,38 @@ export class FeedHostStorage {
       ],
     });
     await batch(this.db(actor, "feed_index"), statements);
+    const parity = await this.checkProjectionParity(actor);
+    if (!parity.readyToRetireLegacyReads) {
+      console.warn("Feed Host projection parity gate remains closed", parity);
+    }
     return plan;
   }
 
   async recordFeedback(
     actor: FeedHostActorStorage,
-    event: FeedbackEvent,
+    event: FeedTargetedInteractionEvent,
   ): Promise<{ eventId: string; duplicate: boolean; status: "applied" | "noop" }> {
     const normalizedActorId = normalizeActorId(event.actorId);
     const existing = await this.findFeedbackEvent(actor, normalizedActorId, event.readerNonce);
     if (existing) return { eventId: existing.eventId, duplicate: true, status: "noop" };
+    const projection = await this.readProjectionTarget(actor, event.target);
+    if (!projection) {
+      throw new FeedHostError("interaction target does not exist", 400, "invalid_feedback_target");
+    }
 
     const payloadHash = event.payloadHash ?? hashJson(event.payload ?? null);
     const statements: SqlStatement[] = [
       {
-        sql: `INSERT INTO feedback_event (
-          event_id, artifact_id, reader_nonce, actor_id, signal, payload_json, payload_hash, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT INTO feed_targeted_interaction_event (
+          event_id, target_kind, artifact_id, post_id, feed_item_id, reader_nonce,
+          actor_id, signal, payload_json, payload_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         params: [
           event.eventId,
-          event.artifactId,
+          event.target.kind,
+          "artifactId" in event.target ? event.target.artifactId : null,
+          event.target.kind === "post" ? event.target.postId : null,
+          event.target.kind === "feed_item" ? event.target.feedItemId : null,
           event.readerNonce,
           normalizedActorId,
           event.signal,
@@ -481,17 +580,33 @@ export class FeedHostStorage {
         ],
       },
     ];
+    if (event.target.kind === "artifact") {
+      statements.push({
+        sql: `INSERT INTO feedback_event (
+          event_id, artifact_id, reader_nonce, actor_id, signal, payload_json, payload_hash, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        params: [
+          event.eventId,
+          event.target.artifactId,
+          event.readerNonce,
+          normalizedActorId,
+          event.signal,
+          event.payload === undefined ? null : JSON.stringify(event.payload),
+          payloadHash,
+          event.createdAt,
+        ],
+      });
+    }
     const disposition = dispositionForSignal(event.signal);
     if (disposition) {
       statements.push({
-        sql: `UPDATE feed_artifact_projection SET disposition = ?, updated_at = ? WHERE artifact_id = ?`,
-        params: [disposition, event.createdAt, event.artifactId],
+        sql: projectionDispositionSql(event.target),
+        params: projectionDispositionParams(event.target, disposition, event.createdAt),
       });
     }
     await batch(this.db(actor, "feed_index"), statements);
 
     if (event.signal === "show_fewer") {
-      const projection = await this.readProjectionByArtifactId(actor, event.artifactId);
       if (projection) {
         await this.bumpShowFewerPreference(actor, normalizedActorId, projection.package_id, event.createdAt);
       }
@@ -758,7 +873,7 @@ export class FeedHostStorage {
   }> {
     const [artifacts, projections, feedback, preferences, controlIntents, generationRequests] = await Promise.all([
       count(this.db(actor, "artifacts_index"), "artifact_index"),
-      count(this.db(actor, "feed_index"), "feed_artifact_projection"),
+      count(this.db(actor, "feed_index"), "feed_item_projection"),
       count(this.db(actor, "feed_index"), "feedback_event"),
       count(this.db(actor, "feed_index"), "preference_profile"),
       count(this.db(actor, "feed_index"), "control_intent_event"),
@@ -772,16 +887,26 @@ export class FeedHostStorage {
     return access.sql.db(DB_PATHS[dbName]);
   }
 
-  private async readProjectionStates(actor: FeedHostActorStorage): Promise<FeedProjectionState[]> {
-    const rows = await queryRows<ProjectionRow>(
+  private async readProjectionStates(
+    actor: FeedHostActorStorage,
+    knownArtifacts?: readonly ArtifactIndexRow[],
+  ): Promise<FeedProjectionState[]> {
+    // Keep resource calls sequential. Some TinyCloud access handles serialize
+    // invocations, so overlapping feed/artifact DB reads can stall activation.
+    const artifacts = knownArtifacts ?? await this.readArtifactIndexRows(actor);
+    const rows = await queryRows<Omit<ProjectionRow, "artifact_type">>(
       this.db(actor, "feed_index"),
-      `SELECT p.artifact_id, p.rank_score, p.disposition, p.visibility, p.freshness_label, p.reason_codes_json,
-              p.package_id, p.source_fingerprint, p.published_at, p.updated_at, a.artifact_type
-         FROM feed_artifact_projection AS p
-         JOIN artifact_index AS a ON a.artifact_id = p.artifact_id
-        ORDER BY p.published_at DESC, p.artifact_id ASC`,
+      `SELECT feed_item_id, target_kind, artifact_id, post_id,
+              rank_score, disposition, visibility, freshness_label, reason_codes_json,
+              package_id, source_fingerprint, published_at, updated_at
+         FROM feed_item_projection
+        ORDER BY published_at DESC, feed_item_id ASC`,
     );
-    return rows.map(projectionStateFromRow);
+    const artifactTypes = new Map(artifacts.map((row) => [row.artifact_id, row.artifact_type] as const));
+    return rows.flatMap((row) => {
+      const artifactType = artifactTypes.get(row.artifact_id);
+      return artifactType ? [projectionStateFromRow({ ...row, artifact_type: artifactType })] : [];
+    });
   }
 
   private async readArtifactIndexRows(actor: FeedHostActorStorage): Promise<ArtifactIndexRow[]> {
@@ -794,14 +919,26 @@ export class FeedHostStorage {
   }
 
   private async readFeedbackRows(actor: FeedHostActorStorage): Promise<FeedbackRow[]> {
-    return queryRows<FeedbackRow>(
+    const rows = await queryRows<FeedbackDbRow>(
       this.db(actor, "feed_index"),
-      `SELECT event_id AS eventId, artifact_id AS artifactId, signal, created_at AS createdAt
-         FROM feedback_event
+      `SELECT event_id AS eventId, target_kind AS targetKind, artifact_id AS artifactId,
+              post_id AS postId, feed_item_id AS feedItemId, signal, created_at AS createdAt
+         FROM feed_targeted_interaction_event
         WHERE actor_id = ?
-        ORDER BY created_at ASC`,
-      [normalizeActorId(actor.actorId)],
+        UNION ALL
+       SELECT f.event_id AS eventId, 'artifact' AS targetKind, f.artifact_id AS artifactId,
+              NULL AS postId, NULL AS feedItemId, f.signal, f.created_at AS createdAt
+         FROM feedback_event AS f
+        WHERE f.actor_id = ?
+          AND NOT EXISTS (SELECT 1 FROM feed_targeted_interaction_event AS t WHERE t.event_id = f.event_id)
+        ORDER BY createdAt ASC`,
+      [normalizeActorId(actor.actorId), normalizeActorId(actor.actorId)],
     );
+    return rows.map((row) => ({
+      target: interactionTargetFromRow(row),
+      signal: row.signal,
+      createdAt: row.createdAt,
+    }));
   }
 
   private async readArtifactDocument(
@@ -824,14 +961,26 @@ export class FeedHostStorage {
     return hydrated;
   }
 
-  private async readProjectionByArtifactId(
+  private async readProjectionTarget(
     actor: FeedHostActorStorage,
-    artifactId: string,
+    target: FeedInteractionTarget,
   ): Promise<{ package_id: string } | null> {
+    if (target.kind === "artifact") {
+      const rows = await queryRows<{ package_id: string }>(
+        this.db(actor, "artifacts_index"),
+        "SELECT package_id FROM artifact_index WHERE artifact_id = ? LIMIT 1",
+        [target.artifactId],
+      );
+      return rows[0] ?? null;
+    }
     const rows = await queryRows<{ package_id: string }>(
       this.db(actor, "feed_index"),
-      `SELECT package_id FROM feed_artifact_projection WHERE artifact_id = ? LIMIT 1`,
-      [artifactId],
+      target.kind === "feed_item"
+        ? `SELECT package_id FROM feed_item_projection WHERE feed_item_id = ? LIMIT 1`
+        : `SELECT package_id FROM feed_item_projection WHERE target_kind = 'post' AND artifact_id = ? AND post_id = ? LIMIT 1`,
+      target.kind === "feed_item"
+        ? [target.feedItemId]
+        : [target.artifactId, target.postId],
     );
     return rows[0] ?? null;
   }
@@ -882,13 +1031,14 @@ export class FeedHostStorage {
     });
   }
 
-  private async findFeedbackEvent(actor: FeedHostActorStorage, actorId: string, readerNonce: string): Promise<FeedbackRow | null> {
-    const rows = await queryRows<FeedbackRow>(
+  private async findFeedbackEvent(actor: FeedHostActorStorage, actorId: string, readerNonce: string): Promise<{ eventId: string } | null> {
+    const rows = await queryRows<{ eventId: string }>(
       this.db(actor, "feed_index"),
-      `SELECT event_id AS eventId, artifact_id AS artifactId, signal, created_at AS createdAt
-         FROM feedback_event
-        WHERE actor_id = ? AND reader_nonce = ?`,
-      [actorId, readerNonce],
+      `SELECT event_id AS eventId FROM feed_targeted_interaction_event WHERE actor_id = ? AND reader_nonce = ?
+       UNION ALL
+       SELECT event_id AS eventId FROM feedback_event WHERE actor_id = ? AND reader_nonce = ?
+       LIMIT 1`,
+      [actorId, readerNonce, actorId, readerNonce],
     );
     return rows[0] ?? null;
   }
@@ -1011,7 +1161,7 @@ export class FeedHostStorage {
   ): Promise<void> {
     await batch(this.db(actor, "feed_index"), [
       {
-        sql: `UPDATE feed_artifact_projection SET disposition = ?, updated_at = ? WHERE artifact_id = ?`,
+        sql: `UPDATE feed_item_projection SET disposition = ?, updated_at = ? WHERE artifact_id = ?`,
         params: [disposition, updatedAt, artifactId],
       },
     ]);
@@ -1145,7 +1295,7 @@ async function batch(db: IDatabaseHandle, statements: SqlStatement[]): Promise<v
 async function execute(db: IDatabaseHandle, sql: string, params: SqlValue[] = []): Promise<number> {
   const result = await db.execute(sql, params);
   if (!result.ok) throw new Error(`TinyCloud SQL execute failed: ${resultError(result)}`);
-  return result.data.changes;
+  return Number(result.data?.changes ?? 0);
 }
 
 function skillCredentialsScope(skillId: string): string {
@@ -1588,7 +1738,10 @@ function normalizePreferenceScope(scope?: string): string {
 function projectionStateFromRow(row: ProjectionRow): FeedProjectionState {
   const reasonCodes = JSON.parse(row.reason_codes_json) as string[];
   return {
-    artifactId: row.artifact_id,
+    feedItemId: row.feed_item_id,
+    target: row.target_kind === "post" && row.post_id
+      ? { kind: "post", artifactId: row.artifact_id, postId: row.post_id }
+      : { kind: "artifact_preview", artifactId: row.artifact_id },
     artifactType: row.artifact_type,
     packageId: row.package_id,
     sourceFingerprint: row.source_fingerprint,
@@ -1603,9 +1756,15 @@ function projectionStateFromRow(row: ProjectionRow): FeedProjectionState {
   };
 }
 
-function stripProjectionState(row: FeedProjectionState): FeedArtifactProjection {
-  return {
-    artifactId: row.artifactId,
+function stripProjectionState(row: FeedProjectionState, artifact?: FeedArtifact | null): FeedItemProjection {
+  const postId = row.target.kind === "post" ? row.target.postId : undefined;
+  const post = artifact && postId ? postsFromArtifact(artifact).find((candidate) => candidate.postId === postId) : undefined;
+  const projection: FeedItemProjection = {
+    feedItemId: row.feedItemId,
+    target: row.target,
+    ...(post?.title ? { postTitle: post.title } : {}),
+    ...(post?.body ? { postBody: post.body } : {}),
+    ...(post?.expansionTarget.sectionId ? { sectionRef: post.expansionTarget.sectionId } : {}),
     rankScore: row.rankScore,
     disposition: row.disposition,
     visibility: row.visibility,
@@ -1616,16 +1775,48 @@ function stripProjectionState(row: FeedProjectionState): FeedArtifactProjection 
     publishedAt: row.publishedAt,
     updatedAt: row.updatedAt,
   };
+  if (artifact) {
+    const joined = validateFeedItemProjectionJoin(projection, artifact);
+    if (!joined.ok) throw new FeedHostError("feed item projection join is invalid", 500, "invalid_projection_join", { errors: joined.errors });
+  }
+  return projection;
 }
 
 function projectionSqlRow(row: FeedProjectionState): SqlStatement {
+  const validated = validateFeedItemProjection(stripProjectionState(row));
+  if (!validated.ok) throw new FeedHostError("feed item projection is invalid", 500, "invalid_projection", { errors: validated.errors });
+  return {
+    sql: `INSERT OR REPLACE INTO feed_item_projection (
+      feed_item_id, target_kind, artifact_id, post_id,
+      rank_score, disposition, visibility, freshness_label, reason_codes_json,
+      package_id, source_fingerprint, published_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    params: [
+      row.feedItemId,
+      row.target.kind,
+      row.target.artifactId,
+      row.target.kind === "post" ? row.target.postId : null,
+      row.rankScore,
+      row.disposition,
+      row.visibility,
+      row.freshnessLabel,
+      JSON.stringify(row.reasonCodes),
+      row.packageId,
+      row.sourceFingerprint,
+      row.publishedAt,
+      row.updatedAt,
+    ],
+  };
+}
+
+function legacyProjectionSqlRow(row: FeedProjectionState): SqlStatement {
   return {
     sql: `INSERT OR REPLACE INTO feed_artifact_projection (
-      artifact_id, rank_score, disposition, visibility, freshness_label, reason_codes_json,
-      package_id, source_fingerprint, published_at, updated_at
+      artifact_id, rank_score, disposition, visibility, freshness_label,
+      reason_codes_json, package_id, source_fingerprint, published_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     params: [
-      row.artifactId,
+      row.target.artifactId,
       row.rankScore,
       row.disposition,
       row.visibility,
@@ -1674,6 +1865,38 @@ function dispositionForSignal(signal: FeedbackEvent["signal"]): FeedArtifactProj
       return "default";
     default:
       return null;
+  }
+}
+
+function interactionTargetFromRow(row: FeedbackDbRow): FeedInteractionTarget {
+  if (row.targetKind === "feed_item" && row.feedItemId) return { kind: "feed_item", feedItemId: row.feedItemId };
+  if (row.targetKind === "post" && row.artifactId && row.postId) {
+    return { kind: "post", artifactId: row.artifactId, postId: row.postId };
+  }
+  if (row.artifactId) return { kind: "artifact", artifactId: row.artifactId };
+  throw new FeedHostError("stored interaction target is invalid", 500, "invalid_interaction_target");
+}
+
+function projectionDispositionSql(target: FeedInteractionTarget): string {
+  switch (target.kind) {
+    case "artifact":
+      return `UPDATE feed_item_projection SET disposition = ?, updated_at = ? WHERE artifact_id = ?`;
+    case "post":
+      return `UPDATE feed_item_projection SET disposition = ?, updated_at = ? WHERE target_kind = 'post' AND artifact_id = ? AND post_id = ?`;
+    case "feed_item":
+      return `UPDATE feed_item_projection SET disposition = ?, updated_at = ? WHERE feed_item_id = ?`;
+  }
+}
+
+function projectionDispositionParams(
+  target: FeedInteractionTarget,
+  disposition: FeedArtifactProjection["disposition"],
+  updatedAt: string,
+): SqlValue[] {
+  switch (target.kind) {
+    case "artifact": return [disposition, updatedAt, target.artifactId];
+    case "post": return [disposition, updatedAt, target.artifactId, target.postId];
+    case "feed_item": return [disposition, updatedAt, target.feedItemId];
   }
 }
 

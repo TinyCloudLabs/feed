@@ -4,6 +4,12 @@ TinyFeed is the Feed v1 client app. It signs the reader in with OpenKey and
 talks to the separate Feed Host API for projections, artifact hydration,
 feedback, and control intents.
 
+Feed ranks and renders `FeedItemProjection` rows. A Feed item targets either a
+`FeedPost` inside a rich artifact or a legacy artifact preview; opening a post
+hydrates the shared artifact and can focus its referenced section. Feedback
+targets an artifact, post, or feed item explicitly, so two posts from one
+artifact can be shaped independently without losing the artifact link.
+
 The previous direct-SQL TinyFeed app is archived in `web/legacy-src` with its
 old docs in `README.legacy.md`.
 

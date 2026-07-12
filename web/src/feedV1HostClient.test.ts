@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { FeedV1HostClient, FeedV1HostError } from "./feedV1HostClient.ts";
 import type {
   ControlIntentEvent,
-  FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type { FeedTargetedInteractionEvent } from "../../shared/feed-item.ts";
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -43,9 +43,9 @@ describe("FeedV1HostClient", () => {
         return jsonResponse({ accepted: true, eventId: "event-1" });
       },
     });
-    const feedback: FeedbackEvent = {
+    const feedback: FeedTargetedInteractionEvent = {
       eventId: "event-1",
-      artifactId: "artifact-1",
+      target: { kind: "feed_item", feedItemId: "artifact-1::post-1" },
       actorId: "did:key:reader",
       readerNonce: "nonce-1",
       signal: "helpful",
