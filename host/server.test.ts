@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { TinyCloudNode } from "@tinycloud/node-sdk";
 import type {
   ControlIntentEvent,
   FeedArtifact,
@@ -38,11 +39,14 @@ import {
   type FeedHostStorage,
 } from "./storage.ts";
 import { startFeedHost, type FeedHostRuntime } from "./server.ts";
+import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../shared/feed-item.ts";
 
 process.env.FEED_HOST_LOG = "0";
 
 const ACTOR_ID = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
 const OTHER_ACTOR_ID = "did:pkh:eip155:1:0x0000000000000000000000000000000000000001";
+const INPUT_CHILD_CID = "bafkr4ie6h4l4tcmrkube2fehu5lloyo4ijh2lzvdfpywj4uj6tyaurbcau";
+const INPUT_PARENT_CID = "bafkr4ihl32taldpsemg4ew32pr5uq62hbriiylqkkem4s2etyrb54ou6pe";
 const MUTATING_ROUTES = ["/feedback", "/control-intents"] as const;
 // Stable host identity used for restart coverage. In production this comes
 // from FEED_HOST_PRIVATE_KEY: the host signs in and its did:pkh stays stable.
@@ -128,6 +132,10 @@ describe("Feed Host server", () => {
         "/api/server-info",
         "/api/delegations",
         "/api/delegations/status",
+        "/input-authorities",
+        "/input-authorities/{sourceId}",
+        "/input-authorities/{sourceId}/status",
+        "/input-authorities/{sourceId}/revoke",
         "/api/openapi.json",
         "/admin/state",
         "/admin/seed",
@@ -195,6 +203,114 @@ describe("Feed Host server", () => {
     expect(blockedFeed.status).toBe(403);
   });
 
+  test("attaches, inspects, revokes, and removes a redacted named input authority", async () => {
+    const data = new Map<string, unknown>();
+    const access = {
+      kv: {
+        get: async (key: string) => data.has(key)
+          ? { ok: true, data: { data: data.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+        put: async (key: string, value: unknown) => {
+          data.set(key, value);
+          return { ok: true, data: undefined };
+        },
+        delete: async (key: string) => {
+          data.delete(key);
+          return { ok: true, data: undefined };
+        },
+      },
+    } as unknown as ActivatedFeedDelegation["access"];
+    let inspections = 0;
+    let revocations = 0;
+    let nodeRevoked = false;
+    const hostNode = {
+      did: "did:key:zFeedHost",
+      getDelegationStatus: async (childCid: string) => ({
+        ok: true as const,
+        data: {
+          cid: childCid,
+          status: nodeRevoked ? "revoked" : "active",
+          exists: true,
+          active: !nodeRevoked,
+          revoked: nodeRevoked,
+          expired: false,
+        },
+      }),
+      revokeDelegation: async (childCid: string) => {
+        expect(childCid).toBe(INPUT_CHILD_CID);
+        revocations += 1;
+        nodeRevoked = true;
+        return { ok: true as const, data: undefined };
+      },
+    } as unknown as TinyCloudNode;
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      hostNode,
+      inputAuthorityExpectedHost: "https://node.tinycloud.xyz",
+      activateDelegation: async ({ serializedDelegation }) => ({
+        ...fakeActivatedDelegation(serializedDelegation),
+        access,
+      }),
+      inspectInputAuthority: async ({ expectedAudienceDID }) => {
+        inspections += 1;
+        return {
+          childCid: INPUT_CHILD_CID,
+          canonicalPortableDelegation: childTransport(),
+          actorId: ACTOR_ID,
+          audienceDID: expectedAudienceDID,
+          host: "https://node.tinycloud.xyz",
+          space: "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:applications",
+          path: "xyz.tinycloud.listen/conversations",
+          actions: ["tinycloud.sql/read"],
+          expiry: "2099-01-01T00:00:00.000Z",
+          parentCid: INPUT_PARENT_CID,
+          agentDID: expectedAudienceDID,
+        };
+      },
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+    const headers = { "x-feed-actor-id": ACTOR_ID };
+
+    const rejectedRaw = await postJson(`${runtime.url}/input-authorities`, {
+      sourceId: "raw",
+      displayName: "Raw",
+      portableDelegation: "child",
+      tc1Link: "tc1:must-not-leak",
+    }, headers);
+    expect(rejectedRaw.status).toBe(400);
+    expect(await rejectedRaw.text()).not.toContain("must-not-leak");
+    expect(inspections).toBe(0);
+
+    const attached = await postJson(`${runtime.url}/input-authorities`, {
+      sourceId: "team-listen",
+      displayName: "Team Listen",
+      portableDelegation: childTransport(),
+    }, headers);
+    expect(attached.status).toBe(201);
+    expect(await attached.json()).toMatchObject({
+      attached: true,
+      item: { sourceId: "team-listen", state: "active", hasPortableDelegation: true },
+    });
+    expect(JSON.stringify(await getJson(`${runtime.url}/input-authorities/team-listen`, headers))).not.toContain("child.jwt.signature");
+    const crossActor = await fetch(`${runtime.url}/input-authorities`, {
+      headers: { "x-feed-actor-id": OTHER_ACTOR_ID },
+    });
+    expect(crossActor.status).toBe(403);
+    expect(await getJson(`${runtime.url}/input-authorities/team-listen/status`, headers)).toMatchObject({
+      sourceId: "team-listen",
+      state: "active",
+    });
+    const revoked = await postJson(`${runtime.url}/input-authorities/team-listen/revoke`, {}, headers);
+    expect(await revoked.json()).toMatchObject({ revoked: true, item: { state: "revoked" } });
+    expect(revocations).toBe(1);
+    const removed = await fetch(`${runtime.url}/input-authorities/team-listen`, { method: "DELETE", headers });
+    expect(removed.status).toBe(204);
+    expect(await getJson<{ items: unknown[] }>(`${runtime.url}/input-authorities`, headers)).toEqual({ items: [] });
+  });
+
   test("rejects expired live delegations after their expiresAt passes", async () => {
     runtime = startFeedHost({
       port: 0,
@@ -249,8 +365,8 @@ describe("Feed Host server", () => {
         packageId: "follow-up",
         runId: "run-seed-002",
         packageDigest: "sha256:fixture-package-follow-up",
-        createdAt: "2026-06-29T11:59:00.000Z",
-        updatedAt: "2026-06-29T11:59:00.000Z",
+        createdAt: "2026-07-11T11:59:00.000Z",
+        updatedAt: "2026-07-11T11:59:00.000Z",
         sourceFingerprint: "sha256:fixture-source-follow-up",
         artifactFingerprint: "sha256:fixture-artifact-follow-up",
         dedupeKey: "feed-v1-fixture:follow-up",
@@ -263,24 +379,24 @@ describe("Feed Host server", () => {
         artifactId: SECOND_ARTIFACT_ID,
         packageId: "follow-up",
         sourceFingerprint: "sha256:fixture-source-follow-up",
-        publishedAt: "2026-06-29T11:59:00.000Z",
-        updatedAt: "2026-06-29T11:59:00.000Z",
-        rankScore: 0.58,
+        publishedAt: "2026-07-11T11:59:00.000Z",
+        updatedAt: "2026-07-11T11:59:00.000Z",
+        rankScore: 0,
         reasonCodes: ["fixture"],
       }),
       {
         runId: "run-seed-002",
         packageId: "follow-up",
         status: "published",
-        startedAt: "2026-06-29T11:59:00.000Z",
-        finishedAt: "2026-06-29T11:59:00.000Z",
+        startedAt: "2026-07-11T11:59:00.000Z",
+        finishedAt: "2026-07-11T11:59:00.000Z",
       },
     );
 
-    const before = await getJson<{ items: Array<{ artifactId: string }> }>(`${runtime.url}/feed?limit=10`, {
+    const before = await getJson<{ items: FeedItemProjection[] }>(`${runtime.url}/feed?limit=10`, {
       "x-feed-actor-id": ACTOR_ID,
     });
-    expect(before.items.map((item) => item.artifactId)[0]).toBe(SEEDED_ARTIFACT_ID);
+    expect(new Set(before.items.map((item) => item.target.artifactId))).toEqual(new Set([SEEDED_ARTIFACT_ID, SECOND_ARTIFACT_ID]));
 
     const currentPreferences = await getJson<{ profile: FeedPreferenceProfileRecord | null }>(`${runtime.url}/preferences`, {
       "x-feed-actor-id": ACTOR_ID,
@@ -293,7 +409,7 @@ describe("Feed Host server", () => {
         expectedVersion: 0,
         patch: {
           packagePriority: {
-            "follow-up": 4,
+            "follow-up": 10,
           },
           unexpected: "drop-me",
         },
@@ -303,7 +419,7 @@ describe("Feed Host server", () => {
     expect(updated.status).toBe(200);
     const updatedProfile = (await updated.json()) as { profile: FeedPreferenceProfileRecord };
     expect(updatedProfile.profile.version).toBe(1);
-    expect(updatedProfile.profile.value.packagePriority?.["follow-up"]).toBe(4);
+    expect(updatedProfile.profile.value.packagePriority?.["follow-up"]).toBe(10);
     expect("unexpected" in updatedProfile.profile.value).toBe(false);
 
     const invalidScope = await putJson(
@@ -323,10 +439,10 @@ describe("Feed Host server", () => {
       },
     });
 
-    const after = await getJson<{ items: Array<{ artifactId: string }> }>(`${runtime.url}/feed?limit=10`, {
+    const after = await getJson<{ items: FeedItemProjection[] }>(`${runtime.url}/feed?limit=10`, {
       "x-feed-actor-id": ACTOR_ID,
     });
-    expect(after.items.map((item) => item.artifactId)[0]).toBe(SECOND_ARTIFACT_ID);
+    expect(after.items.map((item) => item.target.artifactId)[0]).toBe(SECOND_ARTIFACT_ID);
 
     const conflict = await putJson(
       `${runtime.url}/preferences`,
@@ -412,6 +528,7 @@ describe("Feed Host server", () => {
       `${runtime.url}/feedback`,
       {
         eventId: "feedback-test-001",
+        feedItemId: `legacy:${SEEDED_ARTIFACT_ID}`,
         artifactId: SEEDED_ARTIFACT_ID,
         actorId: ACTOR_ID,
         readerNonce: "feedback-nonce-001",
@@ -427,8 +544,12 @@ describe("Feed Host server", () => {
       duplicate: false,
       status: "applied",
     });
+    const storedSaveEvent = (storage as unknown as { feedbackEvents: Array<FeedbackEvent & { feedItemId?: string }> }).feedbackEvents.find(
+      (event) => event.readerNonce === "feedback-nonce-001",
+    );
+    expect(storedSaveEvent).toMatchObject({ target: { kind: "artifact", artifactId: SEEDED_ARTIFACT_ID } });
 
-    const updatedFeed = await getJson<{ items: Array<{ artifactId: string; disposition: string }> }>(
+    const updatedFeed = await getJson<{ items: FeedItemProjection[] }>(
       `${runtime.url}/feed?limit=10`,
       { "x-feed-actor-id": ACTOR_ID },
     );
@@ -552,7 +673,7 @@ describe("Feed Host server", () => {
     expect(resumedResponse.ok).toBe(true);
     const resumedText = await resumedResponse.text();
     expect(resumedText).not.toContain(`id: ${cursorEventId}`);
-    expect(resumedText).toContain(`id: projection:${SECOND_ARTIFACT_ID}:`);
+    expect(resumedText).toContain(`id: projection:legacy:${SECOND_ARTIFACT_ID}:`);
   });
 
   test("dev publisher imports a Feed v1 artifact for the single active actor", async () => {
@@ -595,10 +716,10 @@ describe("Feed Host server", () => {
       },
     });
 
-    const feed = await getJson<{ items: Array<{ artifactId: string }> }>(`${runtime.url}/feed?limit=10`, {
+    const feed = await getJson<{ items: FeedItemProjection[] }>(`${runtime.url}/feed?limit=10`, {
       "x-feed-actor-id": ACTOR_ID,
     });
-    expect(feed.items.some((item) => item.artifactId === artifact.artifactId)).toBe(true);
+    expect(feed.items.some((item) => item.target.artifactId === artifact.artifactId)).toBe(true);
 
     const hydrated = await getJson<FeedArtifact>(`${runtime.url}/artifacts/${encodeURIComponent(artifact.artifactId)}`, {
       "x-feed-actor-id": ACTOR_ID,
@@ -881,11 +1002,11 @@ describe("Feed Host server", () => {
     runtime = startFeedHost(serverOptions());
     const restartedPolicy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
     expect(restartedPolicy.delegateDID).toBe(policy.delegateDID);
-    const feed = await getJson<{ items: Array<{ artifactId: string }> }>(`${runtime.url}/feed?limit=10`, {
+    const feed = await getJson<{ items: FeedItemProjection[] }>(`${runtime.url}/feed?limit=10`, {
       "x-feed-actor-id": ACTOR_ID,
     });
     expect(feed.items).toHaveLength(1);
-    expect(feed.items[0].artifactId).toBe(SEEDED_ARTIFACT_ID);
+    expect(feed.items[0].target.artifactId).toBe(SEEDED_ARTIFACT_ID);
   });
 
   test("accepts one multi-resource delegation covering the full policy in a single submission", async () => {
@@ -1373,14 +1494,14 @@ class FakeFeedHostStorage {
       ),
       now: new Date(FAKE_NOW),
     });
-    for (const artifactId of plan.deletions) this.projections.delete(artifactId);
-    for (const row of plan.upserts) this.projections.set(row.artifactId, stripProjection(row));
+    for (const feedItemId of plan.deletions) this.projections.delete(feedItemId.replace(/^legacy:/, ""));
+    for (const row of plan.upserts) this.projections.set(row.target.artifactId, stripProjection(row));
     return plan;
   }
 
   async recordFeedback(
     _actor: FeedHostActorStorage,
-    event: FeedbackEvent,
+    event: FeedTargetedInteractionEvent,
   ): Promise<{ eventId: string; duplicate: boolean; status: "applied" | "noop" }> {
     const existing = this.feedbackEvents.find(
       (row) => row.actorId === event.actorId && row.readerNonce === event.readerNonce,
@@ -1388,9 +1509,12 @@ class FakeFeedHostStorage {
     if (existing) return { eventId: existing.eventId, duplicate: true, status: "noop" };
 
     this.feedbackEvents.push(event);
-    const projection = this.projections.get(event.artifactId);
+    const artifactId = event.target.kind === "feed_item"
+      ? event.target.feedItemId.replace(/^legacy:/, "").split("::")[0]!
+      : event.target.artifactId;
+    const projection = this.projections.get(artifactId);
     if (projection) {
-      this.projections.set(event.artifactId, {
+      this.projections.set(artifactId, {
         ...projection,
         disposition: feedbackDisposition(event.signal, projection.disposition),
       });
@@ -2113,9 +2237,10 @@ function feedbackDisposition(
   }
 }
 
-function stripProjection(row: FeedProjectionState): FeedArtifactProjection {
+function stripProjection(row: FeedProjectionState): FeedItemProjection {
   return {
-    artifactId: row.artifactId,
+    feedItemId: row.feedItemId,
+    target: row.target,
     rankScore: row.rankScore,
     disposition: row.disposition,
     visibility: row.visibility,
@@ -2128,9 +2253,12 @@ function stripProjection(row: FeedProjectionState): FeedArtifactProjection {
   };
 }
 
-function projectionState(row: FeedArtifactProjection, docMissing: boolean): FeedProjectionState {
+function projectionState(row: FeedArtifactProjection | FeedItemProjection, docMissing: boolean): FeedProjectionState {
+  if ("target" in row) return { ...row, artifactType: "insight_card", docMissing };
   return {
     ...row,
+    feedItemId: `legacy:${row.artifactId}`,
+    target: { kind: "artifact_preview", artifactId: row.artifactId },
     docMissing,
   };
 }
@@ -2267,4 +2395,31 @@ function emptyMigrationSummary(): FeedV1MigrationSummary {
     skippedArtifacts: 0,
     skippedInteractions: 0,
   };
+}
+
+function childTransport(): string {
+  return JSON.stringify({
+    cid: INPUT_CHILD_CID,
+    delegateDID: "did:key:zFeedHost",
+    delegatorDID: "did:key:zShare",
+    spaceId: "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:applications",
+    path: "xyz.tinycloud.listen/conversations",
+    actions: ["tinycloud.sql/read"],
+    expiry: "2099-01-01T00:00:00.000Z",
+    isRevoked: false,
+    allowSubDelegation: false,
+    parentCid: INPUT_PARENT_CID,
+    createdAt: "2026-07-19T00:00:00.000Z",
+    delegationHeader: { Authorization: "child.jwt.signature" },
+    ownerAddress: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
+    chainId: 1,
+    host: "https://node.tinycloud.xyz",
+    resources: [{
+      service: "tinycloud.sql",
+      space: "tinycloud:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266:applications",
+      path: "xyz.tinycloud.listen/conversations",
+      actions: ["tinycloud.sql/read"],
+    }],
+    disableSubDelegation: true,
+  });
 }

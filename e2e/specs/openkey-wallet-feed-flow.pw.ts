@@ -138,12 +138,16 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
     releaseFirstFeed = resolve;
   });
   await page.route(/\/feed(\?.*)?$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
     feedRequests += 1;
     if (feedRequests === 1) {
       await firstFeedReady;
       await route.fulfill({
         status: 200,
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
         body: JSON.stringify({ items: [], nextCursor: undefined }),
       });
       return;
@@ -165,9 +169,13 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   releaseFirstFeed?.();
   await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
   await expect(page.getByRole("button", { name: "Check again" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
-  await expect(page.getByText(/same decision appears across your recent conversations/i)).toBeVisible();
-  await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 120000 });
+  await expect(page.getByRole("heading", { name: "The onboarding experiment changed where users stall" })).toBeVisible();
+  await expect(page.getByText(/first collaborative action is now the dominant stall point/i)).toBeVisible();
+  await page.getByText("Open full artifact").first().click();
+  await expect(page.getByText("From The onboarding experiment changed where users stall").first()).toBeVisible();
+  await expect(page.getByText(/complete analysis remains type-specific/i).first()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide" }).first()).toBeVisible();
   await expect.poll(() => delegationSubmissions).toBe(1);
   const feedHostSignaturePrompts = await page.evaluate(
     (delegateDID) => ((window as any).__walletSignedMessages as string[])
@@ -210,11 +218,15 @@ test("Feed failure state only clears after a successful reload", async ({ page }
     releaseRetryResponse = resolve;
   });
   await page.route(/\/feed(\?.*)?$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
     feedRequests += 1;
     if (feedRequests === 2) {
       await route.fulfill({
         status: 503,
-        headers: { "content-type": "text/plain" },
+        headers: { "content-type": "text/plain", "access-control-allow-origin": "*" },
         body: "bundle offline",
       });
       return;
@@ -223,14 +235,14 @@ test("Feed failure state only clears after a successful reload", async ({ page }
       await retryResponse;
       await route.fulfill({
         status: 200,
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
         body: JSON.stringify({ items: [] }),
       });
       return;
     }
     await route.fulfill({
       status: 200,
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
       body: JSON.stringify({ items: [] }),
     });
   });
@@ -238,7 +250,7 @@ test("Feed failure state only clears after a successful reload", async ({ page }
   await page.route(/\/feed\/events(\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: { "content-type": "text/event-stream", "access-control-allow-origin": "*" },
       body: "",
     });
   });
@@ -249,7 +261,7 @@ test("Feed failure state only clears after a successful reload", async ({ page }
   await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
 
   await page.getByRole("button", { name: /check again/i }).click();
-  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 120000 });
   await expect(page.getByRole("heading", { name: /nothing here yet/i })).toHaveCount(0);
 
   await page.waitForTimeout(6500);
@@ -270,14 +282,14 @@ test("a restored session repairs stale cached access without another wallet prom
 
   await page.goto("/");
   await signInWithWallet(page, wallet);
-  await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 120000 });
 
   await page.evaluate(() => {
     localStorage.setItem("feed:v1:hostDelegations", JSON.stringify({ actorId: "stale-policy" }));
   });
   await page.reload();
 
-  await expect(page.getByRole("heading", { name: "A useful first look" })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 60000 });
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (

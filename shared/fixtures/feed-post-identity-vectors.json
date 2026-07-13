@@ -1,0 +1,86 @@
+{
+  "contractVersion": "feed.post.v1",
+  "vectors": [
+    {
+      "name": "local identifiers and evidence order do not affect identity",
+      "input": {
+        "kind": "acme.risk_signal",
+        "title": "  Risk   moved ",
+        "body": "One\n claim",
+        "evidence": [
+          {
+            "kind": "located_source",
+            "evidenceId": "b",
+            "sourceRefId": "src-1",
+            "loc": "L1"
+          },
+          {
+            "kind": "parent_artifact",
+            "evidenceId": "a",
+            "artifactId": "artifact-0"
+          }
+        ]
+      },
+      "context": {
+        "sourceRefs": [
+          {
+            "sourceRefId": "src-1",
+            "sourceKind": "listen_conversation",
+            "sourceId": "listen-1",
+            "observedPath": "sql_transcript_text",
+            "observedHash": "sha256:source",
+            "observedAt": "2026-06-28T12:00:00.000Z",
+            "quoteLineRefs": ["L1"]
+          }
+        ],
+        "parentArtifactRefs": [
+          {
+            "artifactId": "artifact-0",
+            "observedHash": "sha256:parent"
+          }
+        ]
+      },
+      "equivalentInput": {
+        "kind": "acme.risk_signal",
+        "title": "Risk moved",
+        "body": "One claim",
+        "evidence": [
+          {
+            "kind": "parent_artifact",
+            "evidenceId": "renamed-a",
+            "artifactId": "renamed-artifact"
+          },
+          {
+            "kind": "located_source",
+            "evidenceId": "renamed-b",
+            "sourceRefId": "renamed-source",
+            "loc": "L1"
+          }
+        ]
+      },
+      "equivalentContext": {
+        "sourceRefs": [
+          {
+            "sourceRefId": "renamed-source",
+            "sourceKind": "listen_conversation",
+            "sourceId": "renamed-listen",
+            "observedPath": "sql_transcript_text",
+            "observedHash": "sha256:source",
+            "observedAt": "2026-06-28T12:00:00.000Z",
+            "quoteLineRefs": ["L1"]
+          }
+        ],
+        "parentArtifactRefs": [
+          {
+            "artifactId": "renamed-artifact",
+            "observedHash": "sha256:parent"
+          }
+        ]
+      },
+      "expected": {
+        "postId": "post:9088faedcc601db95f7945c289770623d36a25d7b1c5fbddf8b2723f3603665a",
+        "postFingerprint": "sha256:9088faedcc601db95f7945c289770623d36a25d7b1c5fbddf8b2723f3603665a"
+      }
+    }
+  ]
+}

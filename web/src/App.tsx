@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   ControlIntentEvent,
-  FeedArtifactProjection,
   FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import { artifactExpansionSection, type FeedItemProjection } from "../../shared/feed-item.ts";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
+  attachReceivedInputAuthority,
   restoreSession,
   signIn,
   signOut,
@@ -18,9 +19,10 @@ import type { FeedHostDelegationPolicy } from "./delegation.ts";
 import {
   FeedV1HostClient,
   FeedV1HostError,
+  type FeedHostInputAuthority,
   type FeedHostSkillState,
 } from "./feedV1HostClient.ts";
-import { bodyPreview, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
+import { bodyPreview, hydrateFeedItems, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
@@ -108,17 +110,7 @@ export function App() {
     setLoadState("loading");
     try {
       const page = await client.listFeed({ limit: 40 });
-      const hydrated = await Promise.all(
-        page.items.map(async (projection): Promise<FeedItem> => {
-          try {
-            const artifact = await client.getArtifact(projection.artifactId);
-            return { projection, artifact };
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            return { projection, artifact: null, error: message };
-          }
-        }),
-      );
+      const hydrated = await hydrateFeedItems(page.items, (artifactId) => client.getArtifact(artifactId));
       setItems(sortedFeed(hydrated));
       setLoadError(null);
       setLoadState("ready");
@@ -248,14 +240,14 @@ export function App() {
     }
   };
 
-  const sendFeedback = async (projection: FeedArtifactProjection, signal: FeedbackEvent["signal"]) => {
+  const sendFeedback = async (projection: FeedItemProjection, signal: FeedbackEvent["signal"]) => {
     if (!session || feedState !== "running") return;
-    const actionId = `${projection.artifactId}:${signal}`;
+    const actionId = `${projection.feedItemId}:${signal}`;
     setBusyAction(actionId);
     try {
       await client.postFeedback({
         eventId: crypto.randomUUID(),
-        artifactId: projection.artifactId,
+        target: { kind: "feed_item", feedItemId: projection.feedItemId },
         actorId: session.readerDid,
         readerNonce: newNonce(),
         signal,
@@ -332,7 +324,7 @@ export function App() {
       </header>
 
       {settingsOpen && (
-        <SkillCredentialsPanel client={client} onDisconnect={() => void disconnect()} />
+        <SkillCredentialsPanel client={client} policy={policy!} onDisconnect={() => void disconnect()} />
       )}
 
       <main className="content-shell">
@@ -354,7 +346,7 @@ export function App() {
 
         <div className="feed-list">
           {items.map((item) => (
-            <FeedCard key={item.projection.artifactId} item={item} busyAction={busyAction} onFeedback={sendFeedback} />
+            <FeedCard key={item.projection.feedItemId} item={item} busyAction={busyAction} onFeedback={sendFeedback} />
           ))}
         </div>
       </main>
@@ -490,18 +482,52 @@ function FeedCard({
 }: {
   item: FeedItem;
   busyAction: string | null;
-  onFeedback: (projection: FeedArtifactProjection, signal: FeedbackEvent["signal"]) => Promise<void>;
+  onFeedback: (projection: FeedItemProjection, signal: FeedbackEvent["signal"]) => Promise<void>;
 }) {
   const artifact = item.artifact;
+  const isPost = Boolean(item.projection.postBody);
+  const expansionSection = artifact ? artifactExpansionSection(artifact, item.projection.sectionRef) : undefined;
+  const expansionAnchorId = expansionSection
+    ? `artifact-section-${encodeURIComponent(item.projection.feedItemId)}-${encodeURIComponent(expansionSection.sectionId)}`
+    : undefined;
   return (
     <article className={item.projection.disposition === "hidden" ? "feed-card hidden-card" : "feed-card"}>
       <div className="card-meta">
         <span>{artifact?.artifactType ?? "artifact"}</span>
         <span>{projectionLabel(item.projection)}</span>
       </div>
-      <h2>{artifact?.title ?? item.projection.artifactId}</h2>
-      {artifact?.summary && <p className="summary">{artifact.summary}</p>}
-      <pre>{bodyPreview(artifact)}</pre>
+      <h2>{item.projection.postTitle ?? artifact?.title ?? item.projection.target.artifactId}</h2>
+      {isPost ? (
+        <>
+          <p className="post-body">{item.projection.postBody}</p>
+          <details
+            className="artifact-expansion"
+            onToggle={(event) => {
+              if (event.currentTarget.open && expansionAnchorId) {
+                requestAnimationFrame(() => document.getElementById(expansionAnchorId)?.focus());
+              }
+            }}
+          >
+            <summary>Open full artifact</summary>
+            <div className="artifact-content">
+              <p className="artifact-label">From {artifact?.title ?? item.projection.target.artifactId}</p>
+              {artifact?.summary && <p className="summary">{artifact.summary}</p>}
+              {expansionSection && (
+                <section id={expansionAnchorId} className="artifact-section" aria-label="Relevant section" tabIndex={-1}>
+                  <strong>{expansionSection.title ?? "Related section"}</strong>
+                  <p>{expansionSection.text}</p>
+                </section>
+              )}
+              <pre>{bodyPreview(artifact)}</pre>
+            </div>
+          </details>
+        </>
+      ) : (
+        <>
+          {artifact?.summary && <p className="summary">{artifact.summary}</p>}
+          <pre>{bodyPreview(artifact)}</pre>
+        </>
+      )}
       {item.error && <p className="error">Hydration failed: {item.error}</p>}
       <dl className="provenance">
         <div>
@@ -521,7 +547,7 @@ function FeedCard({
         {(["save", "hide", "helpful", "unhelpful", "show_fewer"] as const).map((signal) => (
           <button
             key={signal}
-            disabled={busyAction === `${item.projection.artifactId}:${signal}`}
+            disabled={busyAction === `${item.projection.feedItemId}:${signal}`}
             onClick={() => void onFeedback(item.projection, signal)}
           >
             {feedbackLabel(signal)}
@@ -579,23 +605,40 @@ function isDelegationLostError(error: unknown): boolean {
 
 function SkillCredentialsPanel({
   client,
+  policy,
   onDisconnect,
 }: {
   client: FeedV1HostClient;
+  policy: FeedHostDelegationPolicy;
   onDisconnect: () => void;
 }) {
   const [skills, setSkills] = useState<FeedHostSkillState[]>([]);
+  const [inputAuthorities, setInputAuthorities] = useState<FeedHostInputAuthority[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [inputAuthorityError, setInputAuthorityError] = useState<string | null>(null);
   const [busySkillId, setBusySkillId] = useState<string | null>(null);
+  const [busySourceId, setBusySourceId] = useState<string | null>(null);
   const [inputs, setInputs] = useState<Record<string, { providerId: string; secretRef: string }>>({});
   const [newSkill, setNewSkill] = useState({ skillId: "", providerId: "", secretRef: "" });
+  const [newSource, setNewSource] = useState({ sourceId: "", displayName: "", tc1Link: "" });
 
   const reload = useCallback(async () => {
     setLoadState("loading");
     try {
-      const page = await client.listSkills({ limit: 50 });
-      setSkills(page.items);
+      const [skillsPage, authorityPage] = await Promise.allSettled([
+        client.listSkills({ limit: 50 }),
+        client.listInputAuthorities(),
+      ]);
+      if (skillsPage.status === "rejected") throw skillsPage.reason;
+      setSkills(skillsPage.value.items);
+      if (authorityPage.status === "fulfilled") {
+        setInputAuthorities(authorityPage.value.items);
+        setInputAuthorityError(null);
+      } else {
+        setInputAuthorities([]);
+        setInputAuthorityError(formatHostError(authorityPage.reason));
+      }
       setLoadError(null);
       setLoadState("ready");
     } catch (error) {
@@ -650,6 +693,92 @@ function SkillCredentialsPanel({
       </ul>
       {loadState === "loading" && <p>Loading skill credential settings.</p>}
       {loadError && <p className="error">{loadError}</p>}
+      <div className="settings-subsection">
+        <h3>Named transcript sources</h3>
+        <p>
+          Additional sources are attached through TinyCloud’s browser share flow. Raw share links and private keys
+          stay in the browser; Feed Host receives only a restricted child delegation.
+        </p>
+        {loadState === "ready" && inputAuthorities.length === 0 && (
+          <p>No additional transcript sources attached. Your ordinary Feed access is unchanged.</p>
+        )}
+        {inputAuthorityError && <p className="error">Named source status is unavailable: {inputAuthorityError}</p>}
+        <form
+          className="skill-row"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const sourceId = newSource.sourceId.trim();
+            const displayName = newSource.displayName.trim();
+            const tc1Link = newSource.tc1Link.trim();
+            if (!sourceId || !displayName || !tc1Link) return;
+            setBusySourceId(sourceId);
+            void attachReceivedInputAuthority({ client, policy, sourceId, displayName, tc1Link })
+              .then(() => {
+                setNewSource({ sourceId: "", displayName: "", tc1Link: "" });
+                return reload();
+              })
+              .catch((error) => setLoadError(formatHostError(error)))
+              .finally(() => setBusySourceId(null));
+          }}
+        >
+          <div className="skill-summary">
+            <strong>Attach a transcript source</strong>
+            <span>The received-share link is attenuated locally and is never sent to Feed Host.</span>
+          </div>
+          <div className="skill-actions">
+            <label>
+              Source ID
+              <input value={newSource.sourceId} onChange={(event) => setNewSource((state) => ({ ...state, sourceId: event.target.value }))} />
+            </label>
+            <label>
+              Display name
+              <input value={newSource.displayName} onChange={(event) => setNewSource((state) => ({ ...state, displayName: event.target.value }))} />
+            </label>
+            <label>
+              TinyCloud share link
+              <input type="password" value={newSource.tc1Link} onChange={(event) => setNewSource((state) => ({ ...state, tc1Link: event.target.value }))} />
+            </label>
+            <button type="submit" disabled={busySourceId !== null || !newSource.tc1Link.trim()}>Attach source</button>
+          </div>
+        </form>
+        <ul className="skill-list">
+          {inputAuthorities.map((authority) => (
+            <li key={authority.sourceId} className="skill-row">
+              <div className="skill-summary">
+                <strong>{authority.displayName}</strong>
+                <span>{authority.state} · {authority.path}</span>
+                <span>Expires {new Date(authority.expiry).toLocaleString()}</span>
+              </div>
+              <div className="skill-actions">
+                <button
+                  disabled={busySourceId === authority.sourceId || authority.state === "revoked"}
+                  onClick={() => {
+                    setBusySourceId(authority.sourceId);
+                    void client.revokeInputAuthority(authority.sourceId)
+                      .then(reload)
+                      .catch((error) => setLoadError(formatHostError(error)))
+                      .finally(() => setBusySourceId(null));
+                  }}
+                >
+                  Revoke
+                </button>
+                <button
+                  disabled={busySourceId === authority.sourceId}
+                  onClick={() => {
+                    setBusySourceId(authority.sourceId);
+                    void client.removeInputAuthority(authority.sourceId)
+                      .then(reload)
+                      .catch((error) => setLoadError(formatHostError(error)))
+                      .finally(() => setBusySourceId(null));
+                  }}
+                >
+                  Remove
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
       {loadState === "ready" && skills.length === 0 && (
         <p>No skill credentials attached yet. Attach one below by entering a provider and reference name.</p>
       )}

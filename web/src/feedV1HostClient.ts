@@ -2,17 +2,17 @@ import type {
   ControlIntentEvent,
   CredentialMode,
   FeedArtifact,
-  FeedArtifactProjection,
-  FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../../shared/feed-item.ts";
 import type {
   FeedHostDelegationPolicy,
   FeedHostDelegationReceipt,
   FeedHostDelegationSubmission,
 } from "./delegation.ts";
+import type { ChildInputAuthoritySubmission } from "./inputAuthority.ts";
 
 export type FeedV1Page = {
-  items: FeedArtifactProjection[];
+  items: FeedItemProjection[];
   nextCursor?: string;
 };
 
@@ -48,6 +48,25 @@ export type FeedHostSkillState = {
 export type FeedHostSkillsPage = {
   items: FeedHostSkillState[];
   nextCursor?: string;
+};
+
+export type FeedHostInputAuthority = {
+  sourceId: string;
+  displayName: string;
+  actorId: string;
+  host: string;
+  space: string;
+  path: string;
+  actions: string[];
+  expiry: string;
+  parentCid?: string;
+  parentLineage?: string[];
+  agentDID: string;
+  attachedAt: string;
+  revokedAt?: string;
+  unavailableAt?: string;
+  hasPortableDelegation: true;
+  state: "active" | "expired" | "revoked" | "unavailable";
 };
 
 export type FeedHostSkillCredentialsPatch = {
@@ -116,6 +135,33 @@ export class FeedV1HostClient {
     await this.request<void>("/api/delegations", { method: "DELETE" });
   }
 
+  async listInputAuthorities(): Promise<{ items: FeedHostInputAuthority[] }> {
+    return this.request<{ items: FeedHostInputAuthority[] }>("/input-authorities");
+  }
+
+  async attachInputAuthority(submission: ChildInputAuthoritySubmission): Promise<{ attached: true; item: FeedHostInputAuthority }> {
+    return this.request<{ attached: true; item: FeedHostInputAuthority }>("/input-authorities", {
+      method: "POST",
+      body: JSON.stringify(submission),
+    });
+  }
+
+  async inspectInputAuthority(sourceId: string): Promise<FeedHostInputAuthority> {
+    return this.request<FeedHostInputAuthority>(`/input-authorities/${encodeURIComponent(sourceId)}`);
+  }
+
+  async inputAuthorityStatus(sourceId: string): Promise<Pick<FeedHostInputAuthority, "sourceId" | "state" | "expiry" | "revokedAt">> {
+    return this.request(`/input-authorities/${encodeURIComponent(sourceId)}/status`);
+  }
+
+  async revokeInputAuthority(sourceId: string): Promise<{ revoked: true; item: FeedHostInputAuthority }> {
+    return this.request(`/input-authorities/${encodeURIComponent(sourceId)}/revoke`, { method: "POST" });
+  }
+
+  async removeInputAuthority(sourceId: string): Promise<void> {
+    await this.request<void>(`/input-authorities/${encodeURIComponent(sourceId)}`, { method: "DELETE" });
+  }
+
   async listFeed(input: { limit?: number; cursor?: string } = {}): Promise<FeedV1Page> {
     const params = new URLSearchParams();
     if (input.limit !== undefined) params.set("limit", String(input.limit));
@@ -151,7 +197,7 @@ export class FeedV1HostClient {
     );
   }
 
-  async postFeedback(event: FeedbackEvent): Promise<{ accepted: true; eventId: string }> {
+  async postFeedback(event: FeedTargetedInteractionEvent): Promise<{ accepted: true; eventId: string }> {
     return this.request<{ accepted: true; eventId: string }>("/feedback", {
       method: "POST",
       body: JSON.stringify(event),

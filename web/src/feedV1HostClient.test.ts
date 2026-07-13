@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { FeedV1HostClient, FeedV1HostError } from "./feedV1HostClient.ts";
 import type {
   ControlIntentEvent,
-  FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
+import type { FeedTargetedInteractionEvent } from "../../shared/feed-item.ts";
 
 function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -43,9 +43,9 @@ describe("FeedV1HostClient", () => {
         return jsonResponse({ accepted: true, eventId: "event-1" });
       },
     });
-    const feedback: FeedbackEvent = {
+    const feedback: FeedTargetedInteractionEvent = {
       eventId: "event-1",
-      artifactId: "artifact-1",
+      target: { kind: "feed_item", feedItemId: "artifact-1::post-1" },
       actorId: "did:key:reader",
       readerNonce: "nonce-1",
       signal: "helpful",
@@ -192,6 +192,38 @@ describe("FeedV1HostClient", () => {
       providerId: "openai",
       secretRef: PLANTED,
     });
+  });
+
+  test("manages named input authorities without sending a raw share", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const client = new FeedV1HostClient({
+      baseUrl: "https://feed.example.test",
+      actorId: "did:pkh:reader",
+      fetchImpl: async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        return jsonResponse({ items: [], attached: true, revoked: true, item: { sourceId: "team", state: "active" } });
+      },
+    });
+    await client.listInputAuthorities();
+    await client.attachInputAuthority({ sourceId: "team", displayName: "Team", portableDelegation: "child-only" });
+    await client.inspectInputAuthority("team");
+    await client.inputAuthorityStatus("team");
+    await client.revokeInputAuthority("team");
+    await client.removeInputAuthority("team");
+
+    expect(JSON.stringify(calls)).not.toContain("tc1:");
+    expect(calls.map(({ url, method }) => [url, method])).toEqual([
+      ["https://feed.example.test/input-authorities", "GET"],
+      ["https://feed.example.test/input-authorities", "POST"],
+      ["https://feed.example.test/input-authorities/team", "GET"],
+      ["https://feed.example.test/input-authorities/team/status", "GET"],
+      ["https://feed.example.test/input-authorities/team/revoke", "POST"],
+      ["https://feed.example.test/input-authorities/team", "DELETE"],
+    ]);
   });
 
   test("surfaces non-2xx host responses", async () => {

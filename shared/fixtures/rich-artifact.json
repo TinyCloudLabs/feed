@@ -1,0 +1,117 @@
+{
+  "schemaVersion": "feed.artifact.v1",
+  "artifactId": "artifact-weekly-product-brief",
+  "artifactType": "weekly_product_brief",
+  "renderShape": "longform",
+  "title": "The onboarding experiment changed where users stall",
+  "summary": "A rich brief with two independently rankable Feed posts.",
+  "body": {
+    "markdown": "# Weekly product brief\n\nThe complete analysis remains type-specific and expands from either post."
+  },
+  "sourceRefs": [
+    {
+      "sourceRefId": "src-product-review",
+      "sourceKind": "listen_conversation",
+      "sourceId": "listen-product-review",
+      "observedPath": "sql_transcript_text",
+      "observedHash": "sha256:product-review",
+      "observedAt": "2026-07-10T15:00:00.000Z",
+      "quoteLineRefs": ["L42-L47", "L88-L91"]
+    }
+  ],
+  "feedSurface": {
+    "mode": "posts"
+  },
+  "derivedAccess": {
+    "releasePolicy": "private",
+    "lineage": [
+      {
+        "sourceRefId": "src-product-review",
+        "lineageId": null,
+        "releasePolicy": "private"
+      }
+    ],
+    "parentArtifacts": [],
+    "audienceDids": []
+  },
+  "posts": [
+    {
+      "postId": "post:70764899762c269b68aa3bd16a11278ef9067dfad19c2a207dc730bfabc01521",
+      "postFingerprint": "sha256:70764899762c269b68aa3bd16a11278ef9067dfad19c2a207dc730bfabc01521",
+      "kind": "insight",
+      "title": "Activation moved; the bottleneck did too",
+      "body": "More people finish setup, but the first collaborative action is now the dominant stall point.",
+      "evidence": [
+        {
+          "kind": "verified_quote",
+          "evidenceId": "activation-quote",
+          "sourceRefId": "src-product-review",
+          "quote": "Setup completion is up, and now most of the drop-off is before the first invite.",
+          "loc": "L42-L47",
+          "verification": {
+            "method": "worker_source_quote_match",
+            "sourceObservedHash": "sha256:product-review"
+          }
+        }
+      ],
+      "expansionTarget": {
+        "artifactId": "artifact-weekly-product-brief"
+      }
+    },
+    {
+      "postId": "post:9803619e0e5643f75f115033ee0937be748573e5da4f545dbe7dea51b51489bb",
+      "postFingerprint": "sha256:9803619e0e5643f75f115033ee0937be748573e5da4f545dbe7dea51b51489bb",
+      "kind": "recommendation",
+      "body": "Test an invite preview inside setup before adding another onboarding step.",
+      "evidence": [
+        {
+          "kind": "located_source",
+          "evidenceId": "invite-observation",
+          "sourceRefId": "src-product-review",
+          "excerpt": "People said they did not know what their teammate would see.",
+          "loc": "L88-L91"
+        },
+        {
+          "kind": "analytic_inference",
+          "evidenceId": "invite-recommendation",
+          "rationale": "A preview addresses the observed uncertainty without lengthening onboarding.",
+          "supportedBy": ["invite-observation"]
+        }
+      ],
+      "expansionTarget": {
+        "artifactId": "artifact-weekly-product-brief"
+      }
+    }
+  ],
+  "producedBy": {
+    "packageId": "weekly-product-brief",
+    "packageVersion": "0.1.0",
+    "packageDigest": "sha256:package",
+    "runId": "run-weekly-product-brief",
+    "runtimeClass": "feed_hosted",
+    "providerClass": "first_party",
+    "credentialOwner": "feed_hosted",
+    "egressClass": "model_provider",
+    "disclosure": {
+      "userCopy": "Reads authorized meeting evidence and produces a private product brief.",
+      "credentialOwner": "feed_hosted",
+      "providerClass": "first_party",
+      "egressClass": "model_provider"
+    }
+  },
+  "freshness": {
+    "label": "fresh",
+    "asOf": "2026-07-10T15:00:00.000Z"
+  },
+  "idempotency": {
+    "sourceFingerprint": "sha256:source",
+    "artifactFingerprint": "sha256:artifact",
+    "dedupeKey": "sha256:dedupe"
+  },
+  "storage": {
+    "docKey": "runs/run-weekly-product-brief/brief.json",
+    "mediaKeys": ["media/brief-chart.png"]
+  },
+  "createdAt": "2026-07-10T15:05:00.000Z",
+  "updatedAt": "2026-07-10T15:05:00.000Z"
+}

@@ -5,6 +5,11 @@ import type {
   FeedbackEvent,
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import type { FeedControlIntentInput, FeedControlIntentKind, FeedGenerationRequestRecord } from "./logic.ts";
+import {
+  validateFeedTargetedInteractionEvent,
+  type FeedInteractionTarget,
+  type FeedTargetedInteractionEvent,
+} from "../shared/feed-item.ts";
 import { validateFeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { artifactIndexRow } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import {
@@ -25,6 +30,7 @@ import {
   FEED_HOST_FEED_SETTINGS_PREFIX,
   hasCompleteFeedHostDelegation,
   normalizeActorId,
+  validateInputAuthorityDelegation,
   type AcceptedFeedDelegation,
   type ActivatedFeedDelegation,
   type FeedHostDelegationPolicy,
@@ -35,6 +41,12 @@ import {
 } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
 import { levelForStatus, logEvent } from "./log.ts";
+import {
+  InputAuthorityRegistry,
+  type InputAuthorityInspector,
+  type InputAuthorityRevoker,
+  type InputAuthorityTruthCheck,
+} from "./input-authority.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
   FeedHostError,
@@ -62,6 +74,10 @@ export type FeedHostServerOptions = {
     serializedDelegation: string;
     expectedDelegateDID: string;
   }) => Promise<ActivatedFeedDelegation>;
+  inspectInputAuthority?: InputAuthorityInspector;
+  checkInputAuthority?: InputAuthorityTruthCheck;
+  revokeInputAuthority?: InputAuthorityRevoker;
+  inputAuthorityExpectedHost?: string;
 };
 
 export type FeedHostRuntime = {
@@ -88,6 +104,11 @@ type FeedHostContext = {
   seedOnStart: boolean;
   delegationStore: FeedHostDelegationStore | null;
   enableDevPublisher: boolean;
+  inputAuthorities: InputAuthorityRegistry;
+  inspectInputAuthority: InputAuthorityInspector;
+  checkInputAuthority: InputAuthorityTruthCheck;
+  revokeInputAuthority: InputAuthorityRevoker;
+  inputAuthorityExpectedHost: string;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -118,6 +139,37 @@ const SSE_HEADERS = {
   "x-accel-buffering": "no",
 };
 
+type InputAuthorityVerificationNode = Pick<TinyCloudNode, "useDelegation"> & {
+  computeDelegationCid?: (authorization: string) => string;
+  getDelegationStatus?: (cid: string) => Promise<{
+    ok: boolean;
+    data?: { cid: string; status: string; active: boolean };
+  }>;
+};
+
+export function createInputAuthorityInspector(hostNode: InputAuthorityVerificationNode): InputAuthorityInspector {
+  return async (input) => {
+    if (!hostNode.computeDelegationCid || !hostNode.getDelegationStatus) {
+      throw new FeedHostError("TinyCloud input-authority verification is unavailable", 503, "input_authority_unavailable");
+    }
+    const inspected = validateInputAuthorityDelegation({
+      serializedDelegation: input.portableDelegation,
+      expectedDelegateDID: input.expectedAudienceDID,
+      expectedHost: input.expectedHost,
+      computeDelegationCid: (authorization) => hostNode.computeDelegationCid!(authorization),
+    });
+    // Activate the recomputed, identity-bound token so the node can sign the
+    // target-status request. No caller-supplied activation metadata is trusted.
+    await hostNode.useDelegation(inspected.portableDelegation);
+    const status = await hostNode.getDelegationStatus(inspected.childCid);
+    if (!status.ok || status.data?.cid !== inspected.childCid || status.data.status !== "active" || !status.data.active) {
+      throw new FeedHostError("TinyCloud did not confirm an active input authority", 409, "input_authority_unavailable");
+    }
+    const { portableDelegation: _portableDelegation, ...lineage } = inspected;
+    return lineage;
+  };
+}
+
 export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const storage = options.storage ?? new FeedHostStorage();
   const hostNode =
@@ -144,6 +196,24 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         ? new FeedHostDelegationStore(hostNode)
         : null;
   const actors = new Map<string, ActorState>();
+  const inputAuthorities = new InputAuthorityRegistry();
+  const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
+  const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
+    const authorityNode = hostNode as TinyCloudNode & {
+      getDelegationStatus?: (cid: string) => Promise<{ ok: boolean; data?: { cid: string; status: string } }>;
+    };
+    if (!authorityNode.getDelegationStatus) return "unavailable";
+    const result = await authorityNode.getDelegationStatus(childCid);
+    if (!result.ok || result.data?.cid !== childCid) return "unavailable";
+    if (result.data.status === "active" || result.data.status === "revoked" || result.data.status === "expired") {
+      return result.data.status;
+    }
+    return "unavailable";
+  });
+  const revokeInputAuthority: InputAuthorityRevoker = options.revokeInputAuthority ?? (async ({ childCid }) => {
+    const result = await hostNode.revokeDelegation(childCid);
+    return result.ok;
+  });
   let context: FeedHostContext | null = null;
 
   const getContext = async (): Promise<FeedHostContext> => {
@@ -159,6 +229,11 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       seedOnStart: options.seedOnStart !== false,
       delegationStore,
       enableDevPublisher: options.enableDevPublisher === true,
+      inputAuthorities,
+      inspectInputAuthority,
+      checkInputAuthority,
+      revokeInputAuthority,
+      inputAuthorityExpectedHost: options.inputAuthorityExpectedHost ?? options.tinycloudHost ?? "https://node.tinycloud.xyz",
     };
     return context;
   };
@@ -221,7 +296,21 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
 }
 
 async function route(request: Request, context: FeedHostContext): Promise<Response> {
-  const { storage, policy, policyHash, serverInfo, actors, activateDelegation, seedOnStart, delegationStore } = context;
+  const {
+    storage,
+    policy,
+    policyHash,
+    serverInfo,
+    actors,
+    activateDelegation,
+    seedOnStart,
+    delegationStore,
+    inputAuthorities,
+    inspectInputAuthority,
+    checkInputAuthority,
+    revokeInputAuthority,
+    inputAuthorityExpectedHost,
+  } = context;
   const url = new URL(request.url);
 
   if (request.method === "GET" && url.pathname === "/health") {
@@ -318,6 +407,45 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       policyHash,
       status: hasCompleteFeedHostDelegation(state) ? "active" : "activation_pending",
     });
+  }
+
+  if (url.pathname === "/input-authorities" && request.method === "GET") {
+    const actor = await requireCompleteActor(request, context);
+    return json({ items: await inputAuthorities.list(actorStorage(actor), checkInputAuthority) });
+  }
+
+  if (url.pathname === "/input-authorities" && request.method === "POST") {
+    const actor = await requireCompleteActor(request, context);
+    const body = await readJsonObject(request, "invalid_input_authority", "input authority body must be JSON");
+    const item = await inputAuthorities.attach({
+      actor: actorStorage(actor),
+      body,
+      expectedAudienceDID: policy.delegateDID,
+      expectedHost: inputAuthorityExpectedHost,
+      inspect: inspectInputAuthority,
+    });
+    return json({ attached: true, item }, 201);
+  }
+
+  const inputAuthorityMatch = url.pathname.match(/^\/input-authorities\/([^/]+)(?:\/(status|revoke))?$/);
+  if (inputAuthorityMatch) {
+    const actor = await requireCompleteActor(request, context);
+    const sourceId = decodeURIComponent(inputAuthorityMatch[1]);
+    const action = inputAuthorityMatch[2];
+    if (request.method === "GET" && action === undefined) {
+      return json(await inputAuthorities.get(actorStorage(actor), sourceId, checkInputAuthority));
+    }
+    if (request.method === "GET" && action === "status") {
+      const item = await inputAuthorities.get(actorStorage(actor), sourceId, checkInputAuthority);
+      return json({ sourceId: item.sourceId, state: item.state, expiry: item.expiry, revokedAt: item.revokedAt });
+    }
+    if (request.method === "POST" && action === "revoke") {
+      return json({ revoked: true, item: await inputAuthorities.revoke(actorStorage(actor), sourceId, revokeInputAuthority) });
+    }
+    if (request.method === "DELETE" && action === undefined) {
+      await inputAuthorities.remove(actorStorage(actor), sourceId);
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
   }
 
   // Browser-side failures (sign-in, delegation minting, feed setup) happen
@@ -425,6 +553,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed") {
     const actor = await requireCompleteActor(request, context);
+    await storage.reconcileFeedProjection(actorStorage(actor));
     const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
@@ -435,6 +564,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed/events") {
     const actor = await requireCompleteActor(request, context);
+    await storage.reconcileFeedProjection(actorStorage(actor));
     const body = await storage.listFeedEvents(actorStorage(actor), optionalString(request.headers.get("last-event-id")));
     return new Response(body, { status: 200, headers: SSE_HEADERS });
   }
@@ -869,17 +999,44 @@ async function readJsonObject(request: Request, code: string, message: string): 
   return body as Record<string, unknown>;
 }
 
-function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string): FeedbackEvent {
+function normalizeFeedbackEvent(body: Record<string, unknown>, actorId: string): FeedTargetedInteractionEvent {
   const signal = readSignal(body.signal);
-  return {
+  const event: FeedTargetedInteractionEvent = {
     eventId: readString(body, "eventId", "invalid_feedback", "eventId is required"),
-    artifactId: readString(body, "artifactId", "invalid_feedback", "artifactId is required"),
+    target: normalizeInteractionTarget(body.target, body.artifactId),
     actorId,
     readerNonce: readString(body, "readerNonce", "invalid_feedback", "readerNonce is required"),
     signal,
     payload: sanitizeFeedbackPayload(signal, body.payload),
     createdAt: readString(body, "createdAt", "invalid_feedback", "createdAt is required"),
   };
+  const validated = validateFeedTargetedInteractionEvent(event);
+  if (!validated.ok) throw new FeedHostError(validated.errors.join("; "), 400, "invalid_feedback");
+  return validated.value;
+}
+
+function normalizeInteractionTarget(value: unknown, legacyArtifactId: unknown): FeedInteractionTarget {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      kind: "artifact",
+      artifactId: readString({ artifactId: legacyArtifactId }, "artifactId", "invalid_feedback", "target or artifactId is required"),
+    };
+  }
+  const target = value as Record<string, unknown>;
+  if (target.kind === "artifact") {
+    return { kind: "artifact", artifactId: readString(target, "artifactId", "invalid_feedback", "target.artifactId is required") };
+  }
+  if (target.kind === "post") {
+    return {
+      kind: "post",
+      artifactId: readString(target, "artifactId", "invalid_feedback", "target.artifactId is required"),
+      postId: readString(target, "postId", "invalid_feedback", "target.postId is required"),
+    };
+  }
+  if (target.kind === "feed_item") {
+    return { kind: "feed_item", feedItemId: readString(target, "feedItemId", "invalid_feedback", "target.feedItemId is required") };
+  }
+  throw new FeedHostError("target.kind is invalid", 400, "invalid_feedback");
 }
 
 function normalizeSkillCredentialsPatch(body: Record<string, unknown>): FeedHostSkillCredentialsPatch {

@@ -4,6 +4,12 @@ TinyFeed is the Feed v1 client app. It signs the reader in with OpenKey and
 talks to the separate Feed Host API for projections, artifact hydration,
 feedback, and control intents.
 
+Feed ranks and renders `FeedItemProjection` rows. A Feed item targets either a
+`FeedPost` inside a rich artifact or a legacy artifact preview; opening a post
+hydrates the shared artifact and can focus its referenced section. Feedback
+targets an artifact, post, or feed item explicitly, so two posts from one
+artifact can be shaped independently without losing the artifact link.
+
 The previous direct-SQL TinyFeed app is archived in `web/legacy-src` with its
 old docs in `README.legacy.md`.
 
@@ -42,8 +48,25 @@ GET  /artifacts/:id
 GET  /artifacts/:id/provenance
 POST /feedback
 POST /control-intents
+GET  /input-authorities
+POST /input-authorities
+GET  /input-authorities/:sourceId/status
+POST /input-authorities/:sourceId/revoke
+DELETE /input-authorities/:sourceId
 POST /admin/seed
 ```
+
+Named input authorities are separate from the Feed Host output delegation.
+The browser attenuates a received `tc1` share with
+`sharing.delegateReceivedShare(...)`; raw share links, embedded private JWKs,
+and parent bearers never leave the browser. Feed Host stores only the child
+portable delegation and non-secret source lineage (host, owner space, path,
+read actions, expiry, parent CID chain, and agent DID). Deploying this flow
+requires publishing the approved web/node SDK sharing changeset from
+`js-sdk-feed-share` and then updating Feed's `@tinycloud/web-sdk` and
+`@tinycloud/node-sdk` package versions. Older SDKs show an explicit
+"SDK update required" compatibility error; Feed does not implement a second
+delegation or crypto path.
 
 The app does not treat OpenKey sign-in as Feed Host authority. On startup it
 fetches `GET /delegation-policy`, includes the Feed Host delegate DID/resources

@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
 import type { FeedArtifact, FeedArtifactProjection } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import {
+  feedItemIdForPost,
+  type FeedInteractionTarget,
+  type FeedItemTarget,
+  type FeedPost,
+} from "../shared/feed-item.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
 
 export const FEED_HOST_SCHEMA_VERSION = "feed.v1";
@@ -50,7 +56,11 @@ export type FeedFeedbackSummary = {
 };
 
 export type FeedProjectionState = {
-  artifactId: string;
+  feedItemId: string;
+  target: FeedItemTarget;
+  postTitle?: string;
+  postBody?: string;
+  sectionRef?: string;
   artifactType: string;
   packageId: string;
   sourceFingerprint: string;
@@ -73,6 +83,8 @@ export type FeedReconcileArtifact = {
   updatedAt: string;
   freshnessLabel: FeedArtifact["freshness"]["label"];
   docMissing: boolean;
+  posts?: FeedPost[];
+  surfaceMode?: "posts" | "artifact_preview" | "none";
 };
 
 export type FeedReconcilePlan = {
@@ -230,14 +242,15 @@ export function mergeFeedPreferences(records: readonly FeedPreferenceProfileReco
 
 export function summarizeFeedbackEvents(
   rows: readonly {
-    artifactId: string;
+    target: FeedInteractionTarget;
     signal: string;
     createdAt: string;
   }[],
 ): Map<string, FeedFeedbackSummary> {
   const summaries = new Map<string, FeedFeedbackSummary>();
   for (const row of rows) {
-    const current = summaries.get(row.artifactId) ?? {
+    const targetId = interactionTargetKey(row.target);
+    const current = summaries.get(targetId) ?? {
       saved: 0,
       hidden: 0,
       helpful: 0,
@@ -272,7 +285,7 @@ export function summarizeFeedbackEvents(
     if (!current.lastEventAt || row.createdAt > current.lastEventAt) {
       current.lastEventAt = row.createdAt;
     }
-    summaries.set(row.artifactId, current);
+    summaries.set(targetId, current);
   }
   return summaries;
 }
@@ -282,13 +295,15 @@ export function rankFeedProjections(input: {
   preferences?: FeedPreferenceAggregate;
   feedbackByArtifact?: Map<string, FeedFeedbackSummary>;
   now?: Date;
+  maxItemsPerArtifact?: number;
 }): FeedProjectionState[] {
   const preferences = input.preferences ?? { presentation: defaultFeedPreferences(), packageScopes: new Map() };
   const feedbackByArtifact = input.feedbackByArtifact ?? new Map<string, FeedFeedbackSummary>();
   const now = input.now ?? new Date();
-  const clusters = sourceFingerprintClusters(input.items);
+  const normalizedItems = input.items.map(withProjectionIdentity);
+  const clusters = sourceFingerprintClusters(normalizedItems);
 
-  const preliminary = input.items.map((item) => scoreRank(item, preferences, feedbackByArtifact, clusters, now));
+  const preliminary = normalizedItems.map((item) => scoreRank(item, preferences, feedbackByArtifact, clusters, now));
   preliminary.sort(compareRanked);
 
   const diversityWindow = Math.max(1, Math.trunc(preferences.presentation.diversityWindow ?? 3));
@@ -309,7 +324,7 @@ export function rankFeedProjections(input: {
   // Keep package history referenced so TypeScript does not elide the helper
   // during dead-code sweeping in downstream tooling.
   packageHistory.clear();
-  return diversified;
+  return capItemsPerArtifact(diversified, input.maxItemsPerArtifact ?? 4);
 }
 
 export function reconcileFeedProjections(input: {
@@ -318,15 +333,39 @@ export function reconcileFeedProjections(input: {
   now?: Date;
 }): FeedReconcilePlan {
   const now = input.now ?? new Date();
-  const currentById = new Map(input.projections.map((row) => [row.artifactId, row] as const));
-  const artifactIds = new Set<string>();
+  const currentProjections = input.projections.map(withProjectionIdentity);
+  const currentById = new Map(currentProjections.map((row) => [row.feedItemId, row] as const));
+  const artifactById = new Map(input.artifacts.map((artifact) => [artifact.artifactId, artifact] as const));
+  const feedItemIds = new Set<string>();
   const duplicateClusters = sourceFingerprintClusters(input.artifacts);
-  const desired = input.artifacts.map((artifact) => {
-    artifactIds.add(artifact.artifactId);
-    const current = currentById.get(artifact.artifactId);
+  const desired = input.artifacts.flatMap((artifact) => {
+    if (artifact.surfaceMode === "none") return [];
+    const postSeeds = artifact.posts && artifact.posts.length > 0
+      ? artifact.posts.map((post) => ({
+          feedItemId: feedItemIdForPost(artifact.artifactId, post.postId),
+          target: { kind: "post" as const, artifactId: artifact.artifactId, postId: post.postId },
+          postTitle: post.title,
+          postBody: post.body,
+          sectionRef: post.expansionTarget.sectionId,
+        }))
+      : [];
+    // Keep the preview mirror during the rolling migration so old readers
+    // retain one artifact card. Feed list composition suppresses this preview
+    // once independently ranked posts exist for the same artifact.
+    const itemSeeds = [
+      ...(artifact.surfaceMode === "artifact_preview" ? [] : postSeeds),
+      { feedItemId: `legacy:${artifact.artifactId}`, target: { kind: "artifact_preview" as const, artifactId: artifact.artifactId } },
+    ];
+    return itemSeeds.map((itemSeed) => {
+    feedItemIds.add(itemSeed.feedItemId);
+    const current = currentById.get(itemSeed.feedItemId);
+    // A stale artifact-index writer must not roll a newer projection backward.
+    // Keep the complete newer row, including its timestamp and post material.
+    if (current && artifact.updatedAt.localeCompare(current.updatedAt) < 0) return current;
     const baseRow: FeedProjectionState = current
       ? {
           ...current,
+          ...itemSeed,
           artifactType: artifact.artifactType,
           packageId: artifact.packageId,
           sourceFingerprint: artifact.sourceFingerprint,
@@ -349,7 +388,7 @@ export function reconcileFeedProjections(input: {
           rankScore: current.rankScore,
         }
       : {
-          artifactId: artifact.artifactId,
+          ...itemSeed,
           artifactType: artifact.artifactType,
           packageId: artifact.packageId,
           sourceFingerprint: artifact.sourceFingerprint,
@@ -369,21 +408,32 @@ export function reconcileFeedProjections(input: {
           docMissing: artifact.docMissing,
         };
     return baseRow;
+    });
   });
 
-  const deletions = input.projections
-    .filter((projection) => !artifactIds.has(projection.artifactId))
-    .map((projection) => projection.artifactId);
+  const preservedFromStaleArtifacts = currentProjections.filter((projection) => {
+    if (feedItemIds.has(projection.feedItemId)) return false;
+    const artifact = artifactById.get(projection.target.artifactId);
+    return Boolean(artifact && artifact.updatedAt.localeCompare(projection.updatedAt) < 0);
+  });
+  for (const projection of preservedFromStaleArtifacts) feedItemIds.add(projection.feedItemId);
+  const completeDesired = [...desired, ...preservedFromStaleArtifacts];
 
-  const upserts = desired.filter((desiredRow) => {
-    const current = currentById.get(desiredRow.artifactId);
+  const deletions = currentProjections
+    .filter((projection) => !feedItemIds.has(projection.feedItemId))
+    .map((projection) => projection.feedItemId);
+
+  const upserts = completeDesired.filter((desiredRow) => {
+    const current = currentById.get(desiredRow.feedItemId);
     if (!current) return true;
     return projectionFingerprint(current) !== projectionFingerprint(desiredRow);
   });
 
-  const cursor = desired.length === 0 ? "" : `${desired[desired.length - 1].publishedAt}|${desired[desired.length - 1].artifactId}`;
+  const cursor = completeDesired.length === 0
+    ? ""
+    : `${completeDesired[completeDesired.length - 1].publishedAt}|${completeDesired[completeDesired.length - 1].feedItemId}`;
   return {
-    desired,
+    desired: completeDesired,
     upserts,
     deletions,
     checkpoint: {
@@ -399,14 +449,17 @@ export function reconcileFeedProjections(input: {
 export function buildFeedEvents(input: {
   projections: readonly FeedProjectionState[];
 }): FeedSseEvent[] {
-  const snapshotKey = hashJson(input.projections);
+  const projections = input.projections.map(withProjectionIdentity);
+  const snapshotKey = hashJson(projections);
   return sortFeedEvents(
-    input.projections.flatMap((projection) => [
+    projections.flatMap((projection) => [
       {
-        id: `projection:${projection.artifactId}:${projection.updatedAt}|${snapshotKey}`,
+        id: `projection:${projection.feedItemId}:${projection.updatedAt}|${snapshotKey}`,
         event: "projection-updated",
         data: {
-          artifactId: projection.artifactId,
+          feedItemId: projection.feedItemId,
+          target: projection.target,
+          artifactId: artifactIdOf(projection),
           packageId: projection.packageId,
           rankScore: projection.rankScore,
           disposition: projection.disposition,
@@ -417,10 +470,10 @@ export function buildFeedEvents(input: {
         },
       },
       {
-        id: `artifact:${projection.artifactId}:${projection.updatedAt}|${snapshotKey}`,
+        id: `artifact:${artifactIdOf(projection)}:${projection.updatedAt}|${snapshotKey}`,
         event: "artifact-published",
         data: {
-          artifactId: projection.artifactId,
+          artifactId: artifactIdOf(projection),
           packageId: projection.packageId,
           publishedAt: projection.publishedAt,
           freshnessLabel: projection.freshnessLabel,
@@ -540,6 +593,20 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       },
       "/api/delegations/status": {
         get: { responses: { 200: { description: "delegation status", content: jsonResponse } } },
+      },
+      "/input-authorities": {
+        get: { responses: { 200: { description: "named input authorities", content: jsonResponse } } },
+        post: { responses: { 201: { description: "input authority attached", content: jsonResponse } } },
+      },
+      "/input-authorities/{sourceId}": {
+        get: { responses: { 200: { description: "input authority lineage", content: jsonResponse } } },
+        delete: { responses: { 204: { description: "input authority removed" } } },
+      },
+      "/input-authorities/{sourceId}/status": {
+        get: { responses: { 200: { description: "input authority status", content: jsonResponse } } },
+      },
+      "/input-authorities/{sourceId}/revoke": {
+        post: { responses: { 200: { description: "input authority revoked", content: jsonResponse } } },
       },
       "/api/openapi.json": {
         get: { security: [], responses: { 200: { description: "openapi", content: jsonResponse } } },
@@ -702,12 +769,12 @@ function scoreRank(
   const sourcePriority = presentation.sourcePriority?.[item.sourceFingerprint] ?? 0;
   score += sourcePriority * 0.08;
 
-  if ((presentation.savedArtifactIds ?? []).includes(item.artifactId) || item.disposition === "saved") {
+  if ((presentation.savedArtifactIds ?? []).includes(artifactIdOf(item)) || item.disposition === "saved") {
     score += 0.4;
     reasons.push("saved");
   }
 
-  if ((presentation.hiddenArtifactIds ?? []).includes(item.artifactId) || item.disposition === "hidden") {
+  if ((presentation.hiddenArtifactIds ?? []).includes(artifactIdOf(item)) || item.disposition === "hidden") {
     score -= 0.7;
     reasons.push("hidden");
   }
@@ -729,8 +796,14 @@ function scoreRank(
     score += 0.12;
   }
 
-  const feedback = feedbackByArtifact.get(item.artifactId);
-  if (feedback) {
+  const feedbackSummaries = [
+    feedbackByArtifact.get(interactionTargetKey({ kind: "feed_item", feedItemId: item.feedItemId })),
+    ...(item.target.kind === "post"
+      ? [feedbackByArtifact.get(interactionTargetKey({ kind: "post", artifactId: item.target.artifactId, postId: item.target.postId }))]
+      : []),
+    feedbackByArtifact.get(interactionTargetKey({ kind: "artifact", artifactId: item.target.artifactId })),
+  ].filter((feedback): feedback is FeedFeedbackSummary => Boolean(feedback));
+  for (const feedback of feedbackSummaries) {
     if (feedback.saved > 0) {
       score += Math.min(0.2, 0.08 * feedback.saved);
       reasons.push("saved");
@@ -762,7 +835,7 @@ function scoreRank(
   const cluster = clusters.get(item.sourceFingerprint) ?? [];
   if (cluster.length > 1) {
     const earliest = [...cluster].sort(comparePublishedThenId)[0];
-    if (earliest && earliest.artifactId !== item.artifactId) {
+    if (earliest && artifactIdOf(earliest) !== artifactIdOf(item)) {
       score -= 0.12;
       reasons.push("duplicate_cluster");
     }
@@ -785,10 +858,44 @@ function compareRanked(left: FeedProjectionState, right: FeedProjectionState): n
   return comparePublishedThenId(left, right);
 }
 
+function withProjectionIdentity(item: FeedProjectionState): FeedProjectionState {
+  if (item.feedItemId && item.target) return item;
+  const legacyArtifactId = (item as unknown as { artifactId: string }).artifactId;
+  return {
+    ...item,
+    feedItemId: item.feedItemId ?? `legacy:${legacyArtifactId}`,
+    target: { kind: "artifact_preview", artifactId: legacyArtifactId },
+  };
+}
+
+function artifactIdOf(item: Pick<FeedProjectionState, "target">): string {
+  return item.target.artifactId;
+}
+
+function interactionTargetKey(target: FeedInteractionTarget): string {
+  switch (target.kind) {
+    case "artifact": return `artifact:${target.artifactId}`;
+    case "post": return `post:${target.artifactId}:${encodeURIComponent(target.postId)}`;
+    case "feed_item": return `feed_item:${target.feedItemId}`;
+  }
+}
+
 function comparePublishedThenId(left: FeedProjectionState, right: FeedProjectionState): number {
   const published = right.publishedAt.localeCompare(left.publishedAt);
   if (published !== 0) return published;
-  return left.artifactId.localeCompare(right.artifactId);
+  return left.feedItemId.localeCompare(right.feedItemId);
+}
+
+function capItemsPerArtifact(items: readonly FeedProjectionState[], cap: number): FeedProjectionState[] {
+  const limit = Math.max(1, Math.trunc(cap));
+  const counts = new Map<string, number>();
+  return items.filter((item) => {
+    const artifactId = artifactIdOf(item);
+    const count = counts.get(artifactId) ?? 0;
+    if (count >= limit) return false;
+    counts.set(artifactId, count + 1);
+    return true;
+  });
 }
 
 function clampScore(value: number): number {
@@ -796,7 +903,7 @@ function clampScore(value: number): number {
   return Math.max(0, Math.min(1, value));
 }
 
-function sourceFingerprintClusters<T extends { artifactId: string; sourceFingerprint: string }>(
+function sourceFingerprintClusters<T extends { sourceFingerprint: string }>(
   items: readonly T[],
 ): Map<string, T[]> {
   const clusters = new Map<string, T[]>();
@@ -852,7 +959,8 @@ function canonicalReasonCodes(input: {
 
 function projectionFingerprint(value: FeedProjectionState): string {
   return hashJson({
-    artifactId: value.artifactId,
+    feedItemId: value.feedItemId,
+    target: value.target,
     artifactType: value.artifactType,
     packageId: value.packageId,
     sourceFingerprint: value.sourceFingerprint,
