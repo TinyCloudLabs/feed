@@ -3,7 +3,7 @@ import { Wallet } from "ethers";
 import {
   NodeWasmBindings,
   TinyCloudNode,
-} from "../../js-sdk-feed-share/packages/node-sdk/dist/index.js";
+} from "@tinycloud/node-sdk";
 import { delegateInputAuthorityLocally } from "../web/src/inputAuthority.ts";
 import { InputAuthorityRegistry } from "./input-authority.ts";
 import { validateInputAuthorityDelegation } from "./delegation.ts";
