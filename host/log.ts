@@ -21,7 +21,7 @@ export function logEvent(level: FeedHostLogLevel, event: string, fields: FeedHos
 }
 
 const SENSITIVE_LOG_KEY = /(tc1|private.?jwk|private.?key|parent.?bearer|authorization|secret|portable.?delegation)/i;
-const SENSITIVE_LOG_VALUE = /(?:tc1:|Bearer\s+)[^\s"']+/i;
+const SENSITIVE_LOG_VALUE = /(?:tc1:|Bearer\s+)[^\s"']+|\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|\b(?:0x)?[0-9a-f]{64}\b/i;
 
 function sanitizeLogFields(fields: FeedHostLogFields): FeedHostLogFields {
   const seen = new WeakSet<object>();

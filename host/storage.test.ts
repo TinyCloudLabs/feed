@@ -5,6 +5,7 @@ import type { FeedHostActorStorage } from "./storage.ts";
 import { FeedHostStorage } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import type { FeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
+import { feedV1MigrationApplyPlans } from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
   FEED_V1_LEGACY_PROJECTION_PARITY_SQL,
@@ -177,8 +178,13 @@ test("falls back to statement-by-statement execution when batches cannot mix act
 
   const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
-  expect(artifactLog?.executes.length).toBe(7);
-  expect(feedLog?.executes.length).toBe(12);
+  const plans = feedV1MigrationApplyPlans();
+  const artifactStatements = plans.find((plan) => plan.dbName === "artifacts_index")!.migrations.flatMap((migration) => migration.sql);
+  const feedStatements = withFeedHostMigrations(
+    plans.find((plan) => plan.dbName === "feed_index")!.migrations,
+  ).flatMap((migration) => migration.sql);
+  expect(artifactLog?.executes.length).toBe(artifactStatements.length);
+  expect(feedLog?.executes.length).toBe(feedStatements.length + 2);
   expect(artifactLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.executes[0]).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(feedLog?.executes[6]).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
@@ -391,7 +397,7 @@ test("bootstraps legacy rows when the actor can read the old SQL resources", asy
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(artifactLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO artifact_index");
-  expect(feedLog?.batches[2]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_artifact_projection");
+  expect(feedLog?.batches[2]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
 });
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {

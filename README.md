@@ -20,7 +20,10 @@ Set these Vite variables for local development or deployment:
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `VITE_FEED_HOST_URL` | `https://api.feed.tinycloud.xyz` | Feed Host API base URL. |
-| `VITE_FEED_HOST_TOKEN` | unset | Optional bearer token for protected Feed Host installs. |
+| `VITE_FEED_HOST_TOKEN` | unset | Optional install-level bearer token for protected Feed Host installs. Actor sessions use separate HttpOnly cookies issued automatically after delegation. |
+| `FEED_HOST_STATE_DIR` | unset | Private directory for a generated, persistent Feed Host identity. Production containers should mount a named volume here. |
+| `FEED_HOST_PRIVATE_KEY` | unset | Explicit Feed Host identity override. Prefer `FEED_HOST_STATE_DIR` for deployments that can persist a private volume. |
+| `FEED_HOST_ALLOWED_ORIGINS` | unset | Comma-separated exact browser origins. Required when the web client and Host use different origins because actor sessions use credentialed CORS. |
 | `VITE_OPENKEY_HOST` | `https://openkey.so` | OpenKey sign-in host. |
 | `VITE_TINYCLOUD_HOST` | `https://node.tinycloud.xyz` | TinyCloud node used for the OpenKey-backed session. |
 
@@ -32,6 +35,8 @@ resources live in Artifactory and are applied by the Feed Host path.
 Run the TinyCloud-backed Feed Host and app in separate terminals:
 
 ```sh
+FEED_HOST_ALLOWED_ORIGINS=http://127.0.0.1:5173 \
+FEED_HOST_STATE_DIR=.local/feed-host \
 bun run host
 bun run dev:local
 ```
@@ -70,15 +75,16 @@ delegation or crypto path.
 
 The app does not treat OpenKey sign-in as Feed Host authority. On startup it
 fetches `GET /delegation-policy`, includes the Feed Host delegate DID/resources
-in the TinyCloud manifest before sign-in, creates portable delegations with
-`space("default").delegations.create(...)`, and submits them with `POST
-/delegations`. Feed reads, artifact hydration, feedback, and control intents are
-rejected until the host has accepted the complete Feed v1 SQL/KV delegation set
-for the actor.
+in the TinyCloud manifest before sign-in, silently materializes a portable
+delegation, and submits it with `POST /api/delegations`. The Host derives the
+actor from that signed delegation and establishes an opaque HttpOnly session
+cookie. Private routes derive the actor from the session and reject a
+caller-supplied actor without it.
 
 For local development, the Feed Host can use a generated session DID. Hosted
-deployments should set `FEED_HOST_PRIVATE_KEY` (the env var only — never commit
-key material). With a stable key the host signs into its own TinyCloud space at
+deployments should mount a private named volume at `FEED_HOST_STATE_DIR`, or set
+`FEED_HOST_PRIVATE_KEY` through the deployment secret store. With a stable key
+the host signs into its own TinyCloud space at
 startup, so the delegate DID is the stable `did:pkh` identity, and every
 accepted delegation is persisted to the host's own TinyCloud KV space under
 `delegations/{actorId}`. After a restart the host reactivates persisted

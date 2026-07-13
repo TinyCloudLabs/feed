@@ -38,7 +38,12 @@ import {
   type FeedHostActorStorage,
   type FeedHostStorage,
 } from "./storage.ts";
-import { startFeedHost, type FeedHostRuntime } from "./server.ts";
+import {
+  isTinyCloudSerializationConflict,
+  startFeedHost as startSecureFeedHost,
+  type FeedHostRuntime,
+  type FeedHostServerOptions,
+} from "./server.ts";
 import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../shared/feed-item.ts";
 
 process.env.FEED_HOST_LOG = "0";
@@ -53,6 +58,12 @@ const MUTATING_ROUTES = ["/feedback", "/control-intents"] as const;
 const HOST_DID = "did:pkh:eip155:1:0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 const SECOND_ARTIFACT_ID = "run-seed-002:insight-card-001";
 const FAKE_NOW = "2026-07-20T00:00:00.000Z";
+
+// Route-focused tests opt out explicitly; authentication tests pass
+// requireActorSession: true and exercise the production default.
+function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
+  return startSecureFeedHost({ requireActorSession: false, ...options });
+}
 
 const SOURCE_REF = {
   sourceRefId: "listen:seed:fundraising-loop",
@@ -124,7 +135,13 @@ describe("Feed Host server", () => {
       actions: ["tinycloud.kv/get", "tinycloud.kv/list"],
     });
 
-    const openApi = await getJson<{ paths: Record<string, unknown> }>(`${runtime.url}/api/openapi.json`);
+    const openApi = await getJson<{
+      paths: Record<string, unknown>;
+      security: Array<Record<string, unknown>>;
+      components: { securitySchemes: Record<string, { in: string; name: string }> };
+    }>(`${runtime.url}/api/openapi.json`);
+    expect(openApi.security).toEqual([{ actorSession: [] }]);
+    expect(openApi.components.securitySchemes.actorSession).toMatchObject({ in: "cookie", name: "__Host-feed_session" });
     expect(Object.keys(openApi.paths).sort()).toEqual(
       [
         "/health",
@@ -201,6 +218,188 @@ describe("Feed Host server", () => {
       headers: { "x-feed-actor-id": ACTOR_ID },
     });
     expect(blockedFeed.status).toBe(403);
+  });
+
+  test("requires an actor-bound session after accepting a signed delegation", async () => {
+    const allowedOrigin = "https://feed.tinycloud.xyz";
+    runtime = startSecureFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      allowedOrigins: [allowedOrigin],
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const preflight = await fetch(`${runtime.url}/feed`, {
+      method: "OPTIONS",
+      headers: { origin: allowedOrigin },
+    });
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe(allowedOrigin);
+    expect(preflight.headers.get("access-control-allow-credentials")).toBe("true");
+
+    const deniedOrigin = await fetch(`${runtime.url}/delegation-policy`, {
+      headers: { origin: "https://attacker.example" },
+    });
+    expect(deniedOrigin.status).toBe(403);
+    expect(deniedOrigin.headers.get("access-control-allow-origin")).toBeNull();
+
+    const beforeGrant = await fetch(`${runtime.url}/feed`, {
+      headers: { "x-feed-actor-id": ACTOR_ID },
+    });
+    expect(beforeGrant.status).toBe(401);
+
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const grant = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    }, { origin: allowedOrigin });
+    expect(grant.status).toBe(200);
+    const setCookie = grant.headers.get("set-cookie") ?? "";
+    expect(setCookie).toContain("feed_session=");
+    expect(setCookie).toContain("HttpOnly");
+    expect(setCookie).toContain("SameSite=Lax");
+    const sessionCookie = setCookie.split(";", 1)[0];
+    const ownFeed = await fetch(`${runtime.url}/feed`, {
+      headers: { cookie: sessionCookie, origin: allowedOrigin },
+    });
+    expect(ownFeed.status).toBe(200);
+    expect(ownFeed.headers.get("cache-control")).toBe("private, no-store");
+    expect(ownFeed.headers.get("access-control-allow-origin")).toBe(allowedOrigin);
+    expect(ownFeed.headers.get("access-control-allow-credentials")).toBe("true");
+
+    const impersonation = await fetch(`${runtime.url}/feed`, {
+      headers: {
+        "x-feed-actor-id": "did:pkh:eip155:1:0x0000000000000000000000000000000000000001",
+        cookie: sessionCookie,
+      },
+    });
+    expect(impersonation.status).toBe(401);
+
+    const narrowGrant = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources[0]!.path,
+    });
+    expect(narrowGrant.status).toBe(202);
+    expect(narrowGrant.headers.get("set-cookie")).toBeNull();
+
+    const hostedGrant = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    }, { origin: allowedOrigin, "x-forwarded-proto": "https" });
+    expect(hostedGrant.headers.get("set-cookie")).toContain("__Host-feed_session=");
+    expect(hostedGrant.headers.get("set-cookie")).toContain("Secure");
+    expect(hostedGrant.headers.get("set-cookie")).toContain("HttpOnly");
+  });
+
+  test("secure browser mode fails closed without an origin allowlist", async () => {
+    runtime = startSecureFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    expect((await fetch(`${runtime.url}/delegation-policy`)).status).toBe(200);
+    const browserRequest = await fetch(`${runtime.url}/delegation-policy`, {
+      headers: { origin: "https://feed.tinycloud.xyz" },
+    });
+    expect(browserRequest.status).toBe(403);
+    expect(browserRequest.headers.get("access-control-allow-origin")).toBeNull();
+  });
+
+  test("a fresh complete delegation replaces expired actor state", async () => {
+    let expiresInMs = 20;
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      requireActorSession: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation, expiresInMs),
+    });
+
+    const expiredCookie = await grantAllDelegations(runtime, ACTOR_ID);
+    await Bun.sleep(30);
+    const expired = await fetch(`${runtime.url}/feed`, { headers: { cookie: expiredCookie } });
+    expect(expired.status).toBe(401);
+
+    expiresInMs = 60_000;
+    const renewedCookie = await grantAllDelegations(runtime, ACTOR_ID);
+    const renewed = await fetch(`${runtime.url}/feed`, { headers: { cookie: renewedCookie } });
+    expect(renewed.status).toBe(200);
+  });
+
+  test("retries transient TinyCloud serialization conflicts during actor setup", async () => {
+    const storage = new TransientBootstrapStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    expect(isTinyCloudSerializationConflict(new Error("could not serialize access due to read/write dependencies"))).toBe(true);
+    expect(isTinyCloudSerializationConflict(new Error("permission denied"))).toBe(false);
+    await grantAllDelegations(runtime, ACTOR_ID);
+    expect(storage.bootstrapAttempts).toBe(2);
+  });
+
+  test("retries transient TinyCloud serialization conflicts while accepting a delegation", async () => {
+    const store = fakeDelegationStore();
+    const save = store.save.bind(store);
+    let activations = 0;
+    let saves = 0;
+    store.save = async (record) => {
+      saves += 1;
+      if (saves <= 2) {
+        throw new Error("KV put failed: could not serialize access due to read/write dependencies among transactions");
+      }
+      await save(record);
+    };
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }) => {
+        activations += 1;
+        if (activations <= 2) {
+          throw new Error("delegation activation failed: could not serialize access due to read/write dependencies among transactions");
+        }
+        return fakeActivatedDelegation(serializedDelegation);
+      },
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+    expect(activations).toBe(3);
+    expect(saves).toBe(3);
+  });
+
+  test("serializes concurrent private requests for the same actor", async () => {
+    const storage = new ConcurrentReadStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const cookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const [feed, events] = await Promise.all([
+      fetch(`${runtime.url}/feed`, { headers: { cookie } }),
+      fetch(`${runtime.url}/feed/events`, { headers: { cookie } }),
+    ]);
+
+    expect(feed.status).toBe(200);
+    expect(events.status).toBe(200);
+    expect(storage.maxConcurrentReads).toBe(1);
   });
 
   test("attaches, inspects, revokes, and removes a redacted named input authority", async () => {
@@ -981,6 +1180,7 @@ describe("Feed Host server", () => {
       port: 0,
       hostname: "127.0.0.1",
       seedOnStart: true,
+      requireActorSession: true,
       storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
       hostNode: fakeHostNode(HOST_DID),
       delegationStore: store,
@@ -1002,8 +1202,13 @@ describe("Feed Host server", () => {
     runtime = startFeedHost(serverOptions());
     const restartedPolicy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
     expect(restartedPolicy.delegateDID).toBe(policy.delegateDID);
+    const missingSession = await fetch(`${runtime.url}/feed?limit=10`, {
+      headers: { "x-feed-actor-id": ACTOR_ID },
+    });
+    expect(missingSession.status).toBe(401);
+    const restoredCookie = await grantAllDelegations(runtime, ACTOR_ID);
     const feed = await getJson<{ items: FeedItemProjection[] }>(`${runtime.url}/feed?limit=10`, {
-      "x-feed-actor-id": ACTOR_ID,
+      cookie: restoredCookie,
     });
     expect(feed.items).toHaveLength(1);
     expect(feed.items[0].target.artifactId).toBe(SEEDED_ARTIFACT_ID);
@@ -1862,6 +2067,45 @@ class FakeFeedHostStorage {
   }
 }
 
+class TransientBootstrapStorage extends FakeFeedHostStorage {
+  bootstrapAttempts = 0;
+
+  override async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    this.bootstrapAttempts += 1;
+    if (this.bootstrapAttempts === 1) {
+      throw new Error("SQL batch failed: could not serialize access due to read/write dependencies among transactions");
+    }
+    return super.bootstrapSchema(actor);
+  }
+}
+
+class ConcurrentReadStorage extends FakeFeedHostStorage {
+  private activeReads = 0;
+  maxConcurrentReads = 0;
+
+  override async listFeed(
+    actor: FeedHostActorStorage,
+    input: { limit: number; cursor?: string },
+  ): Promise<{ items: FeedArtifactProjection[]; nextCursor?: string }> {
+    return this.track(() => super.listFeed(actor, input));
+  }
+
+  override async listFeedEvents(actor: FeedHostActorStorage, afterEventId?: string): Promise<string> {
+    return this.track(() => super.listFeedEvents(actor, afterEventId));
+  }
+
+  private async track<T>(run: () => Promise<T>): Promise<T> {
+    this.activeReads += 1;
+    this.maxConcurrentReads = Math.max(this.maxConcurrentReads, this.activeReads);
+    await Bun.sleep(20);
+    try {
+      return await run();
+    } finally {
+      this.activeReads -= 1;
+    }
+  }
+}
+
 type StoredArtifactIndexRow = {
   artifact_id: string;
   artifact_type: string;
@@ -2263,20 +2507,21 @@ function projectionState(row: FeedArtifactProjection | FeedItemProjection, docMi
   };
 }
 
-async function grantAllDelegations(runtime: FeedHostRuntime, actorId: string): Promise<void> {
+async function grantAllDelegations(runtime: FeedHostRuntime, actorId: string): Promise<string> {
   const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
   expect(policy.resources.map((resource) => resource.path)).toEqual(FEED_HOST_DELEGATION_RESOURCES.map((resource) => resource.path));
-  for (const resource of policy.resources) {
-    const response = await postJson(
-      `${runtime.url}/api/delegations`,
-      {
-        actorId,
-        serializedDelegation: resource.path,
-      },
-      { "content-type": "application/json" },
-    );
-    expect(response.ok).toBe(true);
-  }
+  const response = await postJson(
+    `${runtime.url}/api/delegations`,
+    {
+      actorId,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    },
+    { "content-type": "application/json" },
+  );
+  expect(response.ok).toBe(true);
+  const sessionCookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+  expect(sessionCookie).not.toBe("");
+  return sessionCookie;
 }
 
 async function getJson<T>(url: string, headers: HeadersInit = {}): Promise<T> {

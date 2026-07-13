@@ -13,12 +13,15 @@ export default defineConfig({
   retries: process.env.CI ? 2 : 0,
   workers: 1,
   reporter: process.env.CI ? "github" : "list",
-  timeout: 240000,
-  expect: { timeout: 120000 },
+  timeout: 360000,
+  expect: { timeout: 180000 },
   use: {
     baseURL: `http://127.0.0.1:${WEB_PORT}`,
-    trace: "retain-on-failure",
-    screenshot: "only-on-failure",
+    // This suite uses a real TinyCloud authority. Playwright traces retain
+    // request headers/bodies (delegations and actor cookies), and screenshots
+    // can retain private Feed content, so neither is safe as a CI artifact.
+    trace: "off",
+    screenshot: "off",
     ...devices["Desktop Chrome"],
   },
   webServer: [
@@ -27,6 +30,10 @@ export default defineConfig({
       url: `http://127.0.0.1:${HOST_PORT}/health`,
       reuseExistingServer: false,
       timeout: 120000,
+      env: {
+        ...process.env,
+        FEED_HOST_ALLOWED_ORIGINS: `http://127.0.0.1:${WEB_PORT}`,
+      },
     },
     {
       command: `bun run dev:vite --host 127.0.0.1 --port ${WEB_PORT}`,

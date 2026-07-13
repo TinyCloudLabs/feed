@@ -15,30 +15,22 @@ import { FeedV1HostClient } from "./feedV1HostClient.ts";
 import { errorDetail, reportClientEvent } from "./clientLog.ts";
 import { delegateInputAuthorityLocally } from "./inputAuthority.ts";
 import { connectWallet } from "./openkey.ts";
+import { isRetryableDelegationConflict, isRetryableSpaceCreationFailure } from "./delegationRetry.ts";
 import {
   FEED_MANIFEST,
   FeedReconnectRequiredError,
 } from "./authPolicy.ts";
 
 const SESSION_EXPIRATION_MS = 7 * 24 * 60 * 60 * 1000;
+const DELEGATION_RETRY_DELAYS_MS = [1000, 3000, 7000, 12000];
+const SPACE_CREATION_RETRY_DELAYS_MS = [1000, 3000];
 const LAST_ADDRESS_KEY = "feed:v1:lastAddress";
-const DELEGATION_CACHE_KEY = "feed:v1:hostDelegations";
 
 let instance: TinyCloudWeb | null = null;
 
 export type FeedSession = {
   address: string;
   readerDid: string;
-};
-
-type CachedFeedHostDelegation = {
-  actorId: string;
-  delegateDID: string;
-  resources: Array<{
-    path: string;
-    actions: string[];
-  }>;
-  serializedDelegation: string;
 };
 
 function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
@@ -88,7 +80,7 @@ function savedAddress(): string | null {
 export async function signIn(policy: FeedHostDelegationPolicy): Promise<FeedSession> {
   const { address, web3Provider } = await connectWallet();
   const tc = new TinyCloudWeb(buildConfig(web3Provider, policy));
-  await tc.signIn();
+  await signInWithSpaceCreationRetry(tc);
   instance = tc;
   try {
     localStorage.setItem(LAST_ADDRESS_KEY, address);
@@ -96,6 +88,20 @@ export async function signIn(policy: FeedHostDelegationPolicy): Promise<FeedSess
     // Restore is best-effort; sign-in still succeeded.
   }
   return { address, readerDid: tc.did };
+}
+
+async function signInWithSpaceCreationRetry(tc: TinyCloudWeb): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await tc.signIn();
+      return;
+    } catch (error) {
+      const delay = SPACE_CREATION_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !isRetryableSpaceCreationFailure(error)) throw error;
+      reportClientEvent("warn", "sign_in_space_retry", `attempt=${attempt + 1}`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
 }
 
 export async function restoreSession(policy?: FeedHostDelegationPolicy): Promise<FeedSession | null> {
@@ -121,27 +127,9 @@ export async function submitFeedHostDelegations(input: {
   actorId: string;
 }): Promise<FeedHostDelegationReceipt[]> {
   if (!instance) throw new Error("TinyCloud session is required before creating Feed Host delegations");
-  const cached = cachedDelegations(input.actorId, input.policy);
-  if (cached) {
-    try {
-      return [await input.client.submitDelegation({
-        actorId: input.actorId,
-        serializedDelegation: cached.serializedDelegation,
-      })];
-    } catch (error) {
-      // A stale cached blob (expired, superseded policy) is not fatal:
-      // materializing a fresh delegation below is silent, so fall through.
-      reportClientEvent("warn", "cached_delegation_rejected", errorDetail(error), input.actorId);
-      clearCachedDelegations();
-    }
-  }
-
   let serializedDelegation: string;
   try {
-    const result = await instance.materializeDelegation(
-      input.policy.delegateDID,
-      feedCapabilityRequest(input.policy),
-    );
+    const result = await materializeFeedHostDelegation(instance, input.policy, input.actorId);
     if (result.prompted) {
       throw new Error("Feed Host delegation unexpectedly required another wallet approval");
     }
@@ -151,13 +139,24 @@ export async function submitFeedHostDelegations(input: {
     if (isSessionScopeError(error)) throw reconnectRequiredError(error);
     throw error;
   }
-  saveCachedDelegations({
-    actorId: input.actorId,
-    delegateDID: input.policy.delegateDID,
-    resources: input.policy.resources.map(({ path, actions }) => ({ path, actions })),
-    serializedDelegation,
-  });
   return [await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation })];
+}
+
+async function materializeFeedHostDelegation(
+  tc: TinyCloudWeb,
+  policy: FeedHostDelegationPolicy,
+  actorId: string,
+) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await tc.materializeDelegation(policy.delegateDID, feedCapabilityRequest(policy));
+    } catch (error) {
+      const delay = DELEGATION_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !isRetryableDelegationConflict(error)) throw error;
+      reportClientEvent("warn", "delegation_serialization_retry", `attempt=${attempt + 1}`, actorId);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
 }
 
 export async function attachReceivedInputAuthority(input: {
@@ -194,56 +193,10 @@ export async function signOut(): Promise<void> {
     instance = null;
     try {
       localStorage.removeItem(LAST_ADDRESS_KEY);
-      localStorage.removeItem(DELEGATION_CACHE_KEY);
     } catch {
       // No-op.
     }
   }
-}
-
-function cachedDelegations(actorId: string, policy: FeedHostDelegationPolicy): CachedFeedHostDelegation | null {
-  let cached: CachedFeedHostDelegation | null = null;
-  try {
-    const raw = localStorage.getItem(DELEGATION_CACHE_KEY);
-    cached = raw ? JSON.parse(raw) as CachedFeedHostDelegation : null;
-  } catch {
-    clearCachedDelegations();
-    return null;
-  }
-  if (
-    !cached ||
-    cached.actorId !== actorId ||
-    cached.delegateDID !== policy.delegateDID ||
-    typeof cached.serializedDelegation !== "string"
-  ) return null;
-  const cachedByPath = new Map(cached.resources.map((resource) => [resource.path, resource]));
-  for (const resource of policy.resources) {
-    const match = cachedByPath.get(resource.path);
-    if (!match || !sameActions(match.actions, resource.actions)) return null;
-  }
-  return cached;
-}
-
-function saveCachedDelegations(cached: CachedFeedHostDelegation): void {
-  try {
-    localStorage.setItem(DELEGATION_CACHE_KEY, JSON.stringify(cached));
-  } catch {
-    // Delegation cache is a convenience; wallet-mode sign-in can recreate it.
-  }
-}
-
-function clearCachedDelegations(): void {
-  try {
-    localStorage.removeItem(DELEGATION_CACHE_KEY);
-  } catch {
-    // No-op.
-  }
-}
-
-function sameActions(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) return false;
-  const granted = new Set(left);
-  return right.every((action) => granted.has(action));
 }
 
 function reconnectRequiredError(cause?: unknown): FeedReconnectRequiredError {
