@@ -452,6 +452,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const body = await readJsonObject(request, "invalid_delegation", "delegation body must be JSON");
     const serializedDelegation = readString(body, "serializedDelegation", "invalid_delegation", "serializedDelegation is required");
     const payloadActorId = optionalString(body.actorId);
+    const activationStartedAt = performance.now();
     const activated = await retryTinyCloudTransaction(
       "delegation_activate",
       undefined,
@@ -470,6 +471,11 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         }
       }
       throw error;
+    });
+    logEvent("info", "feed_delegation_activated", {
+      actor: activated.actorId,
+      ms: Math.round(performance.now() - activationStartedAt),
+      resources: activated.resources.length,
     });
     if (payloadActorId && !actorIdsMatch(payloadActorId, activated.actorId)) {
       throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
@@ -500,7 +506,8 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         : state;
       if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, actor);
       if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
-        await retryTinyCloudTransaction(
+        const persistenceStartedAt = performance.now();
+        void retryTinyCloudTransaction(
           "delegation_persist",
           activated.actorId,
           () => persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
@@ -509,7 +516,18 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
             acceptedAt: activated.acceptedAt,
             expiresAt: activated.expiresAt,
           }),
-        );
+        ).then(() => {
+          logEvent("info", "feed_delegation_persisted", {
+            actor: activated.actorId,
+            ms: Math.round(performance.now() - persistenceStartedAt),
+          });
+        }).catch((error) => {
+          logEvent("warn", "feed_delegation_persist_failed", {
+            actor: activated.actorId,
+            ms: Math.round(performance.now() - persistenceStartedAt),
+            ...errorLogFields(error),
+          });
+        });
       }
       if (!currentProofComplete) {
         return json({

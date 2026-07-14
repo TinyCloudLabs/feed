@@ -385,7 +385,37 @@ describe("Feed Host server", () => {
 
     await grantAllDelegations(runtime, ACTOR_ID);
     expect(activations).toBe(3);
+    for (let attempt = 0; attempt < 30 && saves < 3; attempt += 1) await Bun.sleep(50);
     expect(saves).toBe(3);
+  });
+
+  test("does not block the browser session on delegation-store persistence", async () => {
+    const store = fakeDelegationStore();
+    let releaseSave: (() => void) | undefined;
+    const blockedSave = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    store.save = async () => blockedSave;
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+
+    const request = postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    });
+    const response = await Promise.race([request, Bun.sleep(100).then(() => null)]);
+    expect(response).not.toBeNull();
+    expect(response?.status).toBe(202);
+    expect(response?.headers.get("set-cookie")).toContain("feed_session=");
+    releaseSave?.();
   });
 
   test("exposes failed backend preparation and retries it through the actor session", async () => {

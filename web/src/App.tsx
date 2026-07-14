@@ -577,7 +577,10 @@ function SetupScreen({ stage, setup }: { stage: SetupStage; setup: FeedHostSetup
           </li>
           <li className={contextReady ? "complete" : "current"}>
             <span className="progress-mark" aria-hidden="true">{contextReady ? "✓" : ""}</span>
-            <span><strong>Context connected</strong><small>Allowed sources are readable.</small></span>
+            <span>
+              <strong>{contextReady ? "Context connected" : "Connecting context"}</strong>
+              <small>{contextReady ? "Allowed sources are readable." : "Activating secure access with Feed…"}</small>
+            </span>
           </li>
           <li className={contextReady ? "current" : "pending"}>
             <span className="progress-mark" aria-hidden="true" />
