@@ -164,6 +164,7 @@ describe("Feed Host server", () => {
         "/feedback",
         "/control-intents",
         "/preferences",
+        "/workflows",
         "/generation-requests",
         "/generation-requests/{requestId}/cancel",
         "/api/worker/generation-requests/claim",
@@ -1658,6 +1659,101 @@ describe("Feed Host skill credential settings", () => {
   });
 });
 
+describe("Feed Host workflow routines", () => {
+  test("GET /workflows lists admitted starters with presentation, run summary, and no raw authority", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const unauthenticated = await fetch(`${runtime.url}/workflows`);
+    expect(unauthenticated.status).toBe(401);
+
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+    const response = await fetch(`${runtime.url}/workflows?limit=50`, {
+      headers: { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    });
+    expect(response.status).toBe(200);
+    const bodyText = await response.text();
+    const body = JSON.parse(bodyText) as {
+      items: Array<{
+        packageId: string;
+        displayName: string;
+        paused: boolean;
+        disabled: boolean;
+        presentation?: { purpose: string; triggerLabel: string; cadenceLabel: string };
+        lastRun?: { status: string; startedAt: string };
+      }>;
+    };
+
+    // The six reviewed starters are admitted at bootstrap, before any run.
+    const ids = body.items.map((item) => item.packageId);
+    for (const starter of [
+      "feed-daily-brief",
+      "feed-short-insights",
+      "feed-exception-alert",
+      "feed-synthesis-report",
+      "feed-decision-memo",
+      "feed-playbook",
+    ]) {
+      expect(ids).toContain(starter);
+    }
+
+    const dailyBrief = body.items.find((item) => item.packageId === "feed-daily-brief")!;
+    expect(dailyBrief.displayName).toBe("Daily Brief");
+    expect(dailyBrief.paused).toBe(false);
+    expect(dailyBrief.presentation?.purpose.length).toBeGreaterThan(0);
+    expect(dailyBrief.presentation?.triggerLabel).toBe("Runs once a day");
+    expect(dailyBrief.lastRun).toBeUndefined();
+
+    // The seeded fixture package has run once and reports a summary.
+    const seeded = body.items.find((item) => item.displayName === "Weekly Product Brief");
+    expect(seeded?.lastRun?.status).toBe("published");
+
+    // Raw authority material stays out of the routine list.
+    expect(bodyText).not.toContain("sha256:");
+    expect(bodyText).not.toContain("manifestKey");
+    expect(bodyText).not.toContain("workflowDigest");
+    expect(bodyText).not.toContain("did:key");
+  });
+
+  test("pausing a routine through control intents is reflected in /workflows", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const pause = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-pause-001",
+        readerNonce: "wf-pause-nonce-001",
+        intentKind: "pause_package",
+        targetRef: "package:feed-daily-brief",
+        createdAt: "2026-07-14T22:00:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(pause.ok).toBe(true);
+
+    const body = await getJson<{ items: Array<{ packageId: string; paused: boolean }> }>(
+      `${runtime.url}/workflows?limit=50`,
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(body.items.find((item) => item.packageId === "feed-daily-brief")?.paused).toBe(true);
+  });
+});
+
 class FakeFeedHostStorage {
   private readonly artifactIndex = new Map<string, StoredArtifactIndexRow>();
   private readonly artifacts = new Map<string, FeedArtifact>();
@@ -1668,9 +1764,89 @@ class FakeFeedHostStorage {
   private readonly controlIntents: StoredControlIntentRow[] = [];
   private readonly generationRequests: StoredGenerationRequestRow[] = [];
   private readonly skillCredentials = new Map<string, FakeSkillRecord>();
+  private readonly packages = new Map<string, StoredWorkflowPackageRow>();
 
   async bootstrapSchema(_actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
     return emptyMigrationSummary();
+  }
+
+  async ensureWorkflowPackages(
+    _actor: FeedHostActorStorage,
+    packages: Array<{
+      packageId: string;
+      displayName: string;
+      version: string;
+      admissionState: string;
+      disclosure: Record<string, unknown>;
+    }>,
+    now: string,
+  ): Promise<void> {
+    for (const pkg of packages) {
+      if (this.packages.has(pkg.packageId)) continue;
+      this.packages.set(pkg.packageId, {
+        package_id: pkg.packageId,
+        display_name: pkg.displayName,
+        version: pkg.version,
+        admission_state: pkg.admissionState,
+        disclosure_json: JSON.stringify(pkg.disclosure),
+        enabled_at: now,
+        paused_at: null,
+        updated_at: now,
+      });
+    }
+  }
+
+  async listWorkflows(
+    _actor: FeedHostActorStorage,
+    input: { actorId: string; limit: number; cursor?: string },
+  ): Promise<{ items: Array<Record<string, unknown>>; nextCursor?: string }> {
+    const offset = input.cursor ? Number(input.cursor) : 0;
+    if (!Number.isInteger(offset) || offset < 0) throw new Error("cursor must be a non-negative integer offset");
+    const limit = Math.max(1, Math.min(input.limit, 100));
+    const sorted = [...this.packages.values()].sort((left, right) =>
+      left.display_name.localeCompare(right.display_name) || left.package_id.localeCompare(right.package_id),
+    );
+    const page = sorted.slice(offset, offset + limit);
+    const items = page.map((row) => {
+      const latestRun = [...this.runs.values()]
+        .filter((run) => run.package_id === row.package_id)
+        .sort((left, right) => right.started_at.localeCompare(left.started_at))[0];
+      const example = [...this.projections.values()]
+        .filter((projection) => projection.packageId === row.package_id && projection.visibility === "ranked")
+        .sort((left, right) => right.publishedAt.localeCompare(left.publishedAt))[0];
+      const preferences = this.preferenceProfiles.get(`${input.actorId.toLowerCase()}:package:${row.package_id}`)?.value;
+      return {
+        packageId: row.package_id,
+        displayName: row.display_name,
+        version: row.version,
+        admissionState: row.admission_state,
+        disclosure: JSON.parse(row.disclosure_json) as Record<string, unknown>,
+        paused: preferences?.paused === true || row.paused_at !== null,
+        disabled: preferences?.disabled === true,
+        cadence: preferences?.cadence,
+        enabledAt: row.enabled_at,
+        updatedAt: row.updated_at,
+        ...(latestRun
+          ? {
+              lastRun: {
+                runId: latestRun.run_id,
+                status: latestRun.status,
+                startedAt: latestRun.started_at,
+                finishedAt: latestRun.finished_at,
+                durationMs:
+                  latestRun.finished_at === null
+                    ? null
+                    : Math.max(0, Date.parse(latestRun.finished_at) - Date.parse(latestRun.started_at)),
+                publishedArtifactCount: 0,
+              },
+            }
+          : {}),
+        ...(example
+          ? { example: { artifactId: example.artifactId, title: null, publishedAt: example.publishedAt } }
+          : {}),
+      };
+    });
+    return { items, nextCursor: sorted.length > offset + limit ? String(offset + limit) : undefined };
   }
 
   async hasArtifacts(_actor: FeedHostActorStorage): Promise<boolean> {
@@ -2201,6 +2377,20 @@ class FakeFeedHostStorage {
           updatedAt: String(row.values.updated_at),
         });
         break;
+      case "workflow_package_state":
+        if (!this.packages.has(String(row.values.package_id))) {
+          this.packages.set(String(row.values.package_id), {
+            package_id: String(row.values.package_id),
+            display_name: String(row.values.display_name),
+            version: String(row.values.version),
+            admission_state: String(row.values.admission_state),
+            disclosure_json: String(row.values.disclosure_json),
+            enabled_at: row.values.enabled_at === null ? null : String(row.values.enabled_at),
+            paused_at: row.values.paused_at === null ? null : String(row.values.paused_at),
+            updated_at: String(row.values.updated_at),
+          });
+        }
+        break;
       case "workflow_run_index":
         this.runs.set(String(row.values.run_id), {
           run_id: String(row.values.run_id),
@@ -2278,6 +2468,17 @@ type StoredArtifactIndexRow = {
   source_fingerprint: string;
   doc_key: string;
   published_at: string;
+  updated_at: string;
+};
+
+type StoredWorkflowPackageRow = {
+  package_id: string;
+  display_name: string;
+  version: string;
+  admission_state: string;
+  disclosure_json: string;
+  enabled_at: string | null;
+  paused_at: string | null;
   updated_at: string;
 };
 

@@ -49,6 +49,7 @@ import {
   type InputAuthorityRevoker,
   type InputAuthorityTruthCheck,
 } from "./input-authority.ts";
+import { REVIEWED_STARTER_PACKAGES, starterPackageById } from "../../artifactory/skills/_shared/lib/starter-packages.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
   FeedHostError,
@@ -803,6 +804,29 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     );
   }
 
+  if (request.method === "GET" && url.pathname === "/workflows") {
+    const actor = await requireCompleteActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
+      throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
+    }
+    const page = await storage.listWorkflows(actorStorage(actor), {
+      actorId: actor.actorId,
+      limit,
+      cursor,
+    });
+    // Presentation copy is static per reviewed package version and never
+    // stored per-actor; merge it from the reviewed starter module.
+    return json({
+      ...page,
+      items: page.items.map((item) => ({
+        ...item,
+        presentation: item.presentation ?? starterPackageById(item.packageId)?.presentation,
+      })),
+    });
+  }
+
   const skillCredentialsMatch = url.pathname.match(/^\/skills\/([^/]+)\/credentials$/);
   if (request.method === "PATCH" && skillCredentialsMatch) {
     const actor = await requireCompleteActor(request, context);
@@ -1353,6 +1377,11 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
     const ready = (async () => {
       const access = actorStorage(actor);
       await retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access));
+      // Admit the reviewed starter pack so routines exist before any run
+      // (TC-182); only missing packages insert, preserving pause state.
+      await retryTinyCloudTransaction("starter_packages", actor.actorId, () =>
+        storage.ensureWorkflowPackages(access, REVIEWED_STARTER_PACKAGES, new Date().toISOString()),
+      );
       if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
         await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
       }

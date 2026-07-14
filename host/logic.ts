@@ -697,6 +697,9 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
         get: { responses: { 200: { description: "preferences", content: jsonResponse } } },
         put: { responses: { 200: { description: "updated", content: jsonResponse }, 409: { description: "version conflict", content: jsonResponse } } },
       },
+      "/workflows": {
+        get: { responses: { 200: { description: "workflow routines", content: jsonResponse } } },
+      },
       "/generation-requests": {
         get: { responses: { 200: { description: "generation requests", content: jsonResponse } } },
       },
