@@ -570,12 +570,23 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       description: "Feed Host API for projection, preferences, control intents, and generation requests.",
     },
     servers: [{ url: "/" }],
+    security: [{ actorSession: [] }],
+    components: {
+      securitySchemes: {
+        actorSession: {
+          type: "apiKey",
+          in: "cookie",
+          name: "__Host-feed_session",
+          description: "Opaque HttpOnly actor session issued after POST /api/delegations.",
+        },
+      },
+    },
     paths: {
       "/health": {
-        get: { responses: { 200: { description: "health", content: jsonResponse } } },
+        get: { security: [], responses: { 200: { description: "health", content: jsonResponse } } },
       },
       "/delegation-policy": {
-        get: { responses: { 200: { description: "delegation policy", content: jsonResponse } } },
+        get: { security: [], responses: { 200: { description: "delegation policy", content: jsonResponse } } },
       },
       "/api/server-info": {
         get: {
@@ -588,7 +599,7 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
         },
       },
       "/api/delegations": {
-        post: { responses: { 200: { description: "active", content: jsonResponse }, 202: { description: "activation pending", content: jsonResponse } } },
+        post: { security: [], responses: { 200: { description: "active and actor session established", content: jsonResponse }, 202: { description: "activation pending", content: jsonResponse } } },
         delete: { responses: { 204: { description: "removed" } } },
       },
       "/api/delegations/status": {

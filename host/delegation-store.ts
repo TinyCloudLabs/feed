@@ -19,8 +19,8 @@ export type StoredFeedDelegationRecord = {
  * Persists accepted Feed Host delegations in the host's own TinyCloud KV
  * space so accepted actors survive restarts (same pattern as the Listen
  * backend delegation store). Only meaningful with a stable host identity
- * (FEED_HOST_PRIVATE_KEY): a generated session DID cannot reactivate
- * delegations minted for a previous DID.
+ * (FEED_HOST_PRIVATE_KEY or a volume-backed FEED_HOST_STATE_DIR): a generated
+ * session DID cannot reactivate delegations minted for a previous DID.
  */
 export class FeedHostDelegationStore {
   private session: Promise<unknown> | null = null;

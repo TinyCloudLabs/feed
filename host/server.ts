@@ -41,6 +41,7 @@ import {
 } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
 import { levelForStatus, logEvent } from "./log.ts";
+import { ensureFeedHostPrivateKey } from "./host-key.ts";
 import {
   InputAuthorityRegistry,
   type InputAuthorityInspector,
@@ -78,6 +79,8 @@ export type FeedHostServerOptions = {
   checkInputAuthority?: InputAuthorityTruthCheck;
   revokeInputAuthority?: InputAuthorityRevoker;
   inputAuthorityExpectedHost?: string;
+  requireActorSession?: boolean;
+  allowedOrigins?: string[];
 };
 
 export type FeedHostRuntime = {
@@ -109,6 +112,8 @@ type FeedHostContext = {
   checkInputAuthority: InputAuthorityTruthCheck;
   revokeInputAuthority: InputAuthorityRevoker;
   inputAuthorityExpectedHost: string;
+  requireActorSession: boolean;
+  actorSessions: Map<string, { actorKey: string; expiresAt: string; policyHash: string }>;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -130,6 +135,8 @@ const JSON_HEADERS = {
 };
 
 const FEEDBACK_NOTE_MAX_CHARS = 1024;
+const TINYCLOUD_TRANSACTION_RETRY_DELAYS_MS = [250, 750, 1500, 3000, 6000];
+const MAX_ACTOR_SESSIONS = 5;
 
 const SSE_HEADERS = {
   ...CORS_HEADERS,
@@ -196,6 +203,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         ? new FeedHostDelegationStore(hostNode)
         : null;
   const actors = new Map<string, ActorState>();
+  const actorRequestQueues = new Map<string, Promise<void>>();
   const inputAuthorities = new InputAuthorityRegistry();
   const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
   const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
@@ -234,6 +242,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       checkInputAuthority,
       revokeInputAuthority,
       inputAuthorityExpectedHost: options.inputAuthorityExpectedHost ?? options.tinycloudHost ?? "https://node.tinycloud.xyz",
+      requireActorSession: options.requireActorSession !== false,
+      actorSessions: new Map(),
     };
     return context;
   };
@@ -243,24 +253,39 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     hostname: options.hostname,
     // TinyCloud round-trips can exceed Bun's default idle timeout.
     idleTimeout: 120,
+    maxRequestBodySize: 1024 * 1024,
     async fetch(request) {
+      const url = new URL(request.url);
+      const privateRoute = requiresActorSession(request, url);
+      const finish = (response: Response) => applyResponsePolicy(
+        response,
+        request,
+        options.allowedOrigins,
+        privateRoute,
+        options.requireActorSession !== false,
+      );
+      if (!isAllowedOrigin(request, options.allowedOrigins, options.requireActorSession !== false)) {
+        return finish(jsonError(403, "origin_denied", "browser origin is not allowed"));
+      }
       if (request.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: CORS_HEADERS });
+        return finish(new Response(null, { status: 204, headers: CORS_HEADERS }));
       }
 
-      const url = new URL(request.url);
       const startedAt = performance.now();
-      const logRequest = (response: Response, errorCode?: string) => {
-        if (request.method === "GET" && PUBLIC_PATHS.has(url.pathname)) return response;
+      let authenticatedActor: string | undefined;
+      const logRequest = (response: Response, errorCode?: string, error?: unknown) => {
+        const finished = finish(response);
+        if (request.method === "GET" && PUBLIC_PATHS.has(url.pathname)) return finished;
         logEvent(levelForStatus(response.status), "http_request", {
           method: request.method,
           path: url.pathname,
           status: response.status,
           ms: Math.round(performance.now() - startedAt),
-          actor: request.headers.get("x-feed-actor-id") ?? undefined,
+          actor: authenticatedActor,
           ...(errorCode ? { code: errorCode } : {}),
+          ...(error ? errorLogFields(error) : {}),
         });
-        return response;
+        return finished;
       };
 
       const publicRoute = PUBLIC_PATHS.has(url.pathname);
@@ -269,11 +294,26 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       }
 
       try {
-        return logRequest(await route(request, await getContext()));
+        const currentContext = await getContext();
+        let routedRequest = request;
+        if (privateRoute && currentContext.requireActorSession) {
+          authenticatedActor = authenticatedSessionActor(request, currentContext);
+          if (!authenticatedActor) {
+            return logRequest(jsonError(401, "unauthorized", "missing or invalid actor session"), "unauthorized");
+          }
+          routedRequest = bindAuthenticatedActor(request, authenticatedActor);
+        }
+        const runRoute = () => request.method === "GET" && authenticatedActor
+          ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
+          : route(routedRequest, currentContext);
+        const response = authenticatedActor
+          ? await serializeActorRequest(actorRequestQueues, authenticatedActor, runRoute)
+          : await runRoute();
+        return logRequest(response);
       } catch (error) {
         const errorCode =
           error instanceof FeedHostError ? error.code : error instanceof FeedDelegationError ? error.code : "internal_error";
-        return logRequest(mapError(error, url.pathname), errorCode);
+        return logRequest(mapError(error, url.pathname), errorCode, error);
       }
     },
   });
@@ -350,17 +390,24 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   if (request.method === "DELETE" && url.pathname === "/api/delegations") {
     const actorId = requireRequestActorId(request);
     await removeDelegation(context, actorId);
-    return new Response(null, { status: 204, headers: CORS_HEADERS });
+    return new Response(null, {
+      status: 204,
+      headers: { ...CORS_HEADERS, "set-cookie": clearedActorSessionCookie(request) },
+    });
   }
 
   if (request.method === "POST" && url.pathname === "/api/delegations") {
     const body = await readJsonObject(request, "invalid_delegation", "delegation body must be JSON");
     const serializedDelegation = readString(body, "serializedDelegation", "invalid_delegation", "serializedDelegation is required");
     const payloadActorId = optionalString(body.actorId);
-    const activated = await activateDelegation({
-      serializedDelegation,
-      expectedDelegateDID: policy.delegateDID,
-    }).catch((error) => {
+    const activated = await retryTinyCloudTransaction(
+      "delegation_activate",
+      undefined,
+      () => activateDelegation({
+        serializedDelegation,
+        expectedDelegateDID: policy.delegateDID,
+      }),
+    ).catch((error) => {
       if (error instanceof FeedDelegationError) {
         if (error.code === "malformed") throw new FeedHostError(error.message, 400, "invalid_delegation");
         if (error.code === "expired" || error.code === "delegation_stale") {
@@ -377,35 +424,56 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     }
 
     const actorKey = normalizeActorId(activated.actorId);
-    const existing = actors.get(actorKey);
-    const resources = [...new Set([...(existing?.resources ?? []), ...activated.resources])];
-    const accessByResource = new Map(existing?.accessByResource);
+    const prior = actors.get(actorKey);
+    const existing = prior && !isDelegationExpired(prior) ? prior : undefined;
+    const currentProofComplete = policy.resources.every((resource) => activated.resources.includes(resource.path));
+    const resources = currentProofComplete
+      ? [...activated.resources]
+      : [...new Set([...(existing?.resources ?? []), ...activated.resources])];
+    const accessByResource = new Map(currentProofComplete ? undefined : existing?.accessByResource);
     for (const resource of activated.resources) accessByResource.set(resource, activated.access);
     const state: ActorState = {
       actorId: activated.actorId,
       acceptedAt: activated.acceptedAt,
-      expiresAt: activated.expiresAt,
+      expiresAt: currentProofComplete ? activated.expiresAt : earliestExpiry(existing?.expiresAt, activated.expiresAt),
       resources,
       accessByResource,
-      storageAccess: existing?.storageAccess,
-      ready: existing?.ready,
+      storageAccess: currentProofComplete ? undefined : existing?.storageAccess,
+      ready: currentProofComplete ? undefined : existing?.ready,
     };
-    actors.set(actorKey, state);
-    if (delegationStore) {
-      await persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
-        serializedDelegation,
-        resources: activated.resources,
-        acceptedAt: activated.acceptedAt,
-        expiresAt: activated.expiresAt,
-      });
+    if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, state);
+    if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
+      await retryTinyCloudTransaction(
+        "delegation_persist",
+        activated.actorId,
+        () => persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
+          serializedDelegation,
+          resources: activated.resources,
+          acceptedAt: activated.acceptedAt,
+          expiresAt: activated.expiresAt,
+        }),
+      );
     }
-    if (hasCompleteFeedHostDelegation(state)) await ensureActorReady(storage, state, seedOnStart);
+    if (!currentProofComplete) {
+      return json({
+        accepted: true,
+        actorId: activated.actorId,
+        resources: activated.resources,
+        policyHash,
+        status: "activation_pending",
+      }, 202);
+    }
+    await ensureActorReady(storage, state, seedOnStart);
+    const sessionToken = issueActorSession(context, actorKey, state.expiresAt);
     return json({
       accepted: true,
       actorId: activated.actorId,
       resources,
       policyHash,
-      status: hasCompleteFeedHostDelegation(state) ? "active" : "activation_pending",
+      status: "active",
+    }, 200, {
+      "set-cookie": actorSessionCookie(sessionToken, request, state.expiresAt),
+      "cache-control": "private, no-store",
     });
   }
 
@@ -454,7 +522,6 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   if (request.method === "POST" && url.pathname === "/api/client-events") {
     const body = await readJsonObject(request, "invalid_client_event", "client event body must be JSON");
     const entries = Array.isArray(body.events) ? body.events.slice(0, 20) : [body];
-    const actor = optionalString(request.headers.get("x-feed-actor-id"));
     let accepted = 0;
     for (const entry of entries) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
@@ -464,7 +531,6 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       const level = record.level === "error" || record.level === "warn" ? record.level : "info";
       logEvent(level, `client_${eventName.slice(0, 64)}`, {
         source: "web",
-        ...(actor ? { actor } : {}),
         ...(optionalString(record.detail) ? { detail: optionalString(record.detail)!.slice(0, 500) } : {}),
       });
       accepted += 1;
@@ -719,6 +785,134 @@ function authorized(request: Request, token: string | undefined): boolean {
   return request.headers.get("authorization") === `Bearer ${token}`;
 }
 
+function isAllowedOrigin(request: Request, allowedOrigins: string[] | undefined, requireActorSession: boolean): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return true;
+  if (!allowedOrigins) return !requireActorSession;
+  return allowedOrigins.includes(origin);
+}
+
+function applyResponsePolicy(
+  response: Response,
+  request: Request,
+  allowedOrigins: string[] | undefined,
+  privateRoute: boolean,
+  requireActorSession: boolean,
+): Response {
+  const headers = new Headers(response.headers);
+  if (allowedOrigins || requireActorSession) {
+    headers.delete("access-control-allow-origin");
+    const origin = request.headers.get("origin");
+    if (origin && allowedOrigins?.includes(origin)) {
+      headers.set("access-control-allow-origin", origin);
+      headers.set("access-control-allow-credentials", "true");
+      headers.append("vary", "Origin");
+    }
+  }
+  if (privateRoute) headers.set("cache-control", "private, no-store");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function requiresActorSession(request: Request, url: URL): boolean {
+  if (PUBLIC_PATHS.has(url.pathname)) return false;
+  if (request.method === "POST" && (url.pathname === "/api/delegations" || url.pathname === "/api/client-events")) {
+    return false;
+  }
+  return true;
+}
+
+function authenticatedSessionActor(request: Request, context: FeedHostContext): string | undefined {
+  const token = actorSessionToken(request);
+  if (!token) return undefined;
+  const session = context.actorSessions.get(token);
+  if (!session || session.policyHash !== context.policyHash) return undefined;
+  if (Date.parse(session.expiresAt) <= Date.now()) {
+    context.actorSessions.delete(token);
+    return undefined;
+  }
+  const actor = context.actors.get(session.actorKey);
+  if (!actor) return undefined;
+  const claimedActor = request.headers.get("x-feed-actor-id");
+  if (claimedActor && !actorIdsMatch(claimedActor, actor.actorId)) return undefined;
+  return actor.actorId;
+}
+
+function issueActorSession(context: FeedHostContext, actorKey: string, expiresAt: string): string {
+  const now = Date.now();
+  const existingActorTokens: string[] = [];
+  for (const [existingToken, session] of context.actorSessions) {
+    if (Date.parse(session.expiresAt) <= now) {
+      context.actorSessions.delete(existingToken);
+    } else if (session.actorKey === actorKey) {
+      existingActorTokens.push(existingToken);
+    }
+  }
+  for (const existingToken of existingActorTokens.slice(0, Math.max(0, existingActorTokens.length - MAX_ACTOR_SESSIONS + 1))) {
+    context.actorSessions.delete(existingToken);
+  }
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const token = Buffer.from(bytes).toString("base64url");
+  context.actorSessions.set(token, { actorKey, expiresAt, policyHash: context.policyHash });
+  return token;
+}
+
+function bindAuthenticatedActor(request: Request, actorId: string): Request {
+  const headers = new Headers(request.headers);
+  headers.set("x-feed-actor-id", actorId);
+  return new Request(request, { headers });
+}
+
+function actorSessionToken(request: Request): string | undefined {
+  const cookie = request.headers.get("cookie");
+  if (!cookie) return undefined;
+  for (const part of cookie.split(";")) {
+    const [name, ...value] = part.trim().split("=");
+    if (name === "__Host-feed_session" || name === "feed_session") return value.join("=") || undefined;
+  }
+  return undefined;
+}
+
+function actorSessionCookie(token: string, request: Request, expiresAt: string): string {
+  const secure = requestIsSecure(request);
+  const name = secure ? "__Host-feed_session" : "feed_session";
+  const sameSite = secure && isCrossSiteOrigin(request) ? "None" : secure ? "Strict" : "Lax";
+  return `${name}=${token}; Path=/; HttpOnly; ${secure ? "Secure; " : ""}SameSite=${sameSite}; Expires=${new Date(expiresAt).toUTCString()}`;
+}
+
+function clearedActorSessionCookie(request: Request): string {
+  const secure = requestIsSecure(request);
+  const name = secure ? "__Host-feed_session" : "feed_session";
+  return `${name}=; Path=/; HttpOnly; ${secure ? "Secure; " : ""}SameSite=${secure ? "None" : "Lax"}; Max-Age=0`;
+}
+
+function requestIsSecure(request: Request): boolean {
+  return new URL(request.url).protocol === "https:" || request.headers.get("x-forwarded-proto") === "https";
+}
+
+function isCrossSiteOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return false;
+  try {
+    return registrableSite(new URL(origin).hostname) !== registrableSite(new URL(request.url).hostname);
+  } catch {
+    return true;
+  }
+}
+
+function registrableSite(hostname: string): string {
+  const labels = hostname.toLowerCase().split(".");
+  return labels.length > 1 ? labels.slice(-2).join(".") : hostname.toLowerCase();
+}
+
+function earliestExpiry(left: string | undefined, right: string): string {
+  if (!left) return right;
+  return Date.parse(left) <= Date.parse(right) ? left : right;
+}
+
 async function requireCompleteActor(request: Request, context: FeedHostContext): Promise<ActorState> {
   const actorId = requireRequestActorId(request);
   return requireDelegationAndReady(context, actorId);
@@ -788,6 +982,9 @@ async function persistAcceptedDelegation(
 async function removeDelegation(context: FeedHostContext, actorId: string): Promise<void> {
   const actorKey = normalizeActorId(actorId);
   context.actors.delete(actorKey);
+  for (const [token, session] of context.actorSessions) {
+    if (session.actorKey === actorKey) context.actorSessions.delete(token);
+  }
   if (context.delegationStore) {
     await context.delegationStore.remove(actorKey);
   }
@@ -974,16 +1171,60 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
 
 async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, seedOnStart: boolean): Promise<void> {
   if (!actor.ready) {
-    actor.ready = (async () => {
+    const ready = (async () => {
       const access = actorStorage(actor);
-      await storage.bootstrapSchema(access);
-      if (seedOnStart && !(await storage.hasArtifacts(access))) {
-        await seedDefaultFeed(storage, access);
+      await retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access));
+      if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
+        await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
       }
-      await storage.reconcileFeedProjection(access);
+      await retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access));
     })();
+    actor.ready = ready;
+    ready.catch(() => {
+      if (actor.ready === ready) actor.ready = undefined;
+    });
   }
   await actor.ready;
+}
+
+async function retryTinyCloudTransaction<T>(operation: string, actorId: string | undefined, run: () => Promise<T>): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await run();
+    } catch (error) {
+      const delay = TINYCLOUD_TRANSACTION_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined || !isTinyCloudSerializationConflict(error)) throw error;
+      logEvent("warn", "tinycloud_transaction_retry", {
+        ...(actorId ? { actor: actorId } : {}),
+        operation,
+        attempt: attempt + 1,
+        delayMs: delay,
+      });
+      await Bun.sleep(delay);
+    }
+  }
+}
+
+async function serializeActorRequest<T>(
+  queues: Map<string, Promise<void>>,
+  actorId: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const actorKey = normalizeActorId(actorId);
+  const previous = queues.get(actorKey) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(run);
+  const tail = current.then(() => undefined, () => undefined);
+  queues.set(actorKey, tail);
+  try {
+    return await current;
+  } finally {
+    if (queues.get(actorKey) === tail) queues.delete(actorKey);
+  }
+}
+
+export function isTinyCloudSerializationConflict(error: unknown): boolean {
+  const detail = (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).toLowerCase();
+  return detail.includes("could not serialize access") || detail.includes("read/write dependencies among transactions");
 }
 
 async function readJsonObject(request: Request, code: string, message: string): Promise<Record<string, unknown>> {
@@ -1286,11 +1527,16 @@ function mapError(error: unknown, pathname: string): Response {
     return json({ error: { code: error.code, message: error.message } }, 403);
   }
 
-  const message = error instanceof Error ? error.message : String(error);
   if (pathname === "/api/server-info" || pathname === "/api/openapi.json" || pathname === "/delegation-policy" || pathname === "/health") {
-    return json({ error: { code: "unavailable", message } }, 503);
+    return json({ error: { code: "unavailable", message: "service unavailable" } }, 503);
   }
-  return json({ error: { code: "internal_error", message } }, 500);
+  return json({ error: { code: "internal_error", message: "internal service error" } }, 500);
+}
+
+function errorLogFields(error: unknown): { errorClass: string; errorMessage: string } {
+  const errorClass = error instanceof Error ? error.name : typeof error;
+  const errorMessage = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+  return { errorClass, errorMessage };
 }
 
 function etagMatches(headerValue: string | null, etag: string): boolean {
@@ -1319,14 +1565,21 @@ function resolveRequestActorId(request: Request, bodyActorId: unknown): string {
 }
 
 function optionsFromEnv(): FeedHostServerOptions {
+  const stateDir = process.env.FEED_HOST_STATE_DIR;
+  const allowedOrigins = process.env.FEED_HOST_ALLOWED_ORIGINS
+    ?.split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean);
   return {
     port: Number(process.env.FEED_HOST_PORT ?? "8787"),
     hostname: process.env.FEED_HOST_HOSTNAME ?? "127.0.0.1",
     token: process.env.FEED_HOST_TOKEN || undefined,
     tinycloudHost: process.env.TINYCLOUD_HOST || process.env.VITE_TINYCLOUD_HOST || undefined,
-    hostPrivateKey: process.env.FEED_HOST_PRIVATE_KEY || undefined,
+    hostPrivateKey: process.env.FEED_HOST_PRIVATE_KEY || (stateDir ? ensureFeedHostPrivateKey(stateDir) : undefined),
     seedOnStart: process.env.FEED_HOST_SEED !== "0",
     enableDevPublisher: process.env.FEED_HOST_DEV_PUBLISH === "1",
+    requireActorSession: true,
+    allowedOrigins: allowedOrigins?.length ? allowedOrigins : undefined,
   };
 }
 

@@ -89,15 +89,23 @@ describe("FeedV1HostClient", () => {
   });
 
   test("fetches delegation policy, submits portable delegation, and disconnects", async () => {
-    const calls: { url: string; body?: unknown }[] = [];
+    const calls: { url: string; body?: unknown; credentials?: RequestCredentials }[] = [];
     const client = new FeedV1HostClient({
       baseUrl: "https://feed.example.test",
       fetchImpl: async (input, init) => {
-        calls.push({ url: String(input), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+        calls.push({
+          url: String(input),
+          body: init?.body ? JSON.parse(String(init.body)) : undefined,
+          credentials: init?.credentials,
+        });
         if (String(input).endsWith("/delegation-policy")) {
           return jsonResponse({ delegateDID: "did:key:feed-host", resources: [] });
         }
-        return jsonResponse({ accepted: true, actorId: "did:pkh:reader", resources: ["feed_index"] });
+        return jsonResponse({
+          accepted: true,
+          actorId: "did:pkh:reader",
+          resources: ["feed_index"],
+        });
       },
     });
 
@@ -111,12 +119,13 @@ describe("FeedV1HostClient", () => {
     expect(policy.delegateDID).toBe("did:key:feed-host");
     expect(receipt.accepted).toBe(true);
     expect(calls).toEqual([
-      { url: "https://feed.example.test/delegation-policy", body: undefined },
+      { url: "https://feed.example.test/delegation-policy", body: undefined, credentials: "include" },
       {
         url: "https://feed.example.test/api/delegations",
         body: { actorId: "did:pkh:reader", serializedDelegation: "{\"delegateDID\":\"did:key:feed-host\"}" },
+        credentials: "include",
       },
-      { url: "https://feed.example.test/api/delegations", body: undefined },
+      { url: "https://feed.example.test/api/delegations", body: undefined, credentials: "include" },
     ]);
   });
 

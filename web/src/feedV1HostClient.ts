@@ -230,7 +230,7 @@ export class FeedV1HostClient {
     if (init.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
     if (this.token) headers.set("authorization", `Bearer ${this.token}`);
     if (this.actorId) headers.set("x-feed-actor-id", this.actorId);
-    const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers });
+    const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, credentials: "include" });
     const text = await res.text();
     if (!res.ok) throw new FeedV1HostError(`Feed Host request failed: ${res.status}`, res.status, text);
     return text;

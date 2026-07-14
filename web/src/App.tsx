@@ -598,6 +598,7 @@ function formatHostError(error: unknown): string {
 // denied, or 409 delegation_stale — all recoverable by re-submitting.
 function isDelegationLostError(error: unknown): boolean {
   if (!(error instanceof FeedV1HostError)) return false;
+  if (error.status === 401) return error.body.includes("actor session");
   if (error.status === 409) return error.body.includes("delegation_stale");
   if (error.status === 403) return error.body.includes("insufficient_policy") || error.body.includes("denied");
   return false;

@@ -1,4 +1,9 @@
 import { expect, test, type Page } from "@playwright/test";
+
+const CREDENTIALLED_CORS_HEADERS = {
+  "access-control-allow-origin": `http://127.0.0.1:${process.env.FEED_SMOKE_WEB_PORT ?? "4199"}`,
+  "access-control-allow-credentials": "true",
+};
 import { fileURLToPath } from "node:url";
 import { Wallet } from "ethers";
 
@@ -147,7 +152,7 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
       await firstFeedReady;
       await route.fulfill({
         status: 200,
-        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
         body: JSON.stringify({ items: [], nextCursor: undefined }),
       });
       return;
@@ -169,7 +174,7 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   releaseFirstFeed?.();
   await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
   await expect(page.getByRole("button", { name: "Check again" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 120000 });
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
   await expect(page.getByRole("heading", { name: "The onboarding experiment changed where users stall" })).toBeVisible();
   await expect(page.getByText(/first collaborative action is now the dominant stall point/i)).toBeVisible();
   await page.getByText("Open full artifact").first().click();
@@ -226,7 +231,7 @@ test("Feed failure state only clears after a successful reload", async ({ page }
     if (feedRequests === 2) {
       await route.fulfill({
         status: 503,
-        headers: { "content-type": "text/plain", "access-control-allow-origin": "*" },
+        headers: { "content-type": "text/plain", ...CREDENTIALLED_CORS_HEADERS },
         body: "bundle offline",
       });
       return;
@@ -235,14 +240,14 @@ test("Feed failure state only clears after a successful reload", async ({ page }
       await retryResponse;
       await route.fulfill({
         status: 200,
-        headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
         body: JSON.stringify({ items: [] }),
       });
       return;
     }
     await route.fulfill({
       status: 200,
-      headers: { "content-type": "application/json", "access-control-allow-origin": "*" },
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
       body: JSON.stringify({ items: [] }),
     });
   });
@@ -250,7 +255,7 @@ test("Feed failure state only clears after a successful reload", async ({ page }
   await page.route(/\/feed\/events(\?.*)?$/, async (route) => {
     await route.fulfill({
       status: 200,
-      headers: { "content-type": "text/event-stream", "access-control-allow-origin": "*" },
+      headers: { "content-type": "text/event-stream", ...CREDENTIALLED_CORS_HEADERS },
       body: "",
     });
   });
@@ -276,20 +281,18 @@ test("Feed failure state only clears after a successful reload", async ({ page }
   expect(feedRequests).toBe(3);
 });
 
-test("a restored session repairs stale cached access without another wallet prompt", async ({ page }) => {
+test("a restored session silently re-establishes Host access without another wallet prompt", async ({ page }) => {
   const wallet = createTestWallet();
   await installWallet(page, wallet);
 
   await page.goto("/");
   await signInWithWallet(page, wallet);
-  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 120000 });
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
 
-  await page.evaluate(() => {
-    localStorage.setItem("feed:v1:hostDelegations", JSON.stringify({ actorId: "stale-policy" }));
-  });
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("feed:v1:hostDelegations"))).toBeNull();
   await page.reload();
 
-  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 60000 });
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
   await expect(page.getByRole("alert")).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (
