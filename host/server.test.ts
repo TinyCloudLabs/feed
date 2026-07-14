@@ -1659,6 +1659,34 @@ describe("Feed Host skill credential settings", () => {
   });
 });
 
+describe("Feed Host actor bootstrap serialization", () => {
+  test("concurrent delegation submissions never run overlapping bootstraps", async () => {
+    const storage = new OverlapTrackingStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const combined = policy.resources.map((resource) => resource.path).join("|");
+    const submit = () =>
+      postJson(
+        `${runtime.url}/api/delegations`,
+        { actorId: ACTOR_ID, serializedDelegation: combined },
+        { "content-type": "application/json" },
+      );
+
+    const responses = await Promise.all([submit(), submit(), submit()]);
+    for (const response of responses) expect(response.ok).toBe(true);
+    // Re-submissions may re-bootstrap, but never concurrently — overlapping
+    // chains serialization-conflict against real TinyCloud until they die.
+    expect(storage.bootstraps).toBeGreaterThanOrEqual(1);
+    expect(storage.maxActive).toBe(1);
+  });
+});
+
 describe("Feed Host workflow routines", () => {
   test("GET /workflows lists admitted starters with presentation, run summary, and no raw authority", async () => {
     const storage = new FakeFeedHostStorage();
@@ -2419,6 +2447,21 @@ class FakeFeedHostStorage {
     return this.generationRequests.find(
       (row) => row.actor_id === actorId && row.reader_nonce === readerNonce,
     )?.request_id;
+  }
+}
+
+class OverlapTrackingStorage extends FakeFeedHostStorage {
+  active = 0;
+  maxActive = 0;
+  bootstraps = 0;
+
+  override async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    this.active += 1;
+    this.bootstraps += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    this.active -= 1;
+    return super.bootstrapSchema(actor);
   }
 }
 
