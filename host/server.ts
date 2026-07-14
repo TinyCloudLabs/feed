@@ -344,7 +344,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           : request.method === "GET" && authenticatedActor
           ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
           : route(routedRequest, currentContext);
-        const response = authenticatedActor
+        const response = authenticatedActor && !isActorControlRoute(request.method, url.pathname)
           ? await serializeActorRequest(actorRequestQueues, authenticatedActor, runRoute)
           : await runRoute();
         return logRequest(response);
@@ -679,7 +679,14 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed") {
     const actor = await requireCompleteActor(request, context);
-    await storage.reconcileFeedProjection(actorStorage(actor));
+    try {
+      await storage.reconcileFeedProjection(actorStorage(actor));
+    } catch (error) {
+      logEvent("warn", "feed_reconcile_degraded", {
+        actor: actor.actorId,
+        ...errorLogFields(error),
+      });
+    }
     const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
@@ -690,7 +697,6 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed/events") {
     const actor = await requireCompleteActor(request, context);
-    await storage.reconcileFeedProjection(actorStorage(actor));
     const body = await storage.listFeedEvents(actorStorage(actor), optionalString(request.headers.get("last-event-id")));
     return new Response(body, { status: 200, headers: SSE_HEADERS });
   }
@@ -1039,6 +1045,10 @@ function requiresActorSession(request: Request, url: URL): boolean {
     return false;
   }
   return true;
+}
+
+function isActorControlRoute(method: string, pathname: string): boolean {
+  return pathname === "/api/delegations/status" || (method === "POST" && pathname === "/api/delegations/retry");
 }
 
 function authenticatedSessionActor(request: Request, context: FeedHostContext): string | undefined {

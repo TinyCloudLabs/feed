@@ -400,7 +400,13 @@ export class FeedHostStorage {
       const artifactId = row.target.artifactId;
       let artifactRequest = artifacts.get(artifactId);
       if (!artifactRequest) {
-        artifactRequest = this.getArtifact(actor, artifactId);
+        artifactRequest = this.getArtifact(actor, artifactId).catch((error) => {
+          console.warn("Feed Host skipped unavailable artifact doc during feed listing", {
+            artifactId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return null;
+        });
         artifacts.set(artifactId, artifactRequest);
       }
       return stripProjectionState(row, await artifactRequest);

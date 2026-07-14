@@ -467,6 +467,46 @@ describe("Feed Host server", () => {
     expect(storage.maxConcurrentReads).toBe(1);
   });
 
+  test("keeps setup status responsive while a feed read is blocked", async () => {
+    const storage = new BlockingFeedReadStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const cookie = await grantAllDelegations(runtime, ACTOR_ID);
+    const feed = fetch(`${runtime.url}/feed`, { headers: { cookie } });
+    await storage.started;
+
+    const status = await fetch(`${runtime.url}/api/delegations/status`, { headers: { cookie } });
+    expect(status.status).toBe(200);
+    expect(((await status.json()) as { setup: { state: string } }).setup.state).toBe("ready");
+
+    storage.release();
+    expect((await feed).status).toBe(200);
+  });
+
+  test("serves the current feed when read-time reconciliation is temporarily unavailable", async () => {
+    const storage = new ReadTimeReconcileFailureStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const feed = await fetch(`${runtime.url}/feed?limit=40`, { headers: { "x-feed-actor-id": ACTOR_ID } });
+    expect(feed.status).toBe(200);
+    const events = await fetch(`${runtime.url}/feed/events`, { headers: { "x-feed-actor-id": ACTOR_ID } });
+    expect(events.status).toBe(200);
+    expect(storage.reconcileAttempts).toBe(2);
+  });
+
   test("attaches, inspects, revokes, and removes a redacted named input authority", async () => {
     const data = new Map<string, unknown>();
     const access = {
@@ -2354,6 +2394,40 @@ class ConcurrentReadStorage extends FakeFeedHostStorage {
     } finally {
       this.activeReads -= 1;
     }
+  }
+}
+
+class BlockingFeedReadStorage extends FakeFeedHostStorage {
+  private resolveStarted: (() => void) | undefined;
+  private resolveRead: (() => void) | undefined;
+  readonly started = new Promise<void>((resolve) => {
+    this.resolveStarted = resolve;
+  });
+  private readonly blocked = new Promise<void>((resolve) => {
+    this.resolveRead = resolve;
+  });
+
+  override async listFeed(
+    actor: FeedHostActorStorage,
+    input: { limit: number; cursor?: string },
+  ): Promise<{ items: FeedArtifactProjection[]; nextCursor?: string }> {
+    this.resolveStarted?.();
+    await this.blocked;
+    return super.listFeed(actor, input);
+  }
+
+  release(): void {
+    this.resolveRead?.();
+  }
+}
+
+class ReadTimeReconcileFailureStorage extends FakeFeedHostStorage {
+  reconcileAttempts = 0;
+
+  override async reconcileFeedProjection(actor: FeedHostActorStorage) {
+    this.reconcileAttempts += 1;
+    if (this.reconcileAttempts > 1) throw new Error("planned read-time reconciliation failure");
+    return super.reconcileFeedProjection(actor);
   }
 }
 

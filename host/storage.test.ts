@@ -241,6 +241,53 @@ test("hydrates corrupt artifact docs defensively and audits invalid fixtures", a
   }
 });
 
+test("returns a feed page when one artifact document is temporarily unavailable", async () => {
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const artifact = {
+      artifact_id: "temporarily-unavailable",
+      artifact_type: "insight_card",
+      package_id: "pkg-timeout",
+      source_fingerprint: "sha256:timeout",
+      doc_key: "listen-import/timeout.json",
+      published_at: "2026-07-14T12:00:00.000Z",
+      updated_at: "2026-07-14T12:00:00.000Z",
+    };
+    const actor = makeHydrationActor({
+      artifacts: [artifact],
+      docs: {},
+      docErrors: {
+        [artifactDocKey(artifact.doc_key)]: {
+          code: "NETWORK_ERROR",
+          message: "Failed to acquire connection from pool: Connection pool timed out",
+        },
+      },
+      projections: [{
+        feed_item_id: artifact.artifact_id,
+        target_kind: "artifact_preview",
+        artifact_id: artifact.artifact_id,
+        post_id: null,
+        rank_score: 1,
+        disposition: "default",
+        visibility: "visible",
+        freshness_label: "fresh",
+        reason_codes_json: "[]",
+        package_id: artifact.package_id,
+        source_fingerprint: artifact.source_fingerprint,
+        published_at: artifact.published_at,
+        updated_at: artifact.updated_at,
+      }],
+    });
+
+    const page = await new FeedHostStorage().listFeed(actor, { limit: 40 });
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+    expect(warn).toHaveBeenCalledTimes(1);
+  } finally {
+    warn.mockRestore();
+  }
+});
+
 test("rejects feedback for a missing artifact before writing either interaction table", async () => {
   const storage = new FeedHostStorage();
   const actor = makeHydrationActor({ artifacts: [], docs: {} });
@@ -270,6 +317,8 @@ function makeHydrationActor(input: {
     updated_at: string;
   }>;
   docs: Record<string, unknown>;
+  docErrors?: Record<string, { code: string; message: string }>;
+  projections?: Record<string, unknown>[];
 }): FeedHostActorStorage {
   const docs = new Map(Object.entries(input.docs));
 
@@ -310,6 +359,15 @@ function makeHydrationActor(input: {
             },
           };
         }
+        if (path === FEED_HOST_FEED_DB_PATH && sql.includes("FROM feed_item_projection")) {
+          return {
+            ok: true,
+            data: {
+              columns: [],
+              rows: input.projections ?? [],
+            },
+          };
+        }
         return {
           ok: true,
           data: {
@@ -330,7 +388,9 @@ function makeHydrationActor(input: {
     documents: {
       kv: {
         get: async (key: string) =>
-          docs.has(key)
+          input.docErrors?.[key]
+            ? { ok: false, error: input.docErrors[key] }
+            : docs.has(key)
             ? { ok: true, data: { data: docs.get(key) } }
             : { ok: false, error: { code: "KV_NOT_FOUND", message: `not found: ${key}` } },
         put: async () => ({ ok: true }),
