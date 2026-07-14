@@ -77,6 +77,7 @@ export type FeedHostWorkflowState = {
   packageId: string;
   displayName: string;
   version: string;
+  settingsVersion: number;
   admissionState: "candidate" | "enabled_local" | "reviewed_first_party" | "blocked";
   disclosure: {
     userCopy: string;
@@ -88,6 +89,11 @@ export type FeedHostWorkflowState = {
   paused: boolean;
   disabled: boolean;
   cadence?: "more" | "normal" | "less";
+  settings?: {
+    sourceSelection?: "recent_authorized" | "named_sources" | "all_authorized";
+    audience?: "private" | "team" | "draft";
+    outputVolume?: "short" | "standard" | "detailed";
+  };
   enabledAt: string | null;
   updatedAt: string;
   lastRun?: FeedHostWorkflowRunSummary;

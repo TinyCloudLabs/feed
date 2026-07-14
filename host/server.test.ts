@@ -1774,11 +1774,144 @@ describe("Feed Host workflow routines", () => {
     );
     expect(pause.ok).toBe(true);
 
-    const body = await getJson<{ items: Array<{ packageId: string; paused: boolean }> }>(
+    const body = await getJson<{ items: Array<{ packageId: string; paused: boolean; settingsVersion: number }> }>(
       `${runtime.url}/workflows?limit=50`,
       { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
     );
-    expect(body.items.find((item) => item.packageId === "feed-daily-brief")?.paused).toBe(true);
+    const dailyBrief = body.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(dailyBrief?.paused).toBe(true);
+    expect(dailyBrief?.settingsVersion).toBe(1);
+
+    const stale = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-stale-001",
+        readerNonce: "wf-stale-nonce-001",
+        intentKind: "enable_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 0 },
+        createdAt: "2026-07-14T22:01:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(stale.status).toBe(409);
+    expect(((await stale.json()) as { error: { code: string } }).error.code).toBe("version_conflict");
+
+    const staleReset = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-stale-reset-001",
+        readerNonce: "wf-stale-reset-nonce-001",
+        intentKind: "reset_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 0 },
+        createdAt: "2026-07-14T22:02:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(staleReset.status).toBe(409);
+    expect(((await staleReset.json()) as { error: { code: string } }).error.code).toBe("version_conflict");
+
+    const reset = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-reset-001",
+        readerNonce: "wf-reset-nonce-001",
+        intentKind: "reset_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 1 },
+        createdAt: "2026-07-14T22:03:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(reset.ok).toBe(true);
+
+    const resetBody = await getJson<{ items: Array<{ packageId: string; paused: boolean; settingsVersion: number }> }>(
+      `${runtime.url}/workflows?limit=50`,
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    const resetDailyBrief = resetBody.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(resetDailyBrief?.paused).toBe(false);
+    expect(resetDailyBrief?.settingsVersion).toBe(2);
+  });
+
+  test("removing a routine keeps its settings and add-back restores it", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const tune = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-tune-001",
+        readerNonce: "wf-tune-nonce-001",
+        intentKind: "tune_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 0, settings: { cadence: "less", audience: "team", outputVolume: "short" } },
+        createdAt: "2026-07-14T22:10:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(tune.ok).toBe(true);
+
+    const remove = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-remove-001",
+        readerNonce: "wf-remove-nonce-001",
+        intentKind: "disable_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 1 },
+        createdAt: "2026-07-14T22:11:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(remove.ok).toBe(true);
+
+    const removedBody = await getJson<{
+      items: Array<{ packageId: string; disabled: boolean; settingsVersion: number; cadence?: string; settings?: { audience?: string; outputVolume?: string } }>;
+    }>(`${runtime.url}/workflows?limit=50`, { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie });
+    const removed = removedBody.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(removed?.disabled).toBe(true);
+    expect(removed?.cadence).toBe("less");
+    expect(removed?.settings?.audience).toBe("team");
+
+    const addBack = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-addback-001",
+        readerNonce: "wf-addback-nonce-001",
+        intentKind: "enable_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 2 },
+        createdAt: "2026-07-14T22:12:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(addBack.ok).toBe(true);
+
+    const restoredBody = await getJson<{
+      items: Array<{ packageId: string; disabled: boolean; paused: boolean; settingsVersion: number; cadence?: string; settings?: { audience?: string; outputVolume?: string } }>;
+    }>(`${runtime.url}/workflows?limit=50`, { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie });
+    const restored = restoredBody.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(restored?.disabled).toBe(false);
+    expect(restored?.paused).toBe(false);
+    expect(restored?.settingsVersion).toBe(3);
+    expect(restored?.cadence).toBe("less");
+    expect(restored?.settings?.audience).toBe("team");
+    expect(restored?.settings?.outputVolume).toBe("short");
   });
 });
 
@@ -1842,16 +1975,23 @@ class FakeFeedHostStorage {
       const example = [...this.projections.values()]
         .filter((projection) => projection.packageId === row.package_id && projection.visibility === "ranked")
         .sort((left, right) => right.publishedAt.localeCompare(left.publishedAt))[0];
-      const preferences = this.preferenceProfiles.get(`${input.actorId.toLowerCase()}:package:${row.package_id}`)?.value;
+      const preferenceRecord = this.preferenceProfiles.get(`${input.actorId.toLowerCase()}:package:${row.package_id}`);
+      const preferences = preferenceRecord?.value;
       return {
         packageId: row.package_id,
         displayName: row.display_name,
         version: row.version,
+        settingsVersion: preferenceRecord?.version ?? 0,
         admissionState: row.admission_state,
         disclosure: JSON.parse(row.disclosure_json) as Record<string, unknown>,
         paused: preferences?.paused === true || row.paused_at !== null,
         disabled: preferences?.disabled === true,
         cadence: preferences?.cadence,
+        settings: {
+          sourceSelection: preferences?.sourceSelection,
+          audience: preferences?.audience,
+          outputVolume: preferences?.outputVolume,
+        },
         enabledAt: row.enabled_at,
         updatedAt: row.updated_at,
         ...(latestRun
@@ -2109,6 +2249,17 @@ class FakeFeedHostStorage {
         const key = preferenceKey(event.actorId, scope);
         const current = this.preferenceProfiles.get(key);
         const currentVersion = current?.version ?? 0;
+        const expectedVersion =
+          typeof payload?.version === "number"
+            ? payload.version
+            : typeof payload?.expectedVersion === "number"
+              ? payload.expectedVersion
+              : currentVersion;
+        if (expectedVersion !== currentVersion) {
+          capError = new FeedHostError("preference version conflict", 409, "version_conflict", { currentVersion });
+          status = capError.code;
+          break;
+        }
         const value =
           normalizedKind === "reset_preferences" || normalizedKind === "reset_package"
             ? scope === FEED_HOST_PREFERENCES_SCOPE
@@ -2776,6 +2927,23 @@ function mergePreferencePatch(base: FeedPreferenceValue, patch: FeedPreferenceVa
   if (typeof sanitizedPatch.paused === "boolean") next.paused = sanitizedPatch.paused;
   if (typeof sanitizedPatch.disabled === "boolean") next.disabled = sanitizedPatch.disabled;
   if (sanitizedPatch.cadence === "more" || sanitizedPatch.cadence === "normal" || sanitizedPatch.cadence === "less") next.cadence = sanitizedPatch.cadence;
+  if (
+    sanitizedPatch.sourceSelection === "recent_authorized" ||
+    sanitizedPatch.sourceSelection === "named_sources" ||
+    sanitizedPatch.sourceSelection === "all_authorized"
+  ) {
+    next.sourceSelection = sanitizedPatch.sourceSelection;
+  }
+  if (sanitizedPatch.audience === "private" || sanitizedPatch.audience === "team" || sanitizedPatch.audience === "draft") {
+    next.audience = sanitizedPatch.audience;
+  }
+  if (
+    sanitizedPatch.outputVolume === "short" ||
+    sanitizedPatch.outputVolume === "standard" ||
+    sanitizedPatch.outputVolume === "detailed"
+  ) {
+    next.outputVolume = sanitizedPatch.outputVolume;
+  }
   return next;
 }
 

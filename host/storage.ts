@@ -244,12 +244,18 @@ export type FeedHostWorkflowState = {
   packageId: string;
   displayName: string;
   version: string;
+  settingsVersion: number;
   admissionState: FeedWorkflowPackage["admissionState"];
   disclosure: WorkflowDisclosure;
   presentation?: WorkflowPresentation;
   paused: boolean;
   disabled: boolean;
   cadence?: "more" | "normal" | "less";
+  settings?: {
+    sourceSelection?: "recent_authorized" | "named_sources" | "all_authorized";
+    audience?: "private" | "team" | "draft";
+    outputVolume?: "short" | "standard" | "detailed";
+  };
   enabledAt: string | null;
   updatedAt: string;
   lastRun?: FeedHostWorkflowRunSummary;
@@ -1467,15 +1473,15 @@ export class FeedHostStorage {
     const normalizedActorId = normalizeActorId(input.actorId);
     const scopes = packageIds.map((packageId) => `package:${packageId}`);
     const scopePlaceholders = scopes.map(() => "?").join(", ");
-    const preferenceRows = await queryRows<{ scope: string; value_json: string }>(
+    const preferenceRows = await queryRows<{ scope: string; value_json: string; version: number }>(
       this.db(actor, "feed_index"),
-      `SELECT scope, value_json FROM preference_profile WHERE actor_id = ? AND scope IN (${scopePlaceholders})`,
+      `SELECT scope, value_json, version FROM preference_profile WHERE actor_id = ? AND scope IN (${scopePlaceholders})`,
       [normalizedActorId, ...scopes],
     );
-    const preferenceByPackage = new Map<string, FeedPreferenceValue>();
+    const preferenceByPackage = new Map<string, { value: FeedPreferenceValue; version: number }>();
     for (const row of preferenceRows) {
       const packageId = row.scope.slice("package:".length);
-      preferenceByPackage.set(packageId, parsePreferenceValueJson(row.value_json));
+      preferenceByPackage.set(packageId, { value: parsePreferenceValueJson(row.value_json), version: Number(row.version) });
     }
 
     return {
@@ -1812,12 +1818,22 @@ export class FeedHostStorage {
           const scope = preferenceScopeForIntent(event.intentKind, payload, event.targetRef);
           if (event.intentKind === "reset_preferences" || event.intentKind === "reset_package") {
             const current = await this.readPreferenceProfileByActor(actor, event.actorId, scope);
+            const currentVersion = current?.version ?? 0;
+            const expectedVersion =
+              typeof payload?.version === "number"
+                ? payload.version
+                : typeof payload?.expectedVersion === "number"
+                  ? payload.expectedVersion
+                  : currentVersion;
+            if (current ? expectedVersion !== currentVersion : expectedVersion !== 0) {
+              throw new FeedHostError("preference version conflict", 409, "version_conflict", { currentVersion });
+            }
             await this.writePreferenceProfileRecord(actor, {
               profileId: preferenceProfileId(event.actorId, scope),
               actorId: event.actorId,
               scope,
               value: scope === FEED_HOST_PREFERENCES_SCOPE ? defaultPreferenceValue() : {},
-              version: (current?.version ?? 0) + 1,
+              version: currentVersion + 1,
               updatedAt: event.createdAt,
             });
             return { status: "applied" };
@@ -2222,18 +2238,25 @@ function toWireWorkflowState(
   row: WorkflowPackageStateRow,
   run: WorkflowRunIndexRow | undefined,
   example: WorkflowExampleRow | undefined,
-  preferences: FeedPreferenceValue | undefined,
+  preferences: { value: FeedPreferenceValue; version: number } | undefined,
 ): FeedHostWorkflowState {
+  const value = preferences?.value;
   const disclosure = parseWorkflowDisclosure(row.disclosure_json);
   const state: FeedHostWorkflowState = {
     packageId: row.package_id,
     displayName: row.display_name,
     version: row.version,
+    settingsVersion: preferences?.version ?? 0,
     admissionState: row.admission_state as FeedWorkflowPackage["admissionState"],
     disclosure,
-    paused: preferences?.paused === true || (row.paused_at !== null && row.paused_at !== undefined),
-    disabled: preferences?.disabled === true,
-    cadence: preferences?.cadence,
+    paused: value?.paused === true || (row.paused_at !== null && row.paused_at !== undefined),
+    disabled: value?.disabled === true,
+    cadence: value?.cadence,
+    settings: {
+      sourceSelection: value?.sourceSelection,
+      audience: value?.audience,
+      outputVolume: value?.outputVolume,
+    },
     enabledAt: row.enabled_at ?? null,
     updatedAt: row.updated_at,
   };
