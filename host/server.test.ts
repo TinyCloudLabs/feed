@@ -283,6 +283,7 @@ describe("Feed Host server", () => {
     });
     expect(narrowGrant.status).toBe(202);
     expect(narrowGrant.headers.get("set-cookie")).toBeNull();
+    expect(narrowGrant.headers.get("cache-control")).toBe("private, no-store");
 
     const hostedGrant = await postJson(`${runtime.url}/api/delegations`, {
       actorId: ACTOR_ID,
@@ -302,7 +303,9 @@ describe("Feed Host server", () => {
       activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
     });
 
-    expect((await fetch(`${runtime.url}/delegation-policy`)).status).toBe(200);
+    const policyResponse = await fetch(`${runtime.url}/delegation-policy`);
+    expect(policyResponse.status).toBe(200);
+    expect(policyResponse.headers.get("cache-control")).toBe("private, no-store");
     const browserRequest = await fetch(`${runtime.url}/delegation-policy`, {
       headers: { origin: "https://feed.tinycloud.xyz" },
     });

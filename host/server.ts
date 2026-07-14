@@ -257,11 +257,12 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     async fetch(request) {
       const url = new URL(request.url);
       const privateRoute = requiresActorSession(request, url);
+      const noStoreRoute = privateRoute || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
       const finish = (response: Response) => applyResponsePolicy(
         response,
         request,
         options.allowedOrigins,
-        privateRoute,
+        noStoreRoute,
         options.requireActorSession !== false,
       );
       if (!isAllowedOrigin(request, options.allowedOrigins, options.requireActorSession !== false)) {
