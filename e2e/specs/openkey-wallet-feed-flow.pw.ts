@@ -191,6 +191,7 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   const noteAttempts: Array<{ eventId: string; readerNonce: string; signal: string; payload?: { note?: string } }> = [];
   const controlIntentBodies: Array<{ intentKind: string; targetRef: string; payload?: Record<string, unknown> }> = [];
   let routineTuneConflict = true;
+  let weeklyDigestRemoved = true;
   const consoleMessages: string[] = [];
   const clientEventBodies: string[] = [];
   page.on("console", (message) => consoleMessages.push(message.text()));
@@ -352,6 +353,29 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
               publishedAt: RICH_ARTIFACT.updatedAt,
             },
           },
+          {
+            packageId: "feed-weekly-digest",
+            displayName: "Weekly Digest",
+            version: "0.1.0",
+            settingsVersion: 5,
+            admissionState: "reviewed_first_party",
+            disclosure: {
+              userCopy: "Collects the week's authorized highlights into one digest.",
+              credentialOwner: "none",
+              providerClass: "none",
+              egressClass: "none",
+            },
+            paused: false,
+            disabled: weeklyDigestRemoved,
+            cadence: "less",
+            settings: {
+              sourceSelection: "named_sources",
+              audience: "team",
+              outputVolume: "short",
+            },
+            enabledAt: null,
+            updatedAt: "2026-07-14T20:00:00.000Z",
+          },
         ],
       }),
     });
@@ -363,6 +387,9 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
     }
     const body = route.request().postDataJSON() as { eventId: string; intentKind: string; targetRef: string; payload?: Record<string, unknown> };
     controlIntentBodies.push({ intentKind: body.intentKind, targetRef: body.targetRef, payload: body.payload });
+    if (body.intentKind === "enable_package" && body.targetRef === "package:feed-weekly-digest") {
+      weeklyDigestRemoved = false;
+    }
     if (body.intentKind === "tune_package" && routineTuneConflict) {
       routineTuneConflict = false;
       await route.fulfill({
@@ -477,12 +504,23 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect(page.getByRole("heading", { name: "Access & automation" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Routines" })).toBeVisible();
   await expect(page.getByText("Daily Brief", { exact: true })).toBeVisible();
-  await page.getByText("Edit routine").click();
-  await page.getByLabel("Frequency").selectOption("more");
-  await page.getByRole("button", { name: "Save changes" }).click();
+  const dailyBriefRow = page.locator(".routine-row", { hasText: "Daily Brief" });
+  await dailyBriefRow.getByText("Edit routine").click();
+  await dailyBriefRow.getByLabel("Frequency").selectOption("more");
+  await dailyBriefRow.getByRole("button", { name: "Save changes" }).click();
   await expect(page.getByText("This changed elsewhere. Refresh and try again.")).toBeVisible();
-  await page.getByRole("button", { name: "Run now" }).click();
+  await dailyBriefRow.getByRole("button", { name: "Run now" }).click();
   await expect(page.getByText("Daily Brief is queued to run.")).toBeVisible();
+  const weeklyDigestRow = page.locator(".routine-row", { hasText: "Weekly Digest" });
+  await expect(weeklyDigestRow.getByText("Removed", { exact: true })).toBeVisible();
+  await weeklyDigestRow.getByRole("button", { name: "Add back" }).click();
+  await expect(page.getByText("Weekly Digest is active.")).toBeVisible();
+  await expect(weeklyDigestRow.getByText("Active", { exact: true })).toBeVisible();
+  await expect(weeklyDigestRow.getByRole("button", { name: "Add back" })).toHaveCount(0);
+  const addBackIntent = controlIntentBodies.find(
+    (body) => body.intentKind === "enable_package" && body.targetRef === "package:feed-weekly-digest",
+  );
+  expect(addBackIntent?.payload?.expectedVersion).toBe(5);
   expect(controlIntentBodies.map((body) => body.intentKind)).toContain("tune_package");
   expect(controlIntentBodies.map((body) => body.intentKind)).toContain("generate_new_request");
   expect(controlIntentBodies.find((body) => body.intentKind === "tune_package")?.payload?.expectedVersion).toBe(2);
