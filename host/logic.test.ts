@@ -67,6 +67,53 @@ describe("Feed ranking and reconciliation logic", () => {
     expect(preferenceRank.map(artifactId)).toEqual(["beta", "alpha"]);
   });
 
+  test("deduplicates a canonical post across artifacts after ranking", () => {
+    const higherRanked = projection({
+      feedItemId: "higher::post:canonical",
+      artifactId: "higher",
+      target: { kind: "post", artifactId: "higher", postId: "post:canonical" },
+      packageId: "higher-package",
+      sourceFingerprint: "sha256:shared-source",
+      publishedAt: "2026-06-29T12:01:00.000Z",
+      updatedAt: "2026-06-29T12:01:00.000Z",
+      rankScore: 0.9,
+    });
+    const lowerRanked = projection({
+      feedItemId: "lower::post:canonical",
+      artifactId: "lower",
+      target: { kind: "post", artifactId: "lower", postId: "post:canonical" },
+      packageId: "lower-package",
+      sourceFingerprint: "sha256:shared-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:00:00.000Z",
+      rankScore: 0.2,
+    });
+
+    const ranked = rankFeedProjections({ items: [lowerRanked, higherRanked], now: NOW });
+
+    expect(ranked.map((item) => item.feedItemId)).toEqual(["higher::post:canonical"]);
+  });
+
+  test("preserves distinct posts from the same artifact and source", () => {
+    const items = ["first", "second"].map((postId, index) => projection({
+      feedItemId: `artifact::${postId}`,
+      artifactId: "artifact",
+      target: { kind: "post", artifactId: "artifact", postId },
+      packageId: "package",
+      sourceFingerprint: "sha256:shared-source",
+      publishedAt: `2026-06-29T12:0${index}:00.000Z`,
+      updatedAt: `2026-06-29T12:0${index}:00.000Z`,
+      rankScore: 0.5,
+    }));
+
+    const ranked = rankFeedProjections({ items, now: NOW });
+
+    expect(ranked.map((item) => item.target.kind === "post" ? item.target.postId : "preview").sort()).toEqual([
+      "first",
+      "second",
+    ]);
+  });
+
   test("reconciliation restores missing rows, corrects stale rows, and is stable on rerun", () => {
     const artifacts = [
       reconcileArtifact({

@@ -355,7 +355,7 @@ export function rankFeedProjections(input: {
   // Keep package history referenced so TypeScript does not elide the helper
   // during dead-code sweeping in downstream tooling.
   packageHistory.clear();
-  return capItemsPerArtifact(diversified, input.maxItemsPerArtifact ?? 4);
+  return capItemsPerArtifact(dedupeCanonicalPosts(diversified), input.maxItemsPerArtifact ?? 4);
 }
 
 export function reconcileFeedProjections(input: {
@@ -958,6 +958,18 @@ function comparePublishedThenId(left: FeedProjectionState, right: FeedProjection
   const published = right.publishedAt.localeCompare(left.publishedAt);
   if (published !== 0) return published;
   return left.feedItemId.localeCompare(right.feedItemId);
+}
+
+function dedupeCanonicalPosts(items: readonly FeedProjectionState[]): FeedProjectionState[] {
+  // postId is the content-addressed identity of kind/title/body/evidence, so
+  // matching ids represent the same post even when two artifacts publish it.
+  const seenPostIds = new Set<string>();
+  return items.filter((item) => {
+    if (item.target.kind !== "post") return true;
+    if (seenPostIds.has(item.target.postId)) return false;
+    seenPostIds.add(item.target.postId);
+    return true;
+  });
 }
 
 function capItemsPerArtifact(items: readonly FeedProjectionState[], cap: number): FeedProjectionState[] {
