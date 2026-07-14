@@ -181,6 +181,12 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   };
 
   let delegationSubmissions = 0;
+  let recoveryMode = false;
+  let recoveryFeedRequests = 0;
+  let releaseRecoveryResponse: (() => void) | undefined;
+  const recoveryResponse = new Promise<void>((resolve) => {
+    releaseRecoveryResponse = resolve;
+  });
   const savedFeedItemIds = new Set<string>();
   const noteAttempts: Array<{ eventId: string; readerNonce: string; signal: string; payload?: { note?: string } }> = [];
   const consoleMessages: string[] = [];
@@ -209,6 +215,24 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await page.route(/\/feed(\?.*)?$/, async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
+      return;
+    }
+    if (recoveryMode) {
+      recoveryFeedRequests += 1;
+      if (recoveryFeedRequests === 1) {
+        await route.fulfill({
+          status: 503,
+          headers: { "content-type": "text/plain", ...CREDENTIALLED_CORS_HEADERS },
+          body: "bundle offline",
+        });
+        return;
+      }
+      if (recoveryFeedRequests === 2) await recoveryResponse;
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+        body: JSON.stringify({ items: [] }),
+      });
       return;
     }
     const publishedAt = RICH_ARTIFACT.publishedAt ?? RICH_ARTIFACT.createdAt;
@@ -361,76 +385,24 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect(page.getByText("smoke-new-skill", { exact: true })).toBeVisible();
   await expect(page.getByText("credential attached", { exact: true })).toBeVisible();
 
-});
-
-test("Feed failure state only clears after a successful reload", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  const wallet = createTestWallet();
-  await installWallet(page, wallet);
-
-  let feedRequests = 0;
-  let releaseRetryResponse: (() => void) | undefined;
-  const retryResponse = new Promise<void>((resolve) => {
-    releaseRetryResponse = resolve;
-  });
-  await page.route(/\/feed(\?.*)?$/, async (route) => {
-    if (route.request().method() !== "GET") {
-      await route.fallback();
-      return;
-    }
-    feedRequests += 1;
-    if (feedRequests === 2) {
-      await route.fulfill({
-        status: 503,
-        headers: { "content-type": "text/plain", ...CREDENTIALLED_CORS_HEADERS },
-        body: "bundle offline",
-      });
-      return;
-    }
-    if (feedRequests === 3) {
-      await retryResponse;
-      await route.fulfill({
-        status: 200,
-        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
-        body: JSON.stringify({ items: [] }),
-      });
-      return;
-    }
-    await route.fulfill({
-      status: 200,
-      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
-      body: JSON.stringify({ items: [] }),
-    });
-  });
-
-  await page.route(/\/feed\/events(\?.*)?$/, async (route) => {
-    await route.fulfill({
-      status: 200,
-      headers: { "content-type": "text/event-stream", ...CREDENTIALLED_CORS_HEADERS },
-      body: "",
-    });
-  });
-
-  await page.goto("/");
-  await signInWithWallet(page, wallet);
-
-  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
-  await expectMobileLayout(page);
-
-  await page.getByRole("button", { name: /check again/i }).click();
+  recoveryMode = true;
+  await page.getByRole("button", { name: "Menu", exact: true }).click();
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 120000 });
-  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();
 
   await page.waitForTimeout(6500);
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
-  expect(feedRequests).toBe(2);
+  expect(recoveryFeedRequests).toBe(1);
 
   await page.getByRole("button", { name: "Retry" }).click();
-  await expect.poll(() => feedRequests).toBe(3);
+  await expect.poll(() => recoveryFeedRequests).toBe(2);
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
-  releaseRetryResponse?.();
+  releaseRecoveryResponse?.();
   await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible({ timeout: 60000 });
-  expect(feedRequests).toBe(3);
+  expect(recoveryFeedRequests).toBe(2);
+  await expectMobileLayout(page);
 });
 
 test("a restored session silently re-establishes Host access without another wallet prompt", async ({ page }) => {

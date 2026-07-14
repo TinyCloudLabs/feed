@@ -63,6 +63,7 @@ export function App() {
   const [items, setItems] = useState<FeedItem[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -157,6 +158,7 @@ export function App() {
     setItems([]);
     setLoadState("idle");
     setLoadError(null);
+    setEventsError(null);
     setBusyAction(null);
     setCommandStatus(null);
     setMenuOpen(false);
@@ -204,6 +206,7 @@ export function App() {
     setSetupError(null);
     setLoadState("idle");
     setLoadError(null);
+    setEventsError(null);
     void startFeed();
   }, [policy, session, startFeed]);
 
@@ -218,8 +221,7 @@ export function App() {
       try {
         const snapshot = await client.getFeedEvents();
         if (cancelled) return;
-        setLoadError(null);
-        setLoadState("ready");
+        setEventsError(null);
         const signature = snapshot.text.trim();
         if (signature !== lastSignature) {
           lastSignature = signature;
@@ -231,8 +233,7 @@ export function App() {
             // Setup restarts; feedState leaves "running" and this loop unwinds.
             return;
           }
-          setLoadState("error");
-          setLoadError(formatHostError(error));
+          setEventsError(formatHostError(error));
         }
       } finally {
         if (!cancelled) timer = window.setTimeout(() => void pollFeedEvents(), FEED_EVENTS_RETRY_MS);
@@ -347,6 +348,7 @@ export function App() {
   };
 
   const visibleItems = feedItemsForView(items, activeView);
+  const visibleLoadError = loadError ?? eventsError;
 
   if (!restoreDone) {
     return <StatusScreen title="Opening Feed" detail="Checking your saved sign-in." />;
@@ -441,7 +443,7 @@ export function App() {
         aria-labelledby={`feed-tab-${activeView}`}
       >
         {commandStatus && <p className="interaction-status" role="status" aria-live="polite">{commandStatus}</p>}
-        {loadState === "loading" && loadError === null && (
+        {loadState === "loading" && visibleLoadError === null && (
           <NoticePanel
             tone="info"
             title="Refreshing your Feed"
@@ -449,11 +451,11 @@ export function App() {
           />
         )}
 
-        {loadError !== null && (
-          <FeedFailurePanel error={loadError ?? "The feed could not be loaded."} onRetry={() => void loadFeed()} />
+        {visibleLoadError !== null && (
+          <FeedFailurePanel error={visibleLoadError} onRetry={() => void loadFeed()} />
         )}
 
-        {loadState === "ready" && loadError === null && visibleItems.length === 0 && (
+        {loadState === "ready" && visibleLoadError === null && visibleItems.length === 0 && (
           activeView === "saved"
             ? <EmptySavedPanel onShowFeed={() => setActiveView("for_you")} />
             : <EmptyFeedPanel onRetry={() => void loadFeed()} />
