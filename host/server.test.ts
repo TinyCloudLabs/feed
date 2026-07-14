@@ -138,10 +138,11 @@ describe("Feed Host server", () => {
     const openApi = await getJson<{
       paths: Record<string, unknown>;
       security: Array<Record<string, unknown>>;
-      components: { securitySchemes: Record<string, { in: string; name: string }> };
+      components: { securitySchemes: Record<string, { in?: string; name?: string; type: string; scheme?: string }> };
     }>(`${runtime.url}/api/openapi.json`);
     expect(openApi.security).toEqual([{ actorSession: [] }]);
     expect(openApi.components.securitySchemes.actorSession).toMatchObject({ in: "cookie", name: "__Host-feed_session" });
+    expect(openApi.components.securitySchemes.workerBearer).toMatchObject({ type: "http", scheme: "bearer" });
     expect(Object.keys(openApi.paths).sort()).toEqual(
       [
         "/health",
@@ -164,6 +165,9 @@ describe("Feed Host server", () => {
         "/control-intents",
         "/preferences",
         "/generation-requests",
+        "/generation-requests/{requestId}/cancel",
+        "/api/worker/generation-requests/claim",
+        "/api/worker/generation-requests/{requestId}/{action}",
       ].sort(),
     );
     const feedEventsPath = openApi.paths["/feed/events"] as {
@@ -996,6 +1000,120 @@ describe("Feed Host server", () => {
       status: "nonsense",
     });
     expect(invalid.status).toBe(400);
+  });
+
+  test("production worker control fails closed, rejects browser origins, and never accepts actor auth", async () => {
+    const storage = new FakeFeedHostStorage();
+    const workerToken = "worker-control-token-with-at-least-32-random-like-bytes";
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      workerToken,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+    const createdAt = new Date().toISOString();
+    await postJson(`${runtime.url}/control-intents`, {
+      actorId: ACTOR_ID,
+      eventId: "production-worker-001",
+      readerNonce: "production-worker-nonce-001",
+      intentKind: "ask_feed",
+      targetRef: "feed",
+      payload: { prompt: "This prompt must never be logged" },
+      createdAt,
+    }, { "x-feed-actor-id": ACTOR_ID });
+    const claimBody = { actorId: ACTOR_ID, workflowId: "workflow-production", claimOwner: "worker-production" };
+
+    const actorAuthOnly = await postJson(
+      `${runtime.url}/api/worker/generation-requests/claim`,
+      claimBody,
+      { "x-feed-actor-id": ACTOR_ID, cookie: "feed_session=forged" },
+    );
+    expect(actorAuthOnly.status).toBe(401);
+    expect(actorAuthOnly.headers.get("cache-control")).toBe("private, no-store");
+
+    const browser = await postJson(
+      `${runtime.url}/api/worker/generation-requests/claim`,
+      claimBody,
+      { authorization: `Bearer ${workerToken}`, origin: "https://feed.tinycloud.xyz" },
+    );
+    expect(browser.status).toBe(403);
+    expect(browser.headers.get("access-control-allow-origin")).toBeNull();
+    expect(browser.headers.get("cache-control")).toBe("private, no-store");
+
+    const accepted = await postJson(
+      `${runtime.url}/api/worker/generation-requests/claim`,
+      claimBody,
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(accepted.status).toBe(200);
+    expect(accepted.headers.get("cache-control")).toBe("private, no-store");
+    expect(await accepted.json()).toMatchObject({
+      request: {
+        requestId: "production-worker-001",
+        runId: "production-worker-001",
+        workflowId: "workflow-production",
+        fencingToken: 1,
+      },
+      committedCursor: null,
+    });
+
+    runtime.stop();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+    });
+    const unset = await postJson(
+      `${runtime.url}/api/worker/generation-requests/claim`,
+      claimBody,
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(unset.status).toBe(401);
+    expect(unset.headers.get("cache-control")).toBe("private, no-store");
+  });
+
+  test("generation cancellation requires the browser actor session", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startSecureFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      requireActorSession: true,
+      allowedOrigins: ["https://feed.tinycloud.xyz"],
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const cookie = await grantAllDelegations(runtime, ACTOR_ID);
+    const createdAt = new Date().toISOString();
+    const intent = await postJson(`${runtime.url}/control-intents`, {
+      eventId: "cancel-browser-001",
+      readerNonce: "cancel-browser-nonce-001",
+      intentKind: "ask_feed",
+      targetRef: "feed",
+      createdAt,
+    }, { cookie, origin: "https://feed.tinycloud.xyz" });
+    expect(intent.status).toBe(202);
+
+    const noSession = await postJson(`${runtime.url}/generation-requests/cancel-browser-001/cancel`, {}, {
+      "x-feed-actor-id": ACTOR_ID,
+      origin: "https://feed.tinycloud.xyz",
+    });
+    expect(noSession.status).toBe(401);
+
+    const canceled = await postJson(`${runtime.url}/generation-requests/cancel-browser-001/cancel`, {}, {
+      cookie,
+      origin: "https://feed.tinycloud.xyz",
+    });
+    expect(canceled.status).toBe(200);
+    expect(canceled.headers.get("cache-control")).toBe("private, no-store");
+    expect(await canceled.json()).toMatchObject({
+      cancellationRequested: true,
+      request: { status: "cancelled", phase: "cancelled" },
+    });
   });
 
   test("rejects new generation requests once the actor backlog is full", async () => {
@@ -1908,6 +2026,50 @@ class FakeFeedHostStorage {
     };
   }
 
+  async claimGenerationRequest(
+    _actor: FeedHostActorStorage,
+    input: { workflowId: string; claimOwner: string; now: string; leaseExpiresAt: string; maxAttempts: number },
+  ): Promise<Record<string, unknown> | null> {
+    const row = this.generationRequests
+      .filter((candidate) =>
+        candidate.expires_at > input.now &&
+        (candidate.attempt_count ?? 0) < input.maxAttempts &&
+        (
+          candidate.status === "accepted" ||
+          (candidate.status === "retry_wait" && (candidate.next_retry_at ?? "") <= input.now) ||
+          (candidate.status === "pending" && (candidate.lease_expires_at ?? "") <= input.now)
+        ))
+      .sort((left, right) => left.created_at.localeCompare(right.created_at))[0];
+    if (!row) return null;
+    row.status = "pending";
+    row.run_id = row.request_id;
+    row.workflow_id ??= input.workflowId;
+    row.max_attempts ??= input.maxAttempts;
+    row.claim_owner = input.claimOwner;
+    row.lease_expires_at = input.leaseExpiresAt;
+    row.fencing_token = (row.fencing_token ?? 0) + 1;
+    row.attempt_count = (row.attempt_count ?? 0) + 1;
+    row.phase = row.phase === "publishing" || row.phase === "reconciling" ? row.phase : "running";
+    row.cancellation_requested ??= 0;
+    row.updated_at = input.now;
+    return wireGenerationRequest(row);
+  }
+
+  async requestGenerationCancellation(
+    _actor: FeedHostActorStorage,
+    input: { requestId: string; now: string },
+  ): Promise<Record<string, unknown>> {
+    const row = this.generationRequests.find((candidate) => candidate.request_id === input.requestId);
+    if (!row) throw new FeedHostError(`generation request not found: ${input.requestId}`, 404, "not_found");
+    row.cancellation_requested = 1;
+    if (row.status === "accepted" || row.status === "retry_wait" || (row.status === "pending" && row.phase !== "publishing" && row.phase !== "reconciling")) {
+      row.status = "cancelled";
+      row.phase = "cancelled";
+    }
+    row.updated_at = input.now;
+    return wireGenerationRequest(row);
+  }
+
   async listFeedEvents(_actor: FeedHostActorStorage, afterEventId?: string): Promise<string> {
     const projections = [...this.projections.values()].map((projection) =>
       projectionState(projection, !this.artifacts.has(projection.artifactId)),
@@ -2148,10 +2310,49 @@ type StoredGenerationRequestRow = {
   package_id: string | null;
   dedupe_key: string | null;
   prompt: string | null;
+  run_id?: string | null;
+  workflow_id?: string | null;
+  max_attempts?: number;
+  claim_owner?: string | null;
+  lease_expires_at?: string | null;
+  fencing_token?: number;
+  attempt_count?: number;
+  next_retry_at?: string | null;
+  cancellation_requested?: number;
+  phase?: string;
+  source_cursor_before?: string | null;
   expires_at: string;
   created_at: string;
   updated_at: string;
 };
+
+function wireGenerationRequest(row: StoredGenerationRequestRow): Record<string, unknown> {
+  return {
+    requestId: row.request_id,
+    readerNonce: row.reader_nonce,
+    actorId: row.actor_id,
+    status: row.status,
+    scope: JSON.parse(row.scope_json) as Record<string, unknown>,
+    packageId: row.package_id,
+    dedupeKey: row.dedupe_key,
+    prompt: row.prompt,
+    runId: row.run_id ?? null,
+    workflowId: row.workflow_id ?? null,
+    maxAttempts: row.max_attempts ?? 3,
+    claimOwner: row.claim_owner ?? null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    fencingToken: row.fencing_token ?? 0,
+    attemptCount: row.attempt_count ?? 0,
+    nextRetryAt: row.next_retry_at ?? null,
+    cancellationRequested: row.cancellation_requested === 1,
+    phase: row.phase ?? "queued",
+    sourceCursorBefore: row.source_cursor_before ? JSON.parse(row.source_cursor_before) : null,
+    timing: {},
+    expiresAt: row.expires_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
 
 // A serialized delegation may cover several resources (one signed UCAN with a
 // multi-entry att claim); the fake models that with a "|"-joined path list.

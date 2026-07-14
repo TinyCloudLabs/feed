@@ -1,4 +1,5 @@
 import type { DelegatedAccess, TinyCloudNode } from "@tinycloud/node-sdk";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type {
   ControlIntentEvent,
   FeedArtifact,
@@ -64,6 +65,7 @@ export type FeedHostServerOptions = {
   port: number;
   hostname: string;
   token?: string;
+  workerToken?: string;
   tinycloudHost?: string;
   hostPrivateKey?: string;
   seedOnStart?: boolean;
@@ -137,6 +139,9 @@ const JSON_HEADERS = {
 const FEEDBACK_NOTE_MAX_CHARS = 1024;
 const TINYCLOUD_TRANSACTION_RETRY_DELAYS_MS = [250, 750, 1500, 3000, 6000];
 const MAX_ACTOR_SESSIONS = 5;
+const MIN_WORKER_TOKEN_BYTES = 32;
+const DEFAULT_WORKER_LEASE_SECONDS = 120;
+const DEFAULT_WORKER_MAX_ATTEMPTS = 3;
 
 const SSE_HEADERS = {
   ...CORS_HEADERS,
@@ -256,19 +261,31 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     maxRequestBodySize: 1024 * 1024,
     async fetch(request) {
       const url = new URL(request.url);
+      const workerRoute = isWorkerRoute(url.pathname);
       const privateRoute = requiresActorSession(request, url);
-      const noStoreRoute = privateRoute || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
-      const finish = (response: Response) => applyResponsePolicy(
-        response,
-        request,
-        options.allowedOrigins,
-        noStoreRoute,
-        options.requireActorSession !== false,
-      );
-      if (!isAllowedOrigin(request, options.allowedOrigins, options.requireActorSession !== false)) {
+      const noStoreRoute = workerRoute || privateRoute || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
+      const finish = (response: Response) => {
+        const finished = applyResponsePolicy(
+          response,
+          request,
+          options.allowedOrigins,
+          noStoreRoute,
+          options.requireActorSession !== false,
+        );
+        if (!workerRoute) return finished;
+        const headers = new Headers(finished.headers);
+        for (const name of [...headers.keys()]) {
+          if (name.startsWith("access-control-")) headers.delete(name);
+        }
+        return new Response(finished.body, { status: finished.status, statusText: finished.statusText, headers });
+      };
+      if (workerRoute && request.headers.has("origin")) {
+        return finish(jsonError(403, "origin_denied", "worker API does not accept browser requests"));
+      }
+      if (!workerRoute && !isAllowedOrigin(request, options.allowedOrigins, options.requireActorSession !== false)) {
         return finish(jsonError(403, "origin_denied", "browser origin is not allowed"));
       }
-      if (request.method === "OPTIONS") {
+      if (!workerRoute && request.method === "OPTIONS") {
         return finish(new Response(null, { status: 204, headers: CORS_HEADERS }));
       }
 
@@ -290,7 +307,10 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       };
 
       const publicRoute = PUBLIC_PATHS.has(url.pathname);
-      if (!publicRoute && !authorized(request, options.token)) {
+      if (workerRoute && !workerAuthorized(request, options.workerToken)) {
+        return logRequest(jsonError(401, "unauthorized", "missing or invalid worker bearer token"), "unauthorized");
+      }
+      if (!workerRoute && !publicRoute && !authorized(request, options.token)) {
         return logRequest(jsonError(401, "unauthorized", "missing or invalid bearer token"), "unauthorized");
       }
 
@@ -304,7 +324,9 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           }
           routedRequest = bindAuthenticatedActor(request, authenticatedActor);
         }
-        const runRoute = () => request.method === "GET" && authenticatedActor
+        const runRoute = () => workerRoute
+          ? routeWorker(request, currentContext, actorRequestQueues)
+          : request.method === "GET" && authenticatedActor
           ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
           : route(routedRequest, currentContext);
         const response = authenticatedActor
@@ -699,6 +721,23 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     return json({ items: items.map(normalizeGenerationRequestRecord) });
   }
 
+  const generationCancelMatch = url.pathname.match(/^\/generation-requests\/([^/]+)\/cancel$/);
+  if (request.method === "POST" && generationCancelMatch) {
+    const actor = await requireCompleteActor(request, context);
+    const requestId = decodeURIComponent(generationCancelMatch[1]);
+    const record = await storage.requestGenerationCancellation(actorStorage(actor), {
+      requestId,
+      now: new Date().toISOString(),
+    });
+    logEvent("info", "generation_request_cancellation", {
+      requestId,
+      status: record.status,
+      phase: record.phase,
+      actor: actor.actorId,
+    });
+    return json({ cancellationRequested: record.cancellationRequested, request: record });
+  }
+
   if (request.method === "GET" && url.pathname === "/control-intents") {
     const actor = await requireCompleteActor(request, context);
     const limit = parseLimit(url.searchParams.get("limit"));
@@ -781,9 +820,147 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   return json({ error: { code: "not_found", message: `${request.method} ${url.pathname}` } }, 404);
 }
 
+async function routeWorker(
+  request: Request,
+  context: FeedHostContext,
+  actorRequestQueues: Map<string, Promise<void>>,
+): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method !== "POST") {
+    throw new FeedHostError("worker control endpoints require POST", 405, "method_not_allowed");
+  }
+  const body = await readJsonObject(request, "invalid_worker_request", "worker request body must be JSON");
+  const actorId = readString(body, "actorId", "invalid_worker_request", "actorId is required");
+  return serializeActorRequest(actorRequestQueues, actorId, async () => {
+    const actor = await requireDelegationAndReady(context, actorId);
+    const access = actorStorage(actor);
+    const now = new Date().toISOString();
+
+  if (url.pathname === "/api/worker/generation-requests/claim") {
+    const workflowId = readString(body, "workflowId", "invalid_worker_request", "workflowId is required");
+    const claimOwner = readString(body, "claimOwner", "invalid_worker_request", "claimOwner is required");
+    const leaseSeconds = boundedInteger(body.leaseSeconds, DEFAULT_WORKER_LEASE_SECONDS, 15, 900);
+    const maxAttempts = boundedInteger(body.maxAttempts, DEFAULT_WORKER_MAX_ATTEMPTS, 1, 10);
+    const requestRecord = await context.storage.claimGenerationRequest(access, {
+      workflowId,
+      claimOwner,
+      now,
+      leaseExpiresAt: new Date(Date.parse(now) + leaseSeconds * 1000).toISOString(),
+      maxAttempts,
+    });
+    if (requestRecord) {
+      logEvent("info", "generation_request_claimed", {
+        requestId: requestRecord.requestId,
+        runId: requestRecord.runId,
+        claimOwner: requestRecord.claimOwner,
+        fencingToken: requestRecord.fencingToken,
+        attemptCount: requestRecord.attemptCount,
+        actor: actor.actorId,
+      });
+    }
+    return json({ request: requestRecord, committedCursor: requestRecord?.sourceCursorBefore ?? null });
+  }
+
+  const match = url.pathname.match(
+    /^\/api\/worker\/generation-requests\/([^/]+)\/(heartbeat|phase|artifacts|reconcile|complete|retry|assert)$/,
+  );
+  if (!match) throw new FeedHostError("worker endpoint not found", 404, "not_found");
+  const requestId = decodeURIComponent(match[1]);
+  const action = match[2];
+  const identity = {
+    requestId,
+    runId: readString(body, "runId", "invalid_worker_request", "runId is required"),
+    claimOwner: readString(body, "claimOwner", "invalid_worker_request", "claimOwner is required"),
+    fencingToken: boundedInteger(body.fencingToken, -1, 1, Number.MAX_SAFE_INTEGER),
+    now,
+  };
+
+  if (action === "heartbeat") {
+    const leaseSeconds = boundedInteger(body.leaseSeconds, DEFAULT_WORKER_LEASE_SECONDS, 15, 900);
+    const record = await context.storage.heartbeatGenerationRequest(access, {
+      ...identity,
+      leaseExpiresAt: new Date(Date.parse(now) + leaseSeconds * 1000).toISOString(),
+    });
+    return json({ request: record });
+  }
+  if (action === "phase") {
+    const phase = readWorkerPhase(body.phase);
+    const record = await context.storage.updateGenerationRequestPhase(access, {
+      ...identity,
+      phase,
+      metadata: readWorkerMetadata(body.metadata),
+    });
+    return json({ request: record });
+  }
+  if (action === "artifacts") {
+    const result = await context.storage.publishGenerationArtifacts(access, {
+      ...identity,
+      publicationKey: optionalString(body.publicationKey),
+      artifacts: Object.hasOwn(body, "artifacts") ? readWorkerArtifacts(body.artifacts) : undefined,
+      timingEvents: readWorkerTimingEvents(body.timingEvents),
+    });
+    return json(result);
+  }
+  if (action === "reconcile") {
+    return json(await context.storage.reconcileGenerationRequest(access, identity));
+  }
+  if (action === "assert") {
+    return json({ request: await context.storage.assertGenerationRequestFence(access, identity) });
+  }
+  if (action === "complete") {
+    if (!Object.hasOwn(body, "cursor")) {
+      throw new FeedHostError("cursor is required", 400, "invalid_worker_request");
+    }
+    const record = await context.storage.completeGenerationRequest(access, {
+      ...identity,
+      outcome: readWorkerOutcome(body.outcome),
+      cursor: body.cursor,
+      artifactIds: readStringArray(body.artifactIds, "artifactIds"),
+      timingEvents: readWorkerTimingEvents(body.timingEvents),
+    });
+    return json({ request: record });
+  }
+
+  const retryAfterSeconds = boundedInteger(body.retryAfterSeconds, 60, 1, 86_400);
+  const errorCode = readWorkerErrorCode(body.errorCode);
+  const record = await context.storage.retryGenerationRequest(access, {
+    ...identity,
+    nextRetryAt: new Date(Date.parse(now) + retryAfterSeconds * 1000).toISOString(),
+    retryable: optionalBoolean(body.retryable) ?? true,
+    error: { code: errorCode, message: optionalString(body.errorMessage) },
+    timingEvents: readWorkerTimingEvents(body.timingEvents),
+  });
+  logEvent("warn", "generation_request_retry", {
+    requestId,
+    runId: identity.runId,
+    claimOwner: identity.claimOwner,
+    fencingToken: identity.fencingToken,
+    attemptCount: record.attemptCount,
+    status: record.status,
+    errorCode,
+    actor: actor.actorId,
+  });
+    return json({ request: record });
+  });
+}
+
 function authorized(request: Request, token: string | undefined): boolean {
   if (!token) return true;
   return request.headers.get("authorization") === `Bearer ${token}`;
+}
+
+function isWorkerRoute(pathname: string): boolean {
+  return pathname === "/api/worker/generation-requests/claim" || pathname.startsWith("/api/worker/generation-requests/");
+}
+
+function workerAuthorized(request: Request, configuredToken: string | undefined): boolean {
+  if (!configuredToken || Buffer.byteLength(configuredToken, "utf8") < MIN_WORKER_TOKEN_BYTES) return false;
+  const header = request.headers.get("authorization");
+  if (!header?.startsWith("Bearer ")) return false;
+  const supplied = header.slice("Bearer ".length);
+  const expectedDigest = createHash("sha256").update(configuredToken).digest();
+  const suppliedDigest = createHash("sha256").update(supplied).digest();
+  return timingSafeEqual(expectedDigest, suppliedDigest);
 }
 
 function isAllowedOrigin(request: Request, allowedOrigins: string[] | undefined, requireActorSession: boolean): boolean {
@@ -819,6 +996,7 @@ function applyResponsePolicy(
 }
 
 function requiresActorSession(request: Request, url: URL): boolean {
+  if (isWorkerRoute(url.pathname)) return false;
   if (PUBLIC_PATHS.has(url.pathname)) return false;
   if (request.method === "POST" && (url.pathname === "/api/delegations" || url.pathname === "/api/client-events")) {
     return false;
@@ -1356,6 +1534,28 @@ function normalizeGenerationRequestRecord(row: Record<string, unknown>): Record<
     packageId: stringField(row, "packageId") ?? stringField(row, "package_id") ?? null,
     dedupeKey: stringField(row, "dedupeKey") ?? stringField(row, "dedupe_key") ?? null,
     prompt: stringField(row, "prompt") ?? null,
+    runId: stringField(row, "runId") ?? stringField(row, "run_id") ?? null,
+    workflowId: stringField(row, "workflowId") ?? stringField(row, "workflow_id") ?? null,
+    maxAttempts: numberField(row, "maxAttempts") ?? numberField(row, "max_attempts") ?? 3,
+    claimOwner: stringField(row, "claimOwner") ?? stringField(row, "claim_owner") ?? null,
+    leaseExpiresAt: stringField(row, "leaseExpiresAt") ?? stringField(row, "lease_expires_at") ?? null,
+    fencingToken: numberField(row, "fencingToken") ?? numberField(row, "fencing_token") ?? 0,
+    attemptCount: numberField(row, "attemptCount") ?? numberField(row, "attempt_count") ?? 0,
+    nextRetryAt: stringField(row, "nextRetryAt") ?? stringField(row, "next_retry_at") ?? null,
+    cancellationRequested:
+      booleanField(row, "cancellationRequested") ?? numberField(row, "cancellation_requested") === 1,
+    phase: stringField(row, "phase") ?? "queued",
+    phaseStartedAt: stringField(row, "phaseStartedAt") ?? stringField(row, "phase_started_at") ?? null,
+    startedAt: stringField(row, "startedAt") ?? stringField(row, "started_at") ?? null,
+    completedAt: stringField(row, "completedAt") ?? stringField(row, "completed_at") ?? null,
+    lastAttemptAt: stringField(row, "lastAttemptAt") ?? stringField(row, "last_attempt_at") ?? null,
+    sourceCursorBefore: row.sourceCursorBefore ?? parseMaybeJson(stringField(row, "source_cursor_before")),
+    sourceCursorAfter: row.sourceCursorAfter ?? parseMaybeJson(stringField(row, "source_cursor_after")),
+    sourceRefs: row.sourceRefs ?? parseMaybeJson(stringField(row, "source_refs_json")) ?? [],
+    publicationKey: stringField(row, "publicationKey") ?? stringField(row, "publication_key") ?? null,
+    artifactIds: row.artifactIds ?? parseMaybeJson(stringField(row, "artifact_ids_json")) ?? [],
+    error: row.error ?? parseMaybeJson(stringField(row, "error_json")) ?? null,
+    timingEvents: row.timingEvents ?? parseMaybeJson(stringField(row, "timing_events_json")) ?? [],
     expiresAt: stringField(row, "expiresAt") ?? stringField(row, "expires_at"),
     createdAt: stringField(row, "createdAt") ?? stringField(row, "created_at"),
     updatedAt: stringField(row, "updatedAt") ?? stringField(row, "updated_at"),
@@ -1425,12 +1625,15 @@ function readGenerationRequestStatus(value: unknown): FeedGenerationRequestRecor
     value === "blocked" ||
     value === "rejected" ||
     value === "consumed" ||
-    value === "expired"
+    value === "expired" ||
+    value === "retry_wait" ||
+    value === "cancelled" ||
+    value === "dead_letter"
   ) {
     return value;
   }
   throw new FeedHostError(
-    "status must be one of accepted|pending|blocked|rejected|consumed|expired",
+    "status must be one of accepted|pending|retry_wait|blocked|rejected|consumed|expired|cancelled|dead_letter",
     400,
     "invalid_generation_status",
   );
@@ -1469,6 +1672,102 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new FeedHostError(`value must be an integer from ${minimum} to ${maximum}`, 400, "invalid_worker_request");
+  }
+  return value;
+}
+
+function readWorkerPhase(value: unknown): "running" | "validating" {
+  if (value === "running" || value === "validating") {
+    return value;
+  }
+  throw new FeedHostError("phase is not allowed", 400, "invalid_worker_request");
+}
+
+function readWorkerMetadata(value: unknown): {
+  sourceCursorAfter?: unknown;
+  sourceRefs?: unknown[];
+  timingEvents?: Array<{ name: string; at: string; durationMs?: number }>;
+} {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new FeedHostError("metadata must be an object", 400, "invalid_worker_request");
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["sourceCursorAfter", "sourceRefs", "timingEvents"].includes(key))) {
+    throw new FeedHostError("metadata contains unsupported fields", 400, "invalid_worker_request");
+  }
+  return {
+    ...(Object.hasOwn(record, "sourceCursorAfter") ? { sourceCursorAfter: record.sourceCursorAfter } : {}),
+    ...(record.sourceRefs === undefined ? {} : { sourceRefs: readObjectArray(record.sourceRefs, "sourceRefs", 500) }),
+    ...(record.timingEvents === undefined ? {} : { timingEvents: readWorkerTimingEvents(record.timingEvents) }),
+  };
+}
+
+function readWorkerTimingEvents(value: unknown): Array<{ name: string; at: string; durationMs?: number }> | undefined {
+  if (value === undefined) return undefined;
+  const events = readObjectArray(value, "timingEvents", 128);
+  return events.map((event) => {
+    const name = readString(event, "name", "invalid_worker_request", "timing event name is required");
+    const at = readString(event, "at", "invalid_worker_request", "timing event timestamp is required");
+    if (!/^[a-z][a-z0-9_.-]{0,63}$/i.test(name) || !Number.isFinite(Date.parse(at))) {
+      throw new FeedHostError("timing event is invalid", 400, "invalid_worker_request");
+    }
+    const durationMs = event.durationMs;
+    if (durationMs !== undefined && (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0)) {
+      throw new FeedHostError("timing event durationMs is invalid", 400, "invalid_worker_request");
+    }
+    return { name, at, ...(durationMs === undefined ? {} : { durationMs }) };
+  });
+}
+
+function readWorkerArtifacts(value: unknown): FeedArtifact[] {
+  return readObjectArray(value, "artifacts", 32) as FeedArtifact[];
+}
+
+function readObjectArray(value: unknown, field: string, maximum: number): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length > maximum || value.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry))) {
+    throw new FeedHostError(`${field} must be an array of at most ${maximum} objects`, 400, "invalid_worker_request");
+  }
+  return value as Record<string, unknown>[];
+}
+
+function readStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > 32 || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new FeedHostError(`${field} must be an array of strings`, 400, "invalid_worker_request");
+  }
+  return value as string[];
+}
+
+function readWorkerOutcome(value: unknown): "published" | "zero_artifacts" {
+  if (value === "published" || value === "zero_artifacts") return value;
+  throw new FeedHostError("outcome must be published or zero_artifacts", 400, "invalid_worker_request");
+}
+
+function readWorkerErrorCode(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(value)) {
+    throw new FeedHostError("errorCode is required", 400, "invalid_worker_request");
+  }
+  return value;
+}
+
+function numberField(body: Record<string, unknown>, key: string): number | undefined {
+  const value = body[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function booleanField(body: Record<string, unknown>, key: string): boolean | undefined {
+  return typeof body[key] === "boolean" ? body[key] : undefined;
+}
+
+function objectField(body: Record<string, unknown>, key: string): Record<string, number> | undefined {
+  const value = body[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, number> : undefined;
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -1575,6 +1874,7 @@ function optionsFromEnv(): FeedHostServerOptions {
     port: Number(process.env.FEED_HOST_PORT ?? "8787"),
     hostname: process.env.FEED_HOST_HOSTNAME ?? "127.0.0.1",
     token: process.env.FEED_HOST_TOKEN || undefined,
+    workerToken: process.env.FEED_HOST_WORKER_TOKEN || undefined,
     tinycloudHost: process.env.TINYCLOUD_HOST || process.env.VITE_TINYCLOUD_HOST || undefined,
     hostPrivateKey: process.env.FEED_HOST_PRIVATE_KEY || (stateDir ? ensureFeedHostPrivateKey(stateDir) : undefined),
     seedOnStart: process.env.FEED_HOST_SEED !== "0",

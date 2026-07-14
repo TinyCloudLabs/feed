@@ -163,11 +163,42 @@ export type FeedGenerationRequestRecord = {
   requestId: string;
   readerNonce: string;
   actorId: string;
-  status: "accepted" | "pending" | "blocked" | "rejected" | "consumed" | "expired";
+  status:
+    | "accepted"
+    | "pending"
+    | "retry_wait"
+    | "blocked"
+    | "rejected"
+    | "consumed"
+    | "expired"
+    | "cancelled"
+    | "dead_letter";
   scope: { artifactType?: string; packageId?: string; sourceRefId?: string; targetRef?: string };
   packageId: string | null;
   dedupeKey: string | null;
   prompt: string | null;
+  runId: string | null;
+  workflowId: string | null;
+  maxAttempts: number;
+  claimOwner: string | null;
+  leaseExpiresAt: string | null;
+  fencingToken: number;
+  attemptCount: number;
+  nextRetryAt: string | null;
+  cancellationRequested: boolean;
+  phase: string;
+  phaseStartedAt: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  lastAttemptAt: string | null;
+  sourceCursorBefore: unknown | null;
+  sourceCursorAfter: unknown | null;
+  sourceRefs: unknown[];
+  publicationKey: string | null;
+  artifactIds: string[];
+  publicationManifest: unknown[] | null;
+  error: { code: string; message?: string } | null;
+  timingEvents: Array<{ name: string; at: string; durationMs?: number }>;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;
@@ -579,6 +610,11 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
           name: "__Host-feed_session",
           description: "Opaque HttpOnly actor session issued after POST /api/delegations.",
         },
+        workerBearer: {
+          type: "http",
+          scheme: "bearer",
+          description: "Server-to-server worker control token; browser origins are rejected.",
+        },
       },
     },
     paths: {
@@ -663,6 +699,33 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       },
       "/generation-requests": {
         get: { responses: { 200: { description: "generation requests", content: jsonResponse } } },
+      },
+      "/generation-requests/{requestId}/cancel": {
+        post: { responses: { 200: { description: "cancellation requested", content: jsonResponse } } },
+      },
+      "/api/worker/generation-requests/claim": {
+        post: {
+          security: [{ workerBearer: [] }],
+          responses: { 200: { description: "claimed request or null", content: jsonResponse } },
+        },
+      },
+      "/api/worker/generation-requests/{requestId}/{action}": {
+        post: {
+          security: [{ workerBearer: [] }],
+          parameters: [{
+            name: "action",
+            in: "path",
+            required: true,
+            schema: {
+              type: "string",
+              enum: ["heartbeat", "phase", "artifacts", "reconcile", "complete", "retry", "assert"],
+            },
+          }],
+          responses: {
+            200: { description: "generation request updated", content: jsonResponse },
+            409: { description: "stale generation lease", content: jsonResponse },
+          },
+        },
       },
     },
   };

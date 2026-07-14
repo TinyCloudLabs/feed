@@ -12,6 +12,7 @@ import {
   FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL,
   FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL,
   FEED_POST_MIGRATION,
+  FEED_GENERATION_WORKER_MIGRATION,
   withFeedHostMigrations,
 } from "./feed-schema.ts";
 
@@ -99,13 +100,14 @@ test("bootstraps schema with per-migration batches when migrations.apply cannot 
   expect(artifactLog?.applies).toBe(1);
   expect(feedLog?.applies).toBe(1);
   expect(artifactLog?.batches.length).toBe(1);
-  expect(feedLog?.batches.length).toBe(2);
+  expect(feedLog?.batches.length).toBe(3);
   expect(artifactLog?.batches[0]?.length).toBe(7);
   expect(feedLog?.batches[0]?.length).toBe(6);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(feedLog?.batches[1]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
   expect(feedLog?.batches[1]?.some((statement) => statement.sql.includes("CREATE TABLE IF NOT EXISTS feed_targeted_interaction_event"))).toBe(true);
+  expect(feedLog?.batches[2]?.some((statement) => statement.sql.includes("ADD COLUMN fencing_token"))).toBe(true);
   expect(artifactLog?.executes.length).toBe(0);
   expect(feedLog?.executes.length).toBe(2);
   expect(feedLog?.executes[0]).toContain("ON CONFLICT(feed_item_id) DO UPDATE");
@@ -121,6 +123,7 @@ test("converges with the canonical post migration without duplicating it", () =>
   expect(merged.map((migration) => migration.id)).toEqual([
     "001_feed_index",
     "002_post_feed_items",
+    "003_generation_worker_control",
   ]);
   expect(merged.filter((migration) => migration.id === "002_post_feed_items")).toHaveLength(1);
   expect(merged.find((migration) => migration.id === "002_post_feed_items")?.description).toBe(
@@ -128,6 +131,9 @@ test("converges with the canonical post migration without duplicating it", () =>
   );
   expect(FEED_POST_MIGRATION.sql.join("\n")).toContain("'legacy:' || artifact_id");
   expect(FEED_POST_MIGRATION.sql.every((sql) => !sql.startsWith("ALTER TABLE"))).toBe(true);
+  expect(FEED_GENERATION_WORKER_MIGRATION.sql).toContain(
+    "ALTER TABLE generation_request ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+  );
 });
 
 test("reconciliation is monotonic, repairs both rollout directions, and closes the parity gate", () => {
@@ -393,11 +399,11 @@ test("bootstraps legacy rows when the actor can read the old SQL resources", asy
   const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
   expect(artifactLog?.batches.length).toBe(2);
-  expect(feedLog?.batches.length).toBe(3);
+  expect(feedLog?.batches.length).toBe(4);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(artifactLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO artifact_index");
-  expect(feedLog?.batches[2]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
+  expect(feedLog?.batches[3]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
 });
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {

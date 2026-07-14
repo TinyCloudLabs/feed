@@ -121,8 +121,40 @@ export const FEED_POST_MIGRATION: FeedV1SchemaMigration = {
   ],
 };
 
+export const FEED_GENERATION_WORKER_MIGRATION: FeedV1SchemaMigration = {
+  id: "003_generation_worker_control",
+  description: "Add leased, fenced generation request execution state.",
+  sql: [
+    "ALTER TABLE generation_request ADD COLUMN run_id TEXT",
+    "ALTER TABLE generation_request ADD COLUMN workflow_id TEXT",
+    "ALTER TABLE generation_request ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3",
+    "ALTER TABLE generation_request ADD COLUMN claim_owner TEXT",
+    "ALTER TABLE generation_request ADD COLUMN lease_expires_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE generation_request ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE generation_request ADD COLUMN next_retry_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN cancellation_requested INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE generation_request ADD COLUMN phase TEXT NOT NULL DEFAULT 'queued'",
+    "ALTER TABLE generation_request ADD COLUMN phase_started_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN started_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN completed_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN last_attempt_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN source_cursor_before TEXT",
+    "ALTER TABLE generation_request ADD COLUMN source_cursor_after TEXT",
+    "ALTER TABLE generation_request ADD COLUMN source_refs_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE generation_request ADD COLUMN publication_key TEXT",
+    "ALTER TABLE generation_request ADD COLUMN artifact_ids_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE generation_request ADD COLUMN publication_manifest_json TEXT",
+    "ALTER TABLE generation_request ADD COLUMN error_json TEXT",
+    "ALTER TABLE generation_request ADD COLUMN timing_events_json TEXT NOT NULL DEFAULT '[]'",
+  ],
+};
+
 export function withFeedHostMigrations(migrations: readonly FeedV1SchemaMigration[]): FeedV1SchemaMigration[] {
   const byId = new Map(migrations.map((migration) => [migration.id, migration] as const));
   if (!byId.has(FEED_POST_MIGRATION.id)) byId.set(FEED_POST_MIGRATION.id, FEED_POST_MIGRATION);
+  if (!byId.has(FEED_GENERATION_WORKER_MIGRATION.id)) {
+    byId.set(FEED_GENERATION_WORKER_MIGRATION.id, FEED_GENERATION_WORKER_MIGRATION);
+  }
   return [...byId.values()];
 }

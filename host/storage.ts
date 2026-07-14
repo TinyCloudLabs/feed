@@ -1,3 +1,6 @@
+import {
+  artifactIndexRow,
+} from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import type {
   DelegatedAccess,
   IDatabaseHandle,
@@ -56,6 +59,7 @@ import {
 } from "./logic.ts";
 import {
   postsFromArtifact,
+  feedItemIdForPost,
   validateFeedItemProjection,
   validateFeedItemProjectionJoin,
   type FeedInteractionTarget,
@@ -207,9 +211,59 @@ type GenerationRequestRow = {
   package_id: string | null;
   dedupe_key: string | null;
   prompt: string | null;
+  run_id: string | null;
+  workflow_id: string | null;
+  max_attempts: number;
+  claim_owner: string | null;
+  lease_expires_at: string | null;
+  fencing_token: number;
+  attempt_count: number;
+  next_retry_at: string | null;
+  cancellation_requested: number;
+  phase: string;
+  phase_started_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  last_attempt_at: string | null;
+  source_cursor_before: string | null;
+  source_cursor_after: string | null;
+  source_refs_json: string;
+  publication_key: string | null;
+  artifact_ids_json: string;
+  publication_manifest_json: string | null;
+  error_json: string | null;
+  timing_events_json: string;
   expires_at: string;
   created_at: string;
   updated_at: string;
+};
+
+export type FeedGenerationClaimInput = {
+  workflowId: string;
+  claimOwner: string;
+  now: string;
+  leaseExpiresAt: string;
+  maxAttempts: number;
+};
+
+export type FeedGenerationTimingEvent = {
+  name: string;
+  at: string;
+  durationMs?: number;
+};
+
+export type FeedGenerationMetadataPatch = {
+  sourceCursorAfter?: unknown;
+  sourceRefs?: unknown[];
+  timingEvents?: FeedGenerationTimingEvent[];
+};
+
+export type FeedGenerationMutationIdentity = {
+  requestId: string;
+  runId: string;
+  claimOwner: string;
+  fencingToken: number;
+  now: string;
 };
 
 export type FeedHostActorStorage = {
@@ -254,6 +308,13 @@ const DB_PATHS: Record<FeedV1SqlResourceName, string> = {
   artifacts_index: FEED_HOST_ARTIFACTS_DB_PATH,
   feed_index: FEED_HOST_FEED_DB_PATH,
 };
+
+const GENERATION_REQUEST_COLUMNS = `request_id, reader_nonce, actor_id, status, scope_json,
+  package_id, dedupe_key, prompt, run_id, workflow_id, max_attempts, claim_owner, lease_expires_at, fencing_token,
+  attempt_count, next_retry_at, cancellation_requested, phase, phase_started_at, started_at,
+  completed_at, last_attempt_at, source_cursor_before, source_cursor_after, source_refs_json,
+  publication_key, artifact_ids_json, publication_manifest_json, error_json, timing_events_json,
+  expires_at, created_at, updated_at`;
 
 export class FeedHostStorage {
   private readonly bootstrapped = new WeakSet<object>();
@@ -695,7 +756,7 @@ export class FeedHostStorage {
     params.push(Math.max(1, Math.min(limit, 500)));
     const rows = await queryRows<GenerationRequestRow>(
       this.db(actor, "feed_index"),
-      `SELECT request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key, prompt, expires_at, created_at, updated_at
+      `SELECT ${GENERATION_REQUEST_COLUMNS}
          FROM generation_request
         WHERE ${conditions.join(" AND ")}
         ORDER BY created_at ${filter.order === "asc" ? "ASC" : "DESC"}
@@ -703,6 +764,487 @@ export class FeedHostStorage {
       params,
     );
     return rows;
+  }
+
+  async claimGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationClaimInput,
+  ): Promise<FeedGenerationRequestRecord | null> {
+    const actorId = normalizeActorId(actor.actorId);
+    const db = this.db(actor, "feed_index");
+    await execute(
+      db,
+      `UPDATE generation_request
+          SET status = 'dead_letter', phase = 'dead_letter', completed_at = ?, updated_at = ?
+        WHERE actor_id = ? AND status = 'pending' AND lease_expires_at <= ?
+          AND attempt_count >= max_attempts AND phase NOT IN ('publishing', 'reconciling')`,
+      [input.now, input.now, actorId, input.now],
+    );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const rows = await queryRows<GenerationRequestRow>(
+        db,
+        `SELECT ${GENERATION_REQUEST_COLUMNS}
+           FROM generation_request AS candidate
+          WHERE actor_id = ? AND expires_at > ? AND (workflow_id IS NULL OR workflow_id = ?) AND (
+            (attempt_count < max_attempts AND (
+              status = 'accepted'
+              OR (status = 'retry_wait' AND next_retry_at <= ?)
+              OR (status = 'pending' AND lease_expires_at <= ? AND phase NOT IN ('publishing', 'reconciling'))
+            ))
+            OR (status = 'pending' AND lease_expires_at <= ? AND phase IN ('publishing', 'reconciling'))
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM generation_request AS inflight
+             WHERE inflight.actor_id = candidate.actor_id
+               AND inflight.workflow_id = ?
+               AND inflight.status = 'pending'
+               AND inflight.lease_expires_at > ?
+               AND inflight.request_id <> candidate.request_id
+          )
+          ORDER BY created_at ASC
+          LIMIT 1`,
+        [actorId, input.now, input.workflowId, input.now, input.now, input.now, input.workflowId, input.now],
+      );
+      const row = rows[0];
+      if (!row) return null;
+      const changes = await execute(
+        db,
+        `UPDATE generation_request
+            SET status = 'pending', run_id = request_id,
+                workflow_id = COALESCE(workflow_id, ?),
+                max_attempts = CASE WHEN workflow_id IS NULL THEN ? ELSE max_attempts END,
+                claim_owner = ?, lease_expires_at = ?,
+                fencing_token = fencing_token + 1, attempt_count = attempt_count + 1,
+                next_retry_at = NULL,
+                phase = CASE WHEN phase IN ('publishing', 'reconciling') THEN phase ELSE 'running' END,
+                phase_started_at = CASE WHEN phase IN ('publishing', 'reconciling') THEN phase_started_at ELSE ? END,
+                source_cursor_before = COALESCE(source_cursor_before, (
+                  SELECT prior.source_cursor_after
+                    FROM generation_request AS prior
+                   WHERE prior.actor_id = generation_request.actor_id
+                     AND prior.workflow_id = ?
+                     AND prior.phase IN ('published', 'zero_artifacts')
+                     AND prior.source_cursor_after IS NOT NULL
+                   ORDER BY prior.completed_at DESC, prior.request_id DESC
+                   LIMIT 1
+                )),
+                started_at = COALESCE(started_at, ?), last_attempt_at = ?, updated_at = ?
+          WHERE actor_id = ? AND request_id = ? AND fencing_token = ? AND expires_at > ?
+            AND (workflow_id IS NULL OR workflow_id = ?) AND (
+              (attempt_count < max_attempts AND (
+                status = 'accepted'
+                OR (status = 'retry_wait' AND next_retry_at <= ?)
+                OR (status = 'pending' AND lease_expires_at <= ? AND phase NOT IN ('publishing', 'reconciling'))
+              ))
+              OR (status = 'pending' AND lease_expires_at <= ? AND phase IN ('publishing', 'reconciling'))
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM generation_request AS inflight
+               WHERE inflight.actor_id = generation_request.actor_id
+                 AND inflight.workflow_id = ?
+                 AND inflight.status = 'pending'
+                 AND inflight.lease_expires_at > ?
+                 AND inflight.request_id <> generation_request.request_id
+            )`,
+        [
+          input.workflowId,
+          input.maxAttempts,
+          input.claimOwner,
+          input.leaseExpiresAt,
+          input.now,
+          input.workflowId,
+          input.now,
+          input.now,
+          input.now,
+          actorId,
+          row.request_id,
+          Number(row.fencing_token ?? 0),
+          input.now,
+          input.workflowId,
+          input.now,
+          input.now,
+          input.now,
+          input.workflowId,
+          input.now,
+        ],
+      );
+      if (changes === 1) return this.readGenerationRequest(actor, row.request_id);
+    }
+    return null;
+  }
+
+  async heartbeatGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity & { leaseExpiresAt: string },
+  ): Promise<FeedGenerationRequestRecord> {
+    await this.executeFencedMutation(
+      actor,
+      input,
+      "SET lease_expires_at = ?, updated_at = ?",
+      [input.leaseExpiresAt, input.now],
+    );
+    return this.requireGenerationRequest(actor, input.requestId);
+  }
+
+  async updateGenerationRequestPhase(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity & {
+      phase: "running" | "validating";
+      metadata: FeedGenerationMetadataPatch;
+    },
+  ): Promise<FeedGenerationRequestRecord> {
+    const patch = generationMetadataSql(input.metadata);
+    await this.executeFencedMutation(
+      actor,
+      input,
+      `SET phase = ?, phase_started_at = ?, ${patch.setClause} updated_at = ?`,
+      [input.phase, input.now, ...patch.params, input.now],
+      "AND cancellation_requested = 0 AND phase NOT IN ('publishing', 'reconciling')",
+    );
+    return this.requireGenerationRequest(actor, input.requestId);
+  }
+
+  async publishGenerationArtifacts(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity & {
+      publicationKey?: string;
+      artifacts?: FeedArtifact[];
+      timingEvents?: FeedGenerationTimingEvent[];
+    },
+  ): Promise<{
+    outcome: "published" | "zero_artifacts" | "cancelled";
+    request: FeedGenerationRequestRecord;
+    artifactIds: string[];
+    publicationKey: string | null;
+  }> {
+    let current = await this.requireGenerationRequest(actor, input.requestId);
+    if (
+      current.status === "cancelled" && current.runId === input.runId &&
+      current.claimOwner === input.claimOwner && current.fencingToken === input.fencingToken
+    ) {
+      return { outcome: "cancelled", request: current, artifactIds: [], publicationKey: null };
+    }
+    current = await this.requireCurrentGenerationRun(actor, input);
+    if (input.artifacts === undefined && !current.publicationManifest) {
+      throw new FeedHostError("artifacts are required before publication can resume", 400, "invalid_worker_request");
+    }
+    const artifacts = [...(input.artifacts ?? current.publicationManifest as FeedArtifact[])]
+      .sort((left, right) => left.artifactId.localeCompare(right.artifactId));
+    const artifactIds = artifacts.map((artifact) => artifact.artifactId);
+    if (new Set(artifactIds).size !== artifactIds.length) {
+      throw new FeedHostError("artifact ids must be unique", 400, "invalid_worker_request");
+    }
+    for (const artifact of artifacts) {
+      const validated = validateFeedArtifact(artifact);
+      if (!validated.ok) {
+        throw new FeedHostError("artifact validation failed", 400, "invalid_artifact", { errors: validated.errors });
+      }
+      if (artifact.producedBy.runId !== input.requestId) {
+        throw new FeedHostError("artifact runId must equal requestId", 400, "invalid_artifact");
+      }
+      assertArtifactSourcesWereCheckpointed(artifact, current.sourceRefs);
+    }
+    const publicationKey = input.publicationKey ?? current.publicationKey;
+    if (!publicationKey || !/^[a-z0-9][a-z0-9:._-]{0,255}$/i.test(publicationKey)) {
+      throw new FeedHostError("publicationKey is required", 400, "invalid_worker_request");
+    }
+    if (current.publicationKey && current.publicationKey !== publicationKey) throw publicationConflict();
+    if (current.artifactIds.length > 0 && !sameStrings(current.artifactIds, artifactIds)) throw publicationConflict();
+    if (current.publicationManifest && stableJson(current.publicationManifest) !== stableJson(artifacts)) {
+      throw publicationConflict();
+    }
+    const timingEvents = input.timingEvents ?? current.timingEvents;
+    if (!current.publicationManifest) {
+      const changes = await execute(
+        this.db(actor, "feed_index"),
+        `UPDATE generation_request
+            SET phase = 'publishing', phase_started_at = ?, publication_key = ?,
+                artifact_ids_json = ?, publication_manifest_json = ?, timing_events_json = ?, updated_at = ?
+          WHERE actor_id = ? AND request_id = ? AND run_id = ? AND claim_owner = ?
+            AND fencing_token = ? AND status = 'pending' AND lease_expires_at > ?
+            AND cancellation_requested = 0 AND phase IN ('running', 'validating')
+            AND publication_manifest_json IS NULL`,
+        [
+          input.now,
+          publicationKey,
+          JSON.stringify(artifactIds),
+          stableJson(artifacts),
+          JSON.stringify(timingEvents),
+          input.now,
+          normalizeActorId(actor.actorId),
+          input.requestId,
+          input.runId,
+          input.claimOwner,
+          input.fencingToken,
+          input.now,
+        ],
+      );
+      if (changes !== 1) {
+        const after = await this.requireGenerationRequest(actor, input.requestId);
+        if (
+          after.status === "pending" && after.cancellationRequested &&
+          after.phase !== "publishing" && after.phase !== "reconciling"
+        ) {
+          await this.executeFencedMutation(
+            actor,
+            input,
+            "SET status = 'cancelled', phase = 'cancelled', completed_at = ?, updated_at = ?",
+            [input.now, input.now],
+            "AND cancellation_requested = 1 AND phase NOT IN ('publishing', 'reconciling')",
+          );
+          const cancelled = await this.requireGenerationRequest(actor, input.requestId);
+          return { outcome: "cancelled", request: cancelled, artifactIds: [], publicationKey: null };
+        }
+        throw generationLeaseConflict();
+      }
+    } else if (current.phase !== "publishing" && current.phase !== "reconciling") {
+      throw generationLeaseConflict();
+    }
+    for (const artifact of artifacts) {
+      await this.writeArtifactDocument(actor, artifact);
+    }
+    await this.insertSeedRows(actor, "artifacts_index", artifacts.map(artifactIndexRow));
+    await this.assertGenerationRequestFence(actor, input);
+    const request = await this.requireGenerationRequest(actor, input.requestId);
+    return {
+      outcome: artifactIds.length > 0 ? "published" : "zero_artifacts",
+      request,
+      artifactIds,
+      publicationKey,
+    };
+  }
+
+  async reconcileGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity,
+  ): Promise<{ request: FeedGenerationRequestRecord; feedItemIds: string[] }> {
+    const current = await this.requireCurrentGenerationRun(actor, input);
+    if (current.phase !== "publishing" && current.phase !== "reconciling") throw generationLeaseConflict();
+    if (!current.publicationKey) throw new FeedHostError("artifacts must be checkpointed before reconciliation", 409, "publication_incomplete");
+    await this.executeFencedMutation(
+      actor,
+      input,
+      "SET phase = 'reconciling', phase_started_at = ?, updated_at = ?",
+      [input.now, input.now],
+      "AND phase IN ('publishing', 'reconciling')",
+    );
+    const plan = await this.reconcileFeedProjection(actor);
+    const expectedFeedItemIds = new Set(current.publicationManifest!.flatMap((value) => {
+      const artifact = value as FeedArtifact;
+      const mode = artifact.feedSurface?.mode;
+      if (mode === "none") return [];
+      const postIds = mode === "artifact_preview"
+        ? []
+        : postsFromArtifact(artifact).map((post) => feedItemIdForPost(artifact.artifactId, post.postId));
+      return [...postIds, `legacy:${artifact.artifactId}`];
+    }));
+    const expectedArtifacts = new Set(current.artifactIds);
+    const actualFeedItemIds = new Set(plan.desired
+      .filter((item) => expectedArtifacts.has(item.target.artifactId))
+      .map((item) => item.feedItemId));
+    if (!sameStrings([...expectedFeedItemIds], [...actualFeedItemIds])) {
+      throw new FeedHostError("Feed reconciliation is incomplete", 409, "publication_incomplete");
+    }
+    const timingEvents = [
+      ...current.timingEvents.filter((event) => event.name !== "feed_reconciled"),
+      { name: "feed_reconciled", at: input.now },
+    ];
+    await this.executeFencedMutation(
+      actor,
+      input,
+      "SET timing_events_json = ?, updated_at = ?",
+      [JSON.stringify(timingEvents), input.now],
+      "AND phase = 'reconciling'",
+    );
+    const feedItemIds = [...actualFeedItemIds].sort();
+    return { request: await this.requireGenerationRequest(actor, input.requestId), feedItemIds };
+  }
+
+  async completeGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity & {
+      outcome: "published" | "zero_artifacts";
+      cursor: unknown;
+      artifactIds: string[];
+      timingEvents?: FeedGenerationTimingEvent[];
+    },
+  ): Promise<FeedGenerationRequestRecord> {
+    const current = await this.requireCurrentGenerationRun(actor, input);
+    if (current.phase !== "reconciling") throw generationLeaseConflict();
+    if (!sameStrings(current.artifactIds, input.artifactIds)) throw publicationConflict();
+    if ((input.outcome === "published") !== (input.artifactIds.length > 0)) {
+      throw new FeedHostError("terminal outcome does not match artifact ids", 400, "invalid_worker_request");
+    }
+    await this.executeFencedMutation(
+      actor,
+      input,
+      "SET status = 'consumed', phase = ?, source_cursor_after = ?, completed_at = ?, timing_events_json = ?, lease_expires_at = NULL, updated_at = ?",
+      [
+        input.outcome,
+        JSON.stringify(input.cursor),
+        input.now,
+        JSON.stringify(input.timingEvents ?? current.timingEvents),
+        input.now,
+      ],
+      "AND phase = 'reconciling'",
+    );
+    return this.requireGenerationRequest(actor, input.requestId);
+  }
+
+  async retryGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity & {
+      nextRetryAt: string;
+      retryable?: boolean;
+      error: { code: string; message?: string };
+      timingEvents?: FeedGenerationTimingEvent[];
+    },
+  ): Promise<FeedGenerationRequestRecord> {
+    await this.executeFencedMutation(
+      actor,
+      input,
+           `SET status = CASE
+             WHEN cancellation_requested = 1 THEN 'cancelled'
+             WHEN ? = 0 THEN 'dead_letter'
+             WHEN attempt_count >= max_attempts THEN 'dead_letter'
+             ELSE 'retry_wait'
+           END,
+           phase = CASE
+             WHEN cancellation_requested = 1 THEN 'cancelled'
+             WHEN ? = 0 THEN 'dead_letter'
+             WHEN attempt_count >= max_attempts THEN 'dead_letter'
+             ELSE 'retry_wait'
+           END,
+           next_retry_at = CASE
+             WHEN ? = 1 AND cancellation_requested = 0 AND attempt_count < max_attempts THEN ?
+             ELSE NULL
+           END,
+           lease_expires_at = NULL, error_json = ?, timing_events_json = ?,
+           completed_at = CASE WHEN cancellation_requested = 1 OR ? = 0 OR attempt_count >= max_attempts THEN ? ELSE NULL END,
+           updated_at = ?`,
+      [
+        input.retryable === false ? 0 : 1,
+        input.retryable === false ? 0 : 1,
+        input.retryable === false ? 0 : 1,
+        input.nextRetryAt,
+        JSON.stringify(input.error),
+        JSON.stringify(input.timingEvents ?? []),
+        input.retryable === false ? 0 : 1,
+        input.now,
+        input.now,
+      ],
+      "AND phase NOT IN ('publishing', 'reconciling')",
+    );
+    return this.requireGenerationRequest(actor, input.requestId);
+  }
+
+  async requestGenerationCancellation(
+    actor: FeedHostActorStorage,
+    input: { requestId: string; now: string },
+  ): Promise<FeedGenerationRequestRecord> {
+    const actorId = normalizeActorId(actor.actorId);
+    const changes = await execute(
+      this.db(actor, "feed_index"),
+      `UPDATE generation_request
+          SET cancellation_requested = 1,
+              status = CASE
+                WHEN status IN ('accepted', 'retry_wait') OR (status = 'pending' AND phase NOT IN ('publishing', 'reconciling'))
+                  THEN 'cancelled'
+                ELSE status
+              END,
+              phase = CASE
+                WHEN status IN ('accepted', 'retry_wait') OR (status = 'pending' AND phase NOT IN ('publishing', 'reconciling'))
+                  THEN 'cancelled'
+                ELSE phase
+              END,
+              completed_at = CASE
+                WHEN status IN ('accepted', 'retry_wait') OR (status = 'pending' AND phase NOT IN ('publishing', 'reconciling'))
+                  THEN ?
+                ELSE completed_at
+              END,
+              updated_at = ?
+        WHERE actor_id = ? AND request_id = ?
+          AND status NOT IN ('consumed', 'cancelled', 'dead_letter', 'rejected', 'expired')`,
+      [input.now, input.now, actorId, input.requestId],
+    );
+    if (changes === 0) return this.requireGenerationRequest(actor, input.requestId);
+    return this.requireGenerationRequest(actor, input.requestId);
+  }
+
+  private async executeFencedMutation(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity,
+    setClause: string,
+    params: SqlValue[],
+    extraGuard = "",
+    extraGuardParams: SqlValue[] = [],
+  ): Promise<void> {
+    const changes = await execute(
+      this.db(actor, "feed_index"),
+      `UPDATE generation_request ${setClause}
+        WHERE actor_id = ? AND request_id = ? AND run_id = ? AND claim_owner = ?
+          AND fencing_token = ? AND status = 'pending' AND lease_expires_at > ? ${extraGuard}`,
+      [
+        ...params,
+        normalizeActorId(actor.actorId),
+        input.requestId,
+        input.runId,
+        input.claimOwner,
+        input.fencingToken,
+        input.now,
+        ...extraGuardParams,
+      ],
+    );
+    if (changes !== 1) throw generationLeaseConflict();
+  }
+
+  async assertGenerationRequestFence(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity,
+  ): Promise<FeedGenerationRequestRecord> {
+    return this.requireCurrentGenerationRun(actor, input);
+  }
+
+  private async readGenerationRequest(
+    actor: FeedHostActorStorage,
+    requestId: string,
+  ): Promise<FeedGenerationRequestRecord | null> {
+    const rows = await queryRows<GenerationRequestRow>(
+      this.db(actor, "feed_index"),
+      `SELECT ${GENERATION_REQUEST_COLUMNS}
+         FROM generation_request
+        WHERE actor_id = ? AND request_id = ?
+        LIMIT 1`,
+      [normalizeActorId(actor.actorId), requestId],
+    );
+    return rows[0] ? generationRequestFromRow(rows[0]) : null;
+  }
+
+  private async requireGenerationRequest(
+    actor: FeedHostActorStorage,
+    requestId: string,
+  ): Promise<FeedGenerationRequestRecord> {
+    const request = await this.readGenerationRequest(actor, requestId);
+    if (!request) throw new FeedHostError(`generation request not found: ${requestId}`, 404, "not_found");
+    return request;
+  }
+
+  private async requireCurrentGenerationRun(
+    actor: FeedHostActorStorage,
+    input: FeedGenerationMutationIdentity,
+  ): Promise<FeedGenerationRequestRecord> {
+    const request = await this.requireGenerationRequest(actor, input.requestId);
+    if (
+      request.status !== "pending" ||
+      request.runId !== input.runId ||
+      request.claimOwner !== input.claimOwner ||
+      request.fencingToken !== input.fencingToken ||
+      !request.leaseExpiresAt ||
+      request.leaseExpiresAt <= input.now
+    ) {
+      throw generationLeaseConflict();
+    }
+    return request;
   }
 
   async updateGenerationRequestStatus(
@@ -717,7 +1259,7 @@ export class FeedHostStorage {
     const normalizedActorId = normalizeActorId(actor.actorId);
     const rows = await queryRows<GenerationRequestRow>(
       this.db(actor, "feed_index"),
-      `SELECT request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key, prompt, expires_at, created_at, updated_at
+      `SELECT ${GENERATION_REQUEST_COLUMNS}
          FROM generation_request
         WHERE actor_id = ? AND request_id = ?
         LIMIT 1`,
@@ -1184,7 +1726,7 @@ export class FeedHostStorage {
     const dedupeKey = input.payloadHash ?? hashJson({ actorId: input.actorId, scope, prompt, targetRef: input.targetRef });
     const existing = await queryRows<GenerationRequestRow>(
       this.db(actor, "feed_index"),
-      `SELECT request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key, prompt, expires_at, created_at, updated_at
+      `SELECT ${GENERATION_REQUEST_COLUMNS}
          FROM generation_request
         WHERE actor_id = ? AND (reader_nonce = ? OR dedupe_key = ?)
         LIMIT 1`,
@@ -1218,6 +1760,28 @@ export class FeedHostStorage {
       packageId: scope.packageId ?? null,
       dedupeKey,
       prompt,
+      runId: null,
+      workflowId: null,
+      maxAttempts: 3,
+      claimOwner: null,
+      leaseExpiresAt: null,
+      fencingToken: 0,
+      attemptCount: 0,
+      nextRetryAt: null,
+      cancellationRequested: false,
+      phase: "queued",
+      phaseStartedAt: null,
+      startedAt: null,
+      completedAt: null,
+      lastAttemptAt: null,
+      sourceCursorBefore: null,
+      sourceCursorAfter: null,
+      sourceRefs: [],
+      publicationKey: null,
+      artifactIds: [],
+      publicationManifest: null,
+      error: null,
+      timingEvents: [],
       expiresAt,
       createdAt: input.createdAt,
       updatedAt: input.createdAt,
@@ -1260,7 +1824,7 @@ async function applyMigrations(
   if (candidate.migrations?.apply) {
     const result = await candidate.migrations.apply(input).catch((error) => ({ ok: false, error }));
     if (result.ok) return { ok: true };
-    if (!multiResourceInvocationUnsupported(resultError(result))) {
+    if (!multiResourceInvocationUnsupported(resultError(result)) && !isDuplicateColumn(result.error)) {
       return { ok: false, error: result.error };
     }
   }
@@ -1268,10 +1832,12 @@ async function applyMigrations(
   for (const migration of input.migrations) {
     const batched = await db.batch(migration.sql.map((sql) => ({ sql }))).catch((error) => ({ ok: false as const, error }));
     if (batched.ok) continue;
-    if (!multiResourceInvocationUnsupported(resultError(batched))) return { ok: false, error: batched.error };
+    if (!multiResourceInvocationUnsupported(resultError(batched)) && !isDuplicateColumn(batched.error)) {
+      return { ok: false, error: batched.error };
+    }
     for (const sql of migration.sql) {
       const result = await db.execute(sql).catch((error) => ({ ok: false as const, error }));
-      if (!result.ok) return { ok: false, error: result.error };
+      if (!result.ok && !isDuplicateColumn(result.error)) return { ok: false, error: result.error };
     }
   }
   return { ok: true };
@@ -1904,8 +2470,12 @@ function generationRequestSql(request: FeedGenerationRequestRecord): SqlStatemen
   return {
     sql: `INSERT OR REPLACE INTO generation_request (
       request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key,
-      prompt, expires_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      prompt, run_id, workflow_id, max_attempts, claim_owner, lease_expires_at, fencing_token, attempt_count,
+      next_retry_at, cancellation_requested, phase, phase_started_at, started_at,
+      completed_at, last_attempt_at, source_cursor_before, source_cursor_after, source_refs_json,
+      publication_key, artifact_ids_json, publication_manifest_json, error_json, timing_events_json,
+      expires_at, created_at, updated_at
+    ) VALUES (${Array.from({ length: 35 }, () => "?").join(", ")})`,
     params: [
       request.requestId,
       request.readerNonce,
@@ -1915,6 +2485,28 @@ function generationRequestSql(request: FeedGenerationRequestRecord): SqlStatemen
       request.packageId,
       request.dedupeKey,
       request.prompt,
+      request.runId,
+      request.workflowId,
+      request.maxAttempts,
+      request.claimOwner,
+      request.leaseExpiresAt,
+      request.fencingToken,
+      request.attemptCount,
+      request.nextRetryAt,
+      request.cancellationRequested ? 1 : 0,
+      request.phase,
+      request.phaseStartedAt,
+      request.startedAt,
+      request.completedAt,
+      request.lastAttemptAt,
+      serializeJson(request.sourceCursorBefore),
+      serializeJson(request.sourceCursorAfter),
+      JSON.stringify(request.sourceRefs),
+      request.publicationKey,
+      JSON.stringify(request.artifactIds),
+      request.publicationManifest === null ? null : stableJson(request.publicationManifest),
+      request.error === null ? null : JSON.stringify(request.error),
+      JSON.stringify(request.timingEvents),
       request.expiresAt,
       request.createdAt,
       request.updatedAt,
@@ -1932,10 +2524,99 @@ function generationRequestFromRow(row: GenerationRequestRow): FeedGenerationRequ
     packageId: row.package_id,
     dedupeKey: row.dedupe_key,
     prompt: row.prompt,
+    runId: row.run_id ?? null,
+    workflowId: row.workflow_id ?? null,
+    maxAttempts: Number(row.max_attempts ?? 3),
+    claimOwner: row.claim_owner ?? null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    fencingToken: Number(row.fencing_token ?? 0),
+    attemptCount: Number(row.attempt_count ?? 0),
+    nextRetryAt: row.next_retry_at ?? null,
+    cancellationRequested: Number(row.cancellation_requested ?? 0) === 1,
+    phase: row.phase ?? "queued",
+    phaseStartedAt: row.phase_started_at ?? null,
+    startedAt: row.started_at ?? null,
+    completedAt: row.completed_at ?? null,
+    lastAttemptAt: row.last_attempt_at ?? null,
+    sourceCursorBefore: parseJson(row.source_cursor_before, null),
+    sourceCursorAfter: parseJson(row.source_cursor_after, null),
+    sourceRefs: parseJson(row.source_refs_json, []),
+    publicationKey: row.publication_key ?? null,
+    artifactIds: parseJson(row.artifact_ids_json, []),
+    publicationManifest: parseJson(row.publication_manifest_json, null),
+    error: parseJson(row.error_json, null),
+    timingEvents: parseJson(row.timing_events_json, []),
     expiresAt: row.expires_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function parseJson<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function serializeJson(value: unknown): string {
+  return JSON.stringify(value ?? null);
+}
+
+function generationMetadataSql(metadata: FeedGenerationMetadataPatch): { setClause: string; params: SqlValue[] } {
+  const assignments: string[] = [];
+  const params: SqlValue[] = [];
+  if (Object.hasOwn(metadata, "sourceCursorAfter")) {
+    assignments.push("source_cursor_after = ?");
+    params.push(serializeJson(metadata.sourceCursorAfter));
+  }
+  if (metadata.sourceRefs !== undefined) {
+    assignments.push("source_refs_json = ?");
+    params.push(JSON.stringify(metadata.sourceRefs));
+  }
+  if (metadata.timingEvents !== undefined) {
+    assignments.push("timing_events_json = ?");
+    params.push(JSON.stringify(metadata.timingEvents));
+  }
+  return {
+    setClause: assignments.length > 0 ? `${assignments.join(", ")},` : "",
+    params,
+  };
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return [...left].sort().join("\u0000") === [...right].sort().join("\u0000");
+}
+
+function assertArtifactSourcesWereCheckpointed(artifact: FeedArtifact, checkpointed: unknown[]): void {
+  const allowed = new Set(checkpointed.flatMap((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+    const ref = value as Record<string, unknown>;
+    return typeof ref.sourceRefId === "string" && typeof ref.observedHash === "string"
+      ? [`${ref.sourceRefId}\u0000${ref.observedHash}`]
+      : [];
+  }));
+  if (artifact.sourceRefs.some((ref) => !allowed.has(`${ref.sourceRefId}\u0000${ref.observedHash}`))) {
+    throw new FeedHostError("artifact source refs were not checkpointed by this run", 400, "invalid_artifact");
+  }
+}
+
+function stableJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+}
+
+function publicationConflict(): FeedHostError {
+  return new FeedHostError("publication does not match the immutable request manifest", 409, "publication_conflict");
+}
+
+function generationLeaseConflict(): FeedHostError {
+  return new FeedHostError("generation request lease is stale", 409, "stale_generation_lease");
 }
 
 function resultError(result: unknown): string {
@@ -1948,6 +2629,11 @@ function resultError(result: unknown): string {
 
 function multiResourceInvocationUnsupported(message: string): boolean {
   return message.includes("does not support multi-resource invocations");
+}
+
+function isDuplicateColumn(error: unknown): boolean {
+  const message = (error as { message?: unknown } | null)?.message;
+  return /duplicate column name/i.test(message ? String(message) : resultError(error));
 }
 
 async function readLegacyRows(
