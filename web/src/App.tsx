@@ -17,6 +17,7 @@ import {
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
 import { errorDetail, reportClientEvent } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
+import type { FeedHostSetupStatus } from "./delegation.ts";
 import {
   FeedV1HostClient,
   FeedV1HostError,
@@ -42,7 +43,15 @@ type FeedState = "idle" | "starting" | "running" | "error";
 type SetupStage = "identity" | "context" | "preparing";
 
 const FEED_EVENTS_RETRY_MS = 5000;
+const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
+
+class FeedSetupFailedError extends Error {
+  constructor(readonly setup: FeedHostSetupStatus) {
+    super(setup.error?.message ?? "Feed Host preparation failed");
+    this.name = "FeedSetupFailedError";
+  }
+}
 
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
@@ -59,6 +68,7 @@ export function App() {
   const [signInError, setSignInError] = useState<string | null>(null);
   const [feedState, setFeedState] = useState<FeedState>("idle");
   const [setupStage, setSetupStage] = useState<SetupStage>("identity");
+  const [hostSetup, setHostSetup] = useState<FeedHostSetupStatus | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
   const [items, setItems] = useState<FeedItem[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
@@ -154,6 +164,7 @@ export function App() {
   const resetFeedState = useCallback(() => {
     setFeedState("idle");
     setSetupStage("identity");
+    setHostSetup(null);
     setSetupError(null);
     setItems([]);
     setLoadState("idle");
@@ -168,21 +179,42 @@ export function App() {
     feedbackAttempts.current.clear();
   }, [artifactCache]);
 
+  const waitForHostSetup = useCallback(async (): Promise<void> => {
+    for (;;) {
+      const status = await client.getDelegationStatus();
+      if (!status.complete) throw new Error(`Feed Host delegation is ${status.state}`);
+      if (status.setup) setHostSetup(status.setup);
+      if (status.setup?.state === "ready") return;
+      if (status.setup?.state === "failed") throw new FeedSetupFailedError(status.setup);
+      await new Promise((resolve) => window.setTimeout(resolve, SETUP_STATUS_POLL_MS));
+    }
+  }, [client]);
+
+  const recordSetupFailure = useCallback((error: unknown) => {
+    console.error("[Feed setup]", error);
+    if (error instanceof FeedSetupFailedError) setHostSetup(error.setup);
+    reportClientEvent("error", "feed_setup_failed", errorDetail(error), session?.readerDid);
+    setFeedState("error");
+    setSetupError("Feed’s backend could not finish preparing your Feed.");
+  }, [session?.readerDid]);
+
   const startFeed = useCallback(
     async () => {
       if (!session || !policy || setupInFlight.current) return;
       setupInFlight.current = true;
       setFeedState("starting");
       setSetupStage("context");
+      setHostSetup(null);
       setSetupError(null);
       setLoadError(null);
       try {
-        await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
+        const [receipt] = await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
+        if (receipt?.setup) setHostSetup(receipt.setup);
         setSetupStage("preparing");
+        await waitForHostSetup();
         await loadFeed();
         setFeedState("running");
       } catch (error) {
-        console.error("[Feed setup]", error);
         if (isFeedReconnectRequiredError(error)) {
           reportClientEvent("warn", "feed_reconnect_required", errorDetail(error), session.readerDid);
           await signOut().catch(() => undefined);
@@ -191,15 +223,32 @@ export function App() {
           resetFeedState();
           return;
         }
-        reportClientEvent("error", "feed_setup_failed", errorDetail(error), session.readerDid);
-        setFeedState("error");
-        setSetupError("Feed could not finish connecting. Check your connection and try again.");
+        recordSetupFailure(error);
       } finally {
         setupInFlight.current = false;
       }
     },
-    [client, loadFeed, policy, resetFeedState, session],
+    [client, loadFeed, policy, recordSetupFailure, resetFeedState, session, waitForHostSetup],
   );
+
+  const retryFeedSetup = useCallback(async () => {
+    if (!session || setupInFlight.current) return;
+    setupInFlight.current = true;
+    setFeedState("starting");
+    setSetupStage("preparing");
+    setSetupError(null);
+    try {
+      const response = await client.retrySetup();
+      setHostSetup(response.setup);
+      await waitForHostSetup();
+      await loadFeed();
+      setFeedState("running");
+    } catch (error) {
+      recordSetupFailure(error);
+    } finally {
+      setupInFlight.current = false;
+    }
+  }, [client, loadFeed, recordSetupFailure, session, waitForHostSetup]);
 
   useEffect(() => {
     if (!session || !policy) return;
@@ -359,14 +408,15 @@ export function App() {
   }
 
   if (feedState === "idle" || feedState === "starting") {
-    return <SetupScreen stage={setupStage} />;
+    return <SetupScreen stage={setupStage} setup={hostSetup} />;
   }
 
   if (feedState === "error") {
     return (
       <SetupFailurePanel
         error={setupError ?? "Feed could not finish connecting."}
-        onRetry={() => void startFeed()}
+        setup={hostSetup}
+        onRetry={() => void (hostSetup?.state === "failed" ? retryFeedSetup() : startFeed())}
         onSignInAgain={() => void disconnect()}
       />
     );
@@ -504,8 +554,16 @@ function SignInScreen({ error, onSignIn }: { error: string | null; onSignIn: () 
   );
 }
 
-function SetupScreen({ stage }: { stage: SetupStage }) {
+function SetupScreen({ stage, setup }: { stage: SetupStage; setup: FeedHostSetupStatus | null }) {
   const contextReady = stage === "preparing";
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!contextReady || setup?.state !== "preparing") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [contextReady, setup?.state]);
+  const elapsedSeconds = setup ? Math.max(0, Math.floor((now - Date.parse(setup.startedAt)) / 1000)) : 0;
+  const activity = setupActivityLabel(setup?.phase);
   return (
     <main className="setup-screen" aria-labelledby="setup-title">
       <header className="setup-header"><strong>Feed</strong></header>
@@ -526,6 +584,16 @@ function SetupScreen({ stage }: { stage: SetupStage }) {
             <span><strong>Preparing your first Feed</strong><small>Making useful items now.</small></span>
           </li>
         </ol>
+        {contextReady && setup && (
+          <div className="setup-live" aria-label="Backend setup status">
+            <div className="setup-live-bar" aria-hidden="true"><span /></div>
+            <p>
+              <strong>{activity}</strong>
+              <span>{elapsedSeconds}s</span>
+            </p>
+            <small>Backend phase: {setup.phase.replaceAll("_", " ")} · attempt {setup.attempt}</small>
+          </div>
+        )}
         <p className="setup-help">If anything needs attention, Feed will say what to reconnect.</p>
       </section>
     </main>
@@ -534,10 +602,12 @@ function SetupScreen({ stage }: { stage: SetupStage }) {
 
 function SetupFailurePanel({
   error,
+  setup,
   onRetry,
   onSignInAgain,
 }: {
   error: string;
+  setup: FeedHostSetupStatus | null;
   onRetry: () => void;
   onSignInAgain: () => void;
 }) {
@@ -546,12 +616,31 @@ function SetupFailurePanel({
       <p className="status-label">Feed needs attention</p>
       <h1>We couldn’t finish setting up your Feed.</h1>
       <p>{error}</p>
+      {setup?.state === "failed" && (
+        <details className="setup-error-detail">
+          <summary>Backend details</summary>
+          <p>Phase: {setup.phase} · attempt {setup.attempt}</p>
+          {setup.error?.message && <p>{setup.error.message}</p>}
+        </details>
+      )}
       <div className="panel-actions">
-        <button className="primary" onClick={onRetry}>Try again</button>
+        <button className="primary" onClick={onRetry}>{setup?.state === "failed" ? "Retry backend setup" : "Try again"}</button>
         <button onClick={onSignInAgain}>Sign in again</button>
       </div>
     </main>
   );
+}
+
+function setupActivityLabel(phase: FeedHostSetupStatus["phase"] | undefined): string {
+  switch (phase) {
+    case "bootstrap": return "Preparing secure storage…";
+    case "artifact_check": return "Checking existing artifacts…";
+    case "seed": return "Creating starter items…";
+    case "reconcile": return "Building your Feed…";
+    case "ready": return "Feed is ready";
+    case "failed": return "Backend setup stopped";
+    default: return "Starting the Feed backend…";
+  }
 }
 
 function NoticePanel({

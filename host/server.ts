@@ -96,7 +96,20 @@ type ActorState = AcceptedFeedDelegation & {
   accessByResource: Map<string, DelegatedAccess>;
   storageAccess?: FeedHostActorStorage;
   ready?: Promise<void>;
+  preparation?: ActorPreparationStatus;
   expiresAt: string;
+};
+
+type ActorPreparationPhase = "idle" | "bootstrap" | "artifact_check" | "seed" | "reconcile" | "ready" | "failed";
+
+type ActorPreparationStatus = {
+  state: "not_started" | "preparing" | "ready" | "failed";
+  phase: ActorPreparationPhase;
+  attempt: number;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  error?: { code: "preparation_failed"; message: string };
 };
 
 type FeedHostContext = {
@@ -116,6 +129,7 @@ type FeedHostContext = {
   inputAuthorityExpectedHost: string;
   requireActorSession: boolean;
   actorSessions: Map<string, { actorKey: string; expiresAt: string; policyHash: string }>;
+  actorRequestQueues: Map<string, Promise<void>>;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -249,6 +263,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       inputAuthorityExpectedHost: options.inputAuthorityExpectedHost ?? options.tinycloudHost ?? "https://node.tinycloud.xyz",
       requireActorSession: options.requireActorSession !== false,
       actorSessions: new Map(),
+      actorRequestQueues,
     };
     return context;
   };
@@ -410,6 +425,20 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     return json(await readDelegationStatus(context, actorId));
   }
 
+  if (request.method === "POST" && url.pathname === "/api/delegations/retry") {
+    const actorId = requireRequestActorId(request);
+    const actor = await requireDelegation(context, actorId);
+    if (actor.preparation?.state === "failed") actor.ready = undefined;
+    void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
+    const setup = actorPreparationSnapshot(actor);
+    logEvent("info", "feed_preparation_retry_requested", {
+      actor: actor.actorId,
+      attempt: setup.attempt,
+      phase: setup.phase,
+    });
+    return json({ accepted: true, actorId: actor.actorId, setup }, setup.state === "ready" ? 200 : 202);
+  }
+
   if (request.method === "DELETE" && url.pathname === "/api/delegations") {
     const actorId = requireRequestActorId(request);
     await removeDelegation(context, actorId);
@@ -446,57 +475,65 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
     }
 
-    const actorKey = normalizeActorId(activated.actorId);
-    const prior = actors.get(actorKey);
-    const existing = prior && !isDelegationExpired(prior) ? prior : undefined;
-    const currentProofComplete = policy.resources.every((resource) => activated.resources.includes(resource.path));
-    const resources = currentProofComplete
-      ? [...activated.resources]
-      : [...new Set([...(existing?.resources ?? []), ...activated.resources])];
-    const accessByResource = new Map(currentProofComplete ? undefined : existing?.accessByResource);
-    for (const resource of activated.resources) accessByResource.set(resource, activated.access);
-    const state: ActorState = {
-      actorId: activated.actorId,
-      acceptedAt: activated.acceptedAt,
-      expiresAt: currentProofComplete ? activated.expiresAt : earliestExpiry(existing?.expiresAt, activated.expiresAt),
-      resources,
-      accessByResource,
-      storageAccess: currentProofComplete ? undefined : existing?.storageAccess,
-      ready: currentProofComplete ? undefined : existing?.ready,
-    };
-    if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, state);
-    if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
-      await retryTinyCloudTransaction(
-        "delegation_persist",
-        activated.actorId,
-        () => persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
-          serializedDelegation,
+    return serializeActorRequest(context.actorRequestQueues, activated.actorId, async () => {
+      const actorKey = normalizeActorId(activated.actorId);
+      const prior = actors.get(actorKey);
+      const existing = prior && !isDelegationExpired(prior) ? prior : undefined;
+      const currentProofComplete = policy.resources.every((resource) => activated.resources.includes(resource.path));
+      const resources = currentProofComplete
+        ? [...activated.resources]
+        : [...new Set([...(existing?.resources ?? []), ...activated.resources])];
+      const accessByResource = new Map(currentProofComplete ? undefined : existing?.accessByResource);
+      for (const resource of activated.resources) accessByResource.set(resource, activated.access);
+      const state: ActorState = {
+        actorId: activated.actorId,
+        acceptedAt: activated.acceptedAt,
+        expiresAt: currentProofComplete ? activated.expiresAt : earliestExpiry(existing?.expiresAt, activated.expiresAt),
+        resources,
+        accessByResource,
+        storageAccess: currentProofComplete ? undefined : existing?.storageAccess,
+        ready: currentProofComplete ? undefined : existing?.ready,
+        preparation: currentProofComplete ? undefined : existing?.preparation,
+      };
+      const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
+        ? existing
+        : state;
+      if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, actor);
+      if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
+        await retryTinyCloudTransaction(
+          "delegation_persist",
+          activated.actorId,
+          () => persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
+            serializedDelegation,
+            resources: activated.resources,
+            acceptedAt: activated.acceptedAt,
+            expiresAt: activated.expiresAt,
+          }),
+        );
+      }
+      if (!currentProofComplete) {
+        return json({
+          accepted: true,
+          actorId: activated.actorId,
           resources: activated.resources,
-          acceptedAt: activated.acceptedAt,
-          expiresAt: activated.expiresAt,
-        }),
-      );
-    }
-    if (!currentProofComplete) {
+          policyHash,
+          status: "activation_pending",
+        }, 202);
+      }
+      void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
+      const setup = actorPreparationSnapshot(actor);
+      const sessionToken = issueActorSession(context, actorKey, actor.expiresAt);
       return json({
         accepted: true,
         actorId: activated.actorId,
-        resources: activated.resources,
+        resources: actor.resources,
         policyHash,
-        status: "activation_pending",
-      }, 202);
-    }
-    await ensureActorReady(storage, state, seedOnStart);
-    const sessionToken = issueActorSession(context, actorKey, state.expiresAt);
-    return json({
-      accepted: true,
-      actorId: activated.actorId,
-      resources,
-      policyHash,
-      status: "active",
-    }, 200, {
-      "set-cookie": actorSessionCookie(sessionToken, request, state.expiresAt),
-      "cache-control": "private, no-store",
+        status: setup.state === "ready" ? "active" : "preparing",
+        setup,
+      }, setup.state === "ready" ? 200 : 202, {
+        "set-cookie": actorSessionCookie(sessionToken, request, actor.expiresAt),
+        "cache-control": "private, no-store",
+      });
     });
   }
 
@@ -1180,6 +1217,7 @@ async function readDelegationStatus(
   state: "missing" | "active" | "partial" | "expired" | "stale";
   complete: boolean;
   resources: Array<{ path: string; acceptedAt: string; expiresAt: string }>;
+  setup?: ActorPreparationStatus;
 }> {
   const actorKey = normalizeActorId(actorId);
   const liveActor = context.actors.get(actorKey);
@@ -1191,6 +1229,7 @@ async function readDelegationStatus(
       currentPolicyHash: context.policyHash,
       state: "active",
       complete: true,
+      setup: actorPreparationSnapshot(liveActor),
       resources: liveActor.resources.map((path) => ({
         path,
         acceptedAt: liveActor.acceptedAt,
@@ -1350,13 +1389,49 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
 
 async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, seedOnStart: boolean): Promise<void> {
   if (!actor.ready) {
+    const startedAt = new Date().toISOString();
+    actor.preparation = {
+      state: "preparing",
+      phase: "bootstrap",
+      attempt: (actor.preparation?.attempt ?? 0) + 1,
+      startedAt,
+      updatedAt: startedAt,
+    };
     const ready = (async () => {
-      const access = actorStorage(actor);
-      await retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access));
-      if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
-        await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
+      try {
+        const access = actorStorage(actor);
+        await retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access));
+        updateActorPreparation(actor, "artifact_check");
+        if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
+          updateActorPreparation(actor, "seed");
+          await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
+        }
+        updateActorPreparation(actor, "reconcile");
+        await retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access));
+        const completedAt = new Date().toISOString();
+        actor.preparation = {
+          ...actorPreparationSnapshot(actor),
+          state: "ready",
+          phase: "ready",
+          updatedAt: completedAt,
+          completedAt,
+          error: undefined,
+        };
+      } catch (error) {
+        const completedAt = new Date().toISOString();
+        actor.preparation = {
+          ...actorPreparationSnapshot(actor),
+          state: "failed",
+          phase: "failed",
+          updatedAt: completedAt,
+          completedAt,
+          error: {
+            code: "preparation_failed",
+            message: publicPreparationError(error),
+          },
+        };
+        throw error;
       }
-      await retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access));
     })();
     actor.ready = ready;
     ready.catch(() => {
@@ -1364,6 +1439,32 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
     });
   }
   await actor.ready;
+}
+
+function updateActorPreparation(actor: ActorState, phase: ActorPreparationPhase): void {
+  actor.preparation = {
+    ...actorPreparationSnapshot(actor),
+    state: "preparing",
+    phase,
+    updatedAt: new Date().toISOString(),
+    completedAt: undefined,
+    error: undefined,
+  };
+}
+
+function actorPreparationSnapshot(actor: ActorState): ActorPreparationStatus {
+  return actor.preparation ?? {
+    state: "not_started",
+    phase: "idle",
+    attempt: 0,
+    startedAt: actor.acceptedAt,
+    updatedAt: actor.acceptedAt,
+  };
+}
+
+function publicPreparationError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, " ").trim().slice(0, 500) || "Feed preparation failed";
 }
 
 async function retryTinyCloudTransaction<T>(operation: string, actorId: string | undefined, run: () => Promise<T>): Promise<T> {

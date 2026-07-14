@@ -7,7 +7,9 @@ import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../../sha
 import type {
   FeedHostDelegationPolicy,
   FeedHostDelegationReceipt,
+  FeedHostDelegationStatus,
   FeedHostDelegationSubmission,
+  FeedHostSetupStatus,
 } from "./delegation.ts";
 import type { ChildInputAuthoritySubmission } from "./inputAuthority.ts";
 
@@ -129,6 +131,14 @@ export class FeedV1HostClient {
       method: "POST",
       body: JSON.stringify(submission),
     });
+  }
+
+  async getDelegationStatus(): Promise<FeedHostDelegationStatus> {
+    return this.request<FeedHostDelegationStatus>("/api/delegations/status");
+  }
+
+  async retrySetup(): Promise<{ accepted: true; actorId: string; setup: FeedHostSetupStatus }> {
+    return this.request("/api/delegations/retry", { method: "POST" });
   }
 
   async disconnectFeed(): Promise<void> {

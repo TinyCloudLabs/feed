@@ -641,6 +641,9 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       "/api/delegations/status": {
         get: { responses: { 200: { description: "delegation status", content: jsonResponse } } },
       },
+      "/api/delegations/retry": {
+        post: { responses: { 200: { description: "setup already ready", content: jsonResponse }, 202: { description: "setup retry started", content: jsonResponse } } },
+      },
       "/input-authorities": {
         get: { responses: { 200: { description: "named input authorities", content: jsonResponse } } },
         post: { responses: { 201: { description: "input authority attached", content: jsonResponse } } },
