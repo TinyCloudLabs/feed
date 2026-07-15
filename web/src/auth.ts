@@ -12,7 +12,7 @@ import type { providers } from "ethers";
 import { TINYCLOUD_HOST } from "./config.ts";
 import type { FeedHostDelegationPolicy, FeedHostDelegationReceipt } from "./delegation.ts";
 import { FeedV1HostClient } from "./feedV1HostClient.ts";
-import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import { delegateInputAuthorityLocally } from "./inputAuthority.ts";
 import { connectWallet } from "./openkey.ts";
 import { isRetryableDelegationConflict, isRetryableSpaceCreationFailure } from "./delegationRetry.ts";
@@ -31,6 +31,13 @@ let instance: TinyCloudWeb | null = null;
 export type FeedSession = {
   address: string;
   readerDid: string;
+};
+
+export type FeedLoginTrace = {
+  traceId: string;
+  loginStartedAt: number;
+  systemStartedAt?: number;
+  systemElapsedBeforeApprovalMs?: number;
 };
 
 function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
@@ -77,10 +84,20 @@ function savedAddress(): string | null {
   }
 }
 
-export async function signIn(policy: FeedHostDelegationPolicy): Promise<FeedSession> {
+export async function signIn(policy: FeedHostDelegationPolicy, trace?: FeedLoginTrace): Promise<FeedSession> {
+  const walletStartedAt = performance.now();
   const { address, web3Provider } = await connectWallet();
+  if (trace) reportClientTiming("login_wallet_connected", { ...trace, phaseStartedAt: walletStartedAt });
   const tc = new TinyCloudWeb(buildConfig(web3Provider, policy));
+  const tinyCloudStartedAt = performance.now();
   await signInWithSpaceCreationRetry(tc);
+  if (trace) {
+    reportClientTiming("login_tinycloud_signed_in", {
+      ...trace,
+      phaseStartedAt: tinyCloudStartedAt,
+      actorId: tc.did,
+    });
+  }
   instance = tc;
   try {
     localStorage.setItem(LAST_ADDRESS_KEY, address);
@@ -125,11 +142,20 @@ export async function submitFeedHostDelegations(input: {
   client: FeedV1HostClient;
   policy: FeedHostDelegationPolicy;
   actorId: string;
+  trace?: FeedLoginTrace;
 }): Promise<FeedHostDelegationReceipt[]> {
   if (!instance) throw new Error("TinyCloud session is required before creating Feed Host delegations");
   let serializedDelegation: string;
   try {
+    const materializeStartedAt = performance.now();
     const result = await materializeFeedHostDelegation(instance, input.policy, input.actorId);
+    if (input.trace) {
+      reportClientTiming("login_delegation_materialized", {
+        ...input.trace,
+        phaseStartedAt: materializeStartedAt,
+        actorId: input.actorId,
+      });
+    }
     if (result.prompted) {
       throw new Error("Feed Host delegation unexpectedly required another wallet approval");
     }
@@ -139,7 +165,17 @@ export async function submitFeedHostDelegations(input: {
     if (isSessionScopeError(error)) throw reconnectRequiredError(error);
     throw error;
   }
-  return [await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation })];
+  const submitStartedAt = performance.now();
+  const receipt = await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation });
+  if (input.trace) {
+    reportClientTiming("login_delegation_accepted", {
+      ...input.trace,
+      phaseStartedAt: submitStartedAt,
+      actorId: input.actorId,
+      detail: `setup=${receipt.setup?.state ?? "unknown"}`,
+    });
+  }
+  return [receipt];
 }
 
 async function materializeFeedHostDelegation(

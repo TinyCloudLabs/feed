@@ -462,8 +462,10 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect(page.getByText(/approve the default bundle/i)).toHaveCount(0);
   await expect(page.getByText(/first-run-approval/i)).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
-  await expect(page.getByText(/test an invite preview inside setup/i)).toBeVisible();
-  await expect(page.getByText(/first collaborative action is now the dominant stall point/i)).toBeVisible();
+  // The phrase also appears inside the lazily hydrated inline artifact body
+  // (which may be collapsed), so scope to the visible post card.
+  await expect(page.locator("p.post-body", { hasText: /test an invite preview inside setup/i })).toBeVisible();
+  await expect(page.getByText(/first collaborative action is now the dominant stall point/i).locator("visible=true").first()).toBeVisible();
   await expectMobileLayout(page);
   await page.getByText("Open complete artifact").first().click();
   await expect(page.getByText("From The onboarding experiment changed where users stall").first()).toBeVisible();

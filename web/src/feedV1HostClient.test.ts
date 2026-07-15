@@ -20,10 +20,12 @@ describe("FeedV1HostClient", () => {
       baseUrl: "https://feed.example.test/",
       token: "token-1",
       actorId: "did:pkh:eip155:1:0xabc",
+      traceId: "trace-login-1",
       fetchImpl: async (input, init) => {
         calls.push(String(input));
         expect((init?.headers as Headers).get("authorization")).toBe("Bearer token-1");
         expect((init?.headers as Headers).get("x-feed-actor-id")).toBe("did:pkh:eip155:1:0xabc");
+        expect((init?.headers as Headers).get("x-feed-trace-id")).toBe("trace-login-1");
         return jsonResponse({ items: [], nextCursor: "next" });
       },
     });
@@ -126,6 +128,45 @@ describe("FeedV1HostClient", () => {
         credentials: "include",
       },
       { url: "https://feed.example.test/api/delegations", body: undefined, credentials: "include" },
+    ]);
+  });
+
+  test("reads backend setup state and requests a preparation retry", async () => {
+    const calls: Array<{ url: string; method?: string }> = [];
+    const setup = {
+      state: "failed" as const,
+      phase: "failed" as const,
+      attempt: 1,
+      startedAt: "2026-07-14T12:00:00.000Z",
+      updatedAt: "2026-07-14T12:00:10.000Z",
+      error: { code: "preparation_failed" as const, message: "bootstrap failed" },
+    };
+    const client = new FeedV1HostClient({
+      baseUrl: "https://feed.example.test",
+      actorId: "did:pkh:reader",
+      fetchImpl: async (input, init) => {
+        calls.push({ url: String(input), method: init?.method });
+        if (String(input).endsWith("/status")) {
+          return jsonResponse({
+            actorId: "did:pkh:reader",
+            delegateDID: "did:key:host",
+            policyHash: "sha256:one",
+            currentPolicyHash: "sha256:one",
+            state: "active",
+            complete: true,
+            resources: [],
+            setup,
+          });
+        }
+        return jsonResponse({ accepted: true, actorId: "did:pkh:reader", setup: { ...setup, state: "preparing" } }, { status: 202 });
+      },
+    });
+
+    expect((await client.getDelegationStatus()).setup?.state).toBe("failed");
+    expect((await client.retrySetup()).setup.state).toBe("preparing");
+    expect(calls).toEqual([
+      { url: "https://feed.example.test/api/delegations/status", method: undefined },
+      { url: "https://feed.example.test/api/delegations/retry", method: "POST" },
     ]);
   });
 

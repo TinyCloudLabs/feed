@@ -149,6 +149,7 @@ describe("Feed Host server", () => {
         "/delegation-policy",
         "/api/server-info",
         "/api/delegations",
+        "/api/delegations/retry",
         "/api/delegations/status",
         "/input-authorities",
         "/input-authorities/{sourceId}",
@@ -238,11 +239,16 @@ describe("Feed Host server", () => {
 
     const preflight = await fetch(`${runtime.url}/feed`, {
       method: "OPTIONS",
-      headers: { origin: allowedOrigin },
+      headers: {
+        origin: allowedOrigin,
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "x-feed-trace-id",
+      },
     });
     expect(preflight.status).toBe(204);
     expect(preflight.headers.get("access-control-allow-origin")).toBe(allowedOrigin);
     expect(preflight.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(preflight.headers.get("access-control-allow-headers")).toContain("X-Feed-Trace-Id");
 
     const deniedOrigin = await fetch(`${runtime.url}/delegation-policy`, {
       headers: { origin: "https://attacker.example" },
@@ -260,7 +266,7 @@ describe("Feed Host server", () => {
       actorId: ACTOR_ID,
       serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
     }, { origin: allowedOrigin });
-    expect(grant.status).toBe(200);
+    expect(grant.status).toBe(202);
     const setCookie = grant.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("feed_session=");
     expect(setCookie).toContain("HttpOnly");
@@ -385,7 +391,124 @@ describe("Feed Host server", () => {
 
     await grantAllDelegations(runtime, ACTOR_ID);
     expect(activations).toBe(3);
+    for (let attempt = 0; attempt < 30 && saves < 3; attempt += 1) await Bun.sleep(50);
     expect(saves).toBe(3);
+  });
+
+  test("does not block the browser session on delegation-store persistence", async () => {
+    const store = fakeDelegationStore();
+    let releaseSave: (() => void) | undefined;
+    const blockedSave = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    store.save = async () => blockedSave;
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+
+    const request = postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    });
+    const response = await Promise.race([request, Bun.sleep(100).then(() => null)]);
+    expect(response).not.toBeNull();
+    expect(response?.status).toBe(202);
+    expect(response?.headers.get("set-cookie")).toContain("feed_session=");
+    releaseSave?.();
+  });
+
+  test("exposes failed backend preparation and retries it through the actor session", async () => {
+    const storage = new FailOncePreparationStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const grant = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    });
+    expect(grant.status).toBe(202);
+    const cookie = grant.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+
+    const failed = await waitForSetupStatus(runtime, cookie, "failed");
+    expect(failed.setup?.phase).toBe("failed");
+    expect(failed.setup?.attempt).toBe(1);
+    expect(failed.setup?.error?.message).toContain("planned bootstrap failure");
+
+    const retry = await postJson(`${runtime.url}/api/delegations/retry`, {}, { cookie });
+    expect(retry.status).toBe(202);
+    const ready = await waitForSetupStatus(runtime, cookie, "ready");
+    expect(ready.setup?.attempt).toBe(2);
+    expect(storage.bootstrapAttempts).toBe(2);
+  });
+
+  test("deduplicates concurrent backend preparation for the same actor", async () => {
+    const storage = new BlockingPreparationStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const body = {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    };
+
+    const [first, second] = await Promise.all([
+      postJson(`${runtime.url}/api/delegations`, body),
+      postJson(`${runtime.url}/api/delegations`, body),
+    ]);
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    expect(storage.bootstrapAttempts).toBe(1);
+    storage.release();
+    await waitForSetupStatus(runtime, "", "ready");
+  });
+
+  test("serves existing feed data while backend preparation is still running", async () => {
+    const storage = new BlockingPreparationStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const grant = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    });
+    expect(grant.status).toBe(202);
+    const cookie = grant.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+
+    const feed = await Promise.race([
+      fetch(`${runtime.url}/feed`, { headers: { cookie } }),
+      Bun.sleep(100).then(() => null),
+    ]);
+    expect(feed).not.toBeNull();
+    expect(feed?.status).toBe(200);
+    expect(((await feed?.json()) as { items: unknown[] }).items).toEqual([]);
+
+    storage.release();
+    await waitForSetupStatus(runtime, cookie, "ready");
   });
 
   test("serializes concurrent private requests for the same actor", async () => {
@@ -408,6 +531,57 @@ describe("Feed Host server", () => {
     expect(feed.status).toBe(200);
     expect(events.status).toBe(200);
     expect(storage.maxConcurrentReads).toBe(1);
+  });
+
+  test("keeps setup status responsive while a feed read is blocked", async () => {
+    const storage = new BlockingFeedReadStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const cookie = await grantAllDelegations(runtime, ACTOR_ID);
+    const feed = fetch(`${runtime.url}/feed`, { headers: { cookie } });
+    await storage.started;
+
+    const status = await fetch(`${runtime.url}/api/delegations/status`, { headers: { cookie } });
+    expect(status.status).toBe(200);
+    expect(((await status.json()) as { setup: { state: string } }).setup.state).toBe("ready");
+
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const reconnect = await Promise.race([
+      postJson(`${runtime.url}/api/delegations`, {
+        actorId: ACTOR_ID,
+        serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+      }),
+      Bun.sleep(100).then(() => null),
+    ]);
+    expect(reconnect).not.toBeNull();
+    expect(reconnect?.status).toBe(200);
+
+    storage.release();
+    expect((await feed).status).toBe(200);
+  });
+
+  test("does not reconcile projections on reader endpoints", async () => {
+    const storage = new ReconcileCountingStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const feed = await fetch(`${runtime.url}/feed?limit=40`, { headers: { "x-feed-actor-id": ACTOR_ID } });
+    expect(feed.status).toBe(200);
+    const events = await fetch(`${runtime.url}/feed/events`, { headers: { "x-feed-actor-id": ACTOR_ID } });
+    expect(events.status).toBe(200);
+    expect(storage.reconcileAttempts).toBe(0);
   });
 
   test("attaches, inspects, revokes, and removes a redacted named input authority", async () => {
@@ -1352,9 +1526,9 @@ describe("Feed Host server", () => {
       actorId: ACTOR_ID,
       serializedDelegation: combined,
     });
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     const body = (await response.json()) as { status: string; resources: string[] };
-    expect(body.status).toBe("active");
+    expect(body.status).toBe("preparing");
     expect(body.resources.sort()).toEqual(policy.resources.map((resource) => resource.path).sort());
 
     const feed = await getJson<{ items: unknown[] }>(`${runtime.url}/feed?limit=10`, {
@@ -2021,6 +2195,8 @@ class FakeFeedHostStorage {
     return this.artifactIndex.size > 0;
   }
 
+  async reconcileProjectionCompatibility(_actor: FeedHostActorStorage): Promise<void> {}
+
   async insertSeedRows(_actor: FeedHostActorStorage, _dbName: string, rows: SqlSeedRow[]): Promise<void> {
     for (const row of rows) this.applySeedRow(row);
   }
@@ -2628,6 +2804,34 @@ class TransientBootstrapStorage extends FakeFeedHostStorage {
   }
 }
 
+class FailOncePreparationStorage extends FakeFeedHostStorage {
+  bootstrapAttempts = 0;
+
+  override async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    this.bootstrapAttempts += 1;
+    if (this.bootstrapAttempts === 1) throw new Error("planned bootstrap failure");
+    return super.bootstrapSchema(actor);
+  }
+}
+
+class BlockingPreparationStorage extends FakeFeedHostStorage {
+  bootstrapAttempts = 0;
+  private resolveBootstrap: (() => void) | undefined;
+  private readonly blocked = new Promise<void>((resolve) => {
+    this.resolveBootstrap = resolve;
+  });
+
+  override async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    this.bootstrapAttempts += 1;
+    await this.blocked;
+    return super.bootstrapSchema(actor);
+  }
+
+  release(): void {
+    this.resolveBootstrap?.();
+  }
+}
+
 class ConcurrentReadStorage extends FakeFeedHostStorage {
   private activeReads = 0;
   maxConcurrentReads = 0;
@@ -2652,6 +2856,39 @@ class ConcurrentReadStorage extends FakeFeedHostStorage {
     } finally {
       this.activeReads -= 1;
     }
+  }
+}
+
+class BlockingFeedReadStorage extends FakeFeedHostStorage {
+  private resolveStarted: (() => void) | undefined;
+  private resolveRead: (() => void) | undefined;
+  readonly started = new Promise<void>((resolve) => {
+    this.resolveStarted = resolve;
+  });
+  private readonly blocked = new Promise<void>((resolve) => {
+    this.resolveRead = resolve;
+  });
+
+  override async listFeed(
+    actor: FeedHostActorStorage,
+    input: { limit: number; cursor?: string },
+  ): Promise<{ items: FeedArtifactProjection[]; nextCursor?: string }> {
+    this.resolveStarted?.();
+    await this.blocked;
+    return super.listFeed(actor, input);
+  }
+
+  release(): void {
+    this.resolveRead?.();
+  }
+}
+
+class ReconcileCountingStorage extends FakeFeedHostStorage {
+  reconcileAttempts = 0;
+
+  override async reconcileFeedProjection(actor: FeedHostActorStorage) {
+    this.reconcileAttempts += 1;
+    return super.reconcileFeedProjection(actor);
   }
 }
 
@@ -3137,7 +3374,29 @@ async function grantAllDelegations(runtime: FeedHostRuntime, actorId: string): P
   expect(response.ok).toBe(true);
   const sessionCookie = response.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
   expect(sessionCookie).not.toBe("");
+  await waitForSetupStatus(runtime, sessionCookie, "ready", actorId);
   return sessionCookie;
+}
+
+async function waitForSetupStatus(
+  runtime: FeedHostRuntime,
+  cookie: string,
+  expected: "ready" | "failed",
+  actorId = ACTOR_ID,
+): Promise<{
+  setup?: { state: string; phase: string; attempt: number; error?: { message: string } };
+}> {
+  for (let attempt = 0; attempt < 250; attempt += 1) {
+    const status = await getJson<{
+      setup?: { state: string; phase: string; attempt: number; error?: { message: string } };
+    }>(`${runtime.url}/api/delegations/status`, {
+      "x-feed-actor-id": actorId,
+      ...(cookie ? { cookie } : {}),
+    });
+    if (status.setup?.state === expected) return status;
+    await Bun.sleep(10);
+  }
+  throw new Error(`setup did not reach ${expected}`);
 }
 
 async function getJson<T>(url: string, headers: HeadersInit = {}): Promise<T> {

@@ -61,6 +61,101 @@ DELETE /input-authorities/:sourceId
 POST /admin/seed
 ```
 
+## Local Feed with Portless
+
+Portless gives the two-process development stack stable HTTPS names:
+
+- `https://feed.localhost` — Vite web app;
+- `https://api.feed.localhost` — Feed Host.
+
+Install Portless globally once, then start and trust its local HTTPS proxy:
+
+```sh
+npm install -g portless
+portless proxy start
+portless trust
+```
+
+Register fixed aliases for Feed's documented development ports. `--force`
+intentionally moves an existing alias from another worktree to this stack:
+
+```sh
+portless alias api.feed 8787 --force
+portless alias feed 5173 --force
+```
+
+Start Feed Host in the first terminal:
+
+```sh
+FEED_HOST_ALLOWED_ORIGINS=https://feed.localhost,http://127.0.0.1:5173 \
+FEED_HOST_STATE_DIR=.local/feed-host \
+bun run host
+```
+
+Start Vite in the second terminal. The browser must use the HTTPS Host URL to
+avoid mixed-content blocking:
+
+```sh
+VITE_FEED_HOST_URL=https://api.feed.localhost \
+bun run dev:vite --host 127.0.0.1 --port 5173
+```
+
+Verify and open the stack:
+
+```sh
+curl -fsS https://api.feed.localhost/health
+open https://feed.localhost
+portless list
+```
+
+`FEED_HOST_STATE_DIR` preserves the local Host key and delegate DID across
+restarts. Deleting `.local/feed-host` creates a new Host identity, so an
+existing browser session may need to sign in again for the new delegate.
+
+`bun run dev` also launches Vite through Portless, but Portless normally adds a
+branch/worktree prefix to dynamically managed routes. Use the fixed aliases
+above when collaborators need the exact `feed.localhost` and
+`api.feed.localhost` URLs.
+
+Safari can require an explicit hosts-file refresh:
+
+```sh
+portless hosts sync
+```
+
+If 8787 or 5173 is already occupied, select another pair and update both the
+process and alias together. For example:
+
+```sh
+portless alias api.feed 8877 --force
+portless alias feed 5273 --force
+
+FEED_HOST_PORT=8877 \
+FEED_HOST_ALLOWED_ORIGINS=https://feed.localhost \
+FEED_HOST_STATE_DIR=.local/feed-host \
+bun run host
+
+VITE_FEED_HOST_URL=https://api.feed.localhost \
+bun run dev:vite --host 127.0.0.1 --port 5273
+```
+
+Stop the Host and Vite processes with `Ctrl-C`. Static aliases can remain for
+the next run, or be removed explicitly:
+
+```sh
+portless alias --remove feed
+portless alias --remove api.feed
+```
+
+The Playwright smoke suite starts its own Host and Vite processes. Keep the live
+stack running by assigning the smoke suite different ports:
+
+```sh
+FEED_SMOKE_HOST_PORT=8897 \
+FEED_SMOKE_WEB_PORT=4299 \
+bun run test:smoke
+```
+
 Named input authorities are separate from the Feed Host output delegation.
 The browser attenuates a received `tc1` share with
 `sharing.delegateReceivedShare(...)`; raw share links, embedded private JWKs,

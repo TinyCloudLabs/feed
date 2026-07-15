@@ -241,6 +241,47 @@ test("hydrates corrupt artifact docs defensively and audits invalid fixtures", a
   }
 });
 
+test("lists feed projections without hydrating artifact documents", async () => {
+  const artifact = {
+    artifact_id: "temporarily-unavailable",
+    artifact_type: "insight_card",
+    package_id: "pkg-timeout",
+    source_fingerprint: "sha256:timeout",
+    doc_key: "listen-import/timeout.json",
+    published_at: "2026-07-14T12:00:00.000Z",
+    updated_at: "2026-07-14T12:00:00.000Z",
+  };
+  const actor = makeHydrationActor({
+    artifacts: [artifact],
+    docs: {},
+    projections: [{
+      feed_item_id: artifact.artifact_id,
+      target_kind: "artifact_preview",
+      artifact_id: artifact.artifact_id,
+      post_id: null,
+      rank_score: 1,
+      disposition: "default",
+      visibility: "visible",
+      freshness_label: "fresh",
+      reason_codes_json: "[]",
+      package_id: artifact.package_id,
+      source_fingerprint: artifact.source_fingerprint,
+      published_at: artifact.published_at,
+      updated_at: artifact.updated_at,
+    }],
+  });
+
+  const storage = new FeedHostStorage();
+  const page = await storage.listFeed(actor, { limit: 40 });
+  expect(page.items).toHaveLength(1);
+  expect(page.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+
+  const refreshedAccess = makeHydrationActor({ artifacts: [], docs: {}, projections: [] });
+  const cachedPage = await storage.listFeed(refreshedAccess, { limit: 40 });
+  expect(cachedPage.items).toHaveLength(1);
+  expect(cachedPage.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+});
+
 test("rejects feedback for a missing artifact before writing either interaction table", async () => {
   const storage = new FeedHostStorage();
   const actor = makeHydrationActor({ artifacts: [], docs: {} });
@@ -270,6 +311,7 @@ function makeHydrationActor(input: {
     updated_at: string;
   }>;
   docs: Record<string, unknown>;
+  projections?: Record<string, unknown>[];
 }): FeedHostActorStorage {
   const docs = new Map(Object.entries(input.docs));
 
@@ -307,6 +349,15 @@ function makeHydrationActor(input: {
             data: {
               columns: [],
               rows: [],
+            },
+          };
+        }
+        if (path === FEED_HOST_FEED_DB_PATH && sql.includes("FROM feed_item_projection")) {
+          return {
+            ok: true,
+            data: {
+              columns: [],
+              rows: input.projections ?? [],
             },
           };
         }

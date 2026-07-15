@@ -12,11 +12,13 @@ import {
   signIn,
   signOut,
   submitFeedHostDelegations,
+  type FeedLoginTrace,
   type FeedSession,
 } from "./auth.ts";
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
-import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
+import type { FeedHostSetupStatus } from "./delegation.ts";
 import {
   FeedV1HostClient,
   FeedV1HostError,
@@ -48,7 +50,8 @@ type RoutineDraft = {
   outputVolume: "short" | "standard" | "detailed";
 };
 
-const FEED_EVENTS_RETRY_MS = 5000;
+const FEED_EVENTS_RETRY_MS = 15_000;
+const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
 const DEFAULT_ROUTINE_DRAFT: RoutineDraft = {
   cadence: "normal",
@@ -56,6 +59,13 @@ const DEFAULT_ROUTINE_DRAFT: RoutineDraft = {
   audience: "private",
   outputVolume: "standard",
 };
+
+class FeedSetupFailedError extends Error {
+  constructor(readonly setup: FeedHostSetupStatus) {
+    super(setup.error?.message ?? "Feed Host preparation failed");
+    this.name = "FeedSetupFailedError";
+  }
+}
 
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
@@ -72,6 +82,7 @@ export function App() {
   const [signInError, setSignInError] = useState<string | null>(null);
   const [feedState, setFeedState] = useState<FeedState>("idle");
   const [setupStage, setSetupStage] = useState<SetupStage>("identity");
+  const [hostSetup, setHostSetup] = useState<FeedHostSetupStatus | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
   const [items, setItems] = useState<FeedItem[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
@@ -84,11 +95,20 @@ export function App() {
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef(false);
+  const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastRecoveryAt = useRef(0);
+  const loginTrace = useRef<FeedLoginTrace | null>(null);
+  const firstContentReported = useRef<string | null>(null);
+  const restoredHostSession = useRef(false);
   const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
 
   const client = useMemo(
-    () => new FeedV1HostClient({ baseUrl: FEED_HOST_URL, token: FEED_HOST_TOKEN || undefined, actorId: session?.readerDid }),
+    () => new FeedV1HostClient({
+      baseUrl: FEED_HOST_URL,
+      token: FEED_HOST_TOKEN || undefined,
+      actorId: session?.readerDid,
+      traceId: loginTrace.current?.traceId,
+    }),
     [session?.readerDid],
   );
   const artifactCache = useMemo(() => createLazyArtifactCache((artifactId) => client.getArtifact(artifactId)), [client]);
@@ -96,11 +116,33 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
+      const startedAt = performance.now();
+      const trace: FeedLoginTrace = {
+        traceId: crypto.randomUUID(),
+        loginStartedAt: startedAt,
+        systemStartedAt: startedAt,
+      };
+      loginTrace.current = trace;
+      client.setTraceId(trace.traceId);
+      const policyStartedAt = performance.now();
       const nextPolicy = await client.getDelegationPolicy();
+      reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
       if (cancelled) return;
       setPolicy(nextPolicy);
+      const restoreStartedAt = performance.now();
       const restored = await restoreSession(nextPolicy);
-      if (!cancelled && restored) setSession(restored);
+      if (!cancelled && restored) {
+        restoredHostSession.current = true;
+        reportClientTiming("login_session_restored", {
+          ...trace,
+          phaseStartedAt: restoreStartedAt,
+          actorId: restored.readerDid,
+        });
+        setSession(restored);
+      } else if (!restored) {
+        loginTrace.current = null;
+        client.setTraceId(undefined);
+      }
     };
     bootstrap()
       .then(() => undefined)
@@ -123,6 +165,7 @@ export function App() {
     const now = Date.now();
     if (now - lastRecoveryAt.current < RECOVERY_COOLDOWN_MS) return false;
     lastRecoveryAt.current = now;
+    restoredHostSession.current = false;
     reportClientEvent("warn", "delegation_lost_recovering", undefined, session?.readerDid);
     try {
       const nextPolicy = await client.getDelegationPolicy();
@@ -136,10 +179,17 @@ export function App() {
     }
   }, [client, session]);
 
-  const loadFeed = useCallback(async () => {
-    if (!session || feedLoadInFlight.current) return;
+  const loadFeed = useCallback(async (options: {
+    recoverDelegation?: boolean;
+    surfaceError?: boolean;
+    reason?: string;
+  } = {}): Promise<boolean> => {
+    if (!session || feedLoadInFlight.current) return false;
+    const recoverLostDelegation = options.recoverDelegation !== false;
+    const surfaceError = options.surfaceError !== false;
     feedLoadInFlight.current = true;
-    setLoadState("loading");
+    if (surfaceError) setLoadState("loading");
+    const phaseStartedAt = performance.now();
     try {
       const page = await client.listFeed({ limit: 40 });
       setItems((current) => {
@@ -151,14 +201,32 @@ export function App() {
       });
       setLoadError(null);
       setLoadState("ready");
-    } catch (error) {
-      if (isDelegationLostError(error)) {
-        feedLoadInFlight.current = false;
-        if (await recoverDelegation()) return;
+      if (loginTrace.current) {
+        reportClientTiming("login_feed_projections_received", {
+          ...loginTrace.current,
+          phaseStartedAt,
+          actorId: session.readerDid,
+          detail: `items=${page.items.length} reason=${options.reason ?? "refresh"}`,
+        });
       }
-      reportClientEvent("error", "feed_load_failed", errorDetail(error), session.readerDid);
-      setLoadState("error");
-      setLoadError(formatHostError(error));
+      return true;
+    } catch (error) {
+      if (recoverLostDelegation && isDelegationLostError(error)) {
+        feedLoadInFlight.current = false;
+        if (await recoverDelegation()) return false;
+      }
+      reportClientEvent(
+        surfaceError ? "error" : "info",
+        surfaceError ? "feed_load_failed" : "feed_fast_path_missed",
+        errorDetail(error),
+        session.readerDid,
+        loginTrace.current ? { traceId: loginTrace.current.traceId } : {},
+      );
+      if (surfaceError) {
+        setLoadState("error");
+        setLoadError(formatHostError(error));
+      }
+      return false;
     } finally {
       feedLoadInFlight.current = false;
     }
@@ -167,6 +235,7 @@ export function App() {
   const resetFeedState = useCallback(() => {
     setFeedState("idle");
     setSetupStage("identity");
+    setHostSetup(null);
     setSetupError(null);
     setItems([]);
     setLoadState("idle");
@@ -179,23 +248,113 @@ export function App() {
     setActiveView("for_you");
     artifactCache.clear();
     feedbackAttempts.current.clear();
+    firstContentReported.current = null;
   }, [artifactCache]);
+
+  const waitForHostSetup = useCallback(async (): Promise<void> => {
+    let previousPhase: FeedHostSetupStatus["phase"] | undefined;
+    let phaseStartedAt = performance.now();
+    for (;;) {
+      const status = await client.getDelegationStatus();
+      if (!status.complete) throw new Error(`Feed Host delegation is ${status.state}`);
+      if (status.setup) {
+        setHostSetup(status.setup);
+        if (status.setup.phase !== previousPhase) {
+          if (loginTrace.current) {
+            reportClientTiming("login_setup_phase", {
+              ...loginTrace.current,
+              phaseStartedAt,
+              actorId: session?.readerDid,
+              detail: `phase=${status.setup.phase}`,
+            });
+          }
+          previousPhase = status.setup.phase;
+          phaseStartedAt = performance.now();
+        }
+      }
+      if (status.setup?.state === "ready") {
+        if (loginTrace.current) {
+          reportClientTiming("login_setup_ready", {
+            ...loginTrace.current,
+            phaseStartedAt,
+            actorId: session?.readerDid,
+          });
+        }
+        return;
+      }
+      if (status.setup?.state === "failed") throw new FeedSetupFailedError(status.setup);
+      await new Promise((resolve) => window.setTimeout(resolve, SETUP_STATUS_POLL_MS));
+    }
+  }, [client, session?.readerDid]);
+
+  const recordSetupFailure = useCallback((error: unknown) => {
+    console.error("[Feed setup]", error);
+    if (error instanceof FeedSetupFailedError) setHostSetup(error.setup);
+    reportClientEvent("error", "feed_setup_failed", errorDetail(error), session?.readerDid);
+    setFeedState("error");
+    setSetupError("Feed’s backend could not finish preparing your Feed.");
+  }, [session?.readerDid]);
 
   const startFeed = useCallback(
     async () => {
       if (!session || !policy || setupInFlight.current) return;
       setupInFlight.current = true;
       setFeedState("starting");
-      setSetupStage("context");
+      setHostSetup(null);
       setSetupError(null);
       setLoadError(null);
       try {
-        await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
+        // A returning browser usually still has a valid Feed Host session.
+        // Read first so existing content never waits for delegation refresh or
+        // schema preparation.
+        if (restoredHostSession.current) {
+          const restoredFeed = await loadFeed({
+            recoverDelegation: false,
+            surfaceError: false,
+            reason: "restored_host_session",
+          });
+          if (restoredFeed) {
+            setFeedState("running");
+            return;
+          }
+          restoredHostSession.current = false;
+        }
+
+        setSetupStage("context");
+        const [receipt] = await submitFeedHostDelegations({
+          client,
+          policy,
+          actorId: session.readerDid,
+          trace: loginTrace.current ?? undefined,
+        });
+        if (receipt?.setup) setHostSetup(receipt.setup);
         setSetupStage("preparing");
-        await loadFeed();
+        const setup = waitForHostSetup().then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        const existingFeed = await loadFeed({
+          recoverDelegation: false,
+          surfaceError: false,
+          reason: "new_host_session",
+        });
+        if (existingFeed) {
+          setFeedState("running");
+          void setup.then((result) => {
+            if (result.ok) return;
+            reportClientEvent("warn", "feed_background_setup_failed", errorDetail(result.error), session.readerDid,
+              loginTrace.current ? { traceId: loginTrace.current.traceId } : {});
+            setEventsError("Feed is available, but background preparation needs attention.");
+          });
+          return;
+        }
+
+        const setupResult = await setup;
+        if (!setupResult.ok) throw setupResult.error;
+        const firstFeed = await loadFeed({ reason: "setup_complete" });
+        if (!firstFeed) throw new Error("Feed did not become readable after setup completed");
         setFeedState("running");
       } catch (error) {
-        console.error("[Feed setup]", error);
         if (isFeedReconnectRequiredError(error)) {
           reportClientEvent("warn", "feed_reconnect_required", errorDetail(error), session.readerDid);
           await signOut().catch(() => undefined);
@@ -204,15 +363,32 @@ export function App() {
           resetFeedState();
           return;
         }
-        reportClientEvent("error", "feed_setup_failed", errorDetail(error), session.readerDid);
-        setFeedState("error");
-        setSetupError("Feed could not finish connecting. Check your connection and try again.");
+        recordSetupFailure(error);
       } finally {
         setupInFlight.current = false;
       }
     },
-    [client, loadFeed, policy, resetFeedState, session],
+    [client, loadFeed, policy, recordSetupFailure, resetFeedState, session, waitForHostSetup],
   );
+
+  const retryFeedSetup = useCallback(async () => {
+    if (!session || setupInFlight.current) return;
+    setupInFlight.current = true;
+    setFeedState("starting");
+    setSetupStage("preparing");
+    setSetupError(null);
+    try {
+      const response = await client.retrySetup();
+      setHostSetup(response.setup);
+      await waitForHostSetup();
+      await loadFeed();
+      setFeedState("running");
+    } catch (error) {
+      recordSetupFailure(error);
+    } finally {
+      setupInFlight.current = false;
+    }
+  }, [client, loadFeed, recordSetupFailure, session, waitForHostSetup]);
 
   useEffect(() => {
     if (!session || !policy) return;
@@ -227,7 +403,7 @@ export function App() {
     if (!session || feedState !== "running") return;
     let cancelled = false;
     let timer: number | undefined;
-    let lastSignature = "";
+    let lastSignature: string | undefined;
 
     const pollFeedEvents = async () => {
       if (cancelled) return;
@@ -236,7 +412,12 @@ export function App() {
         if (cancelled) return;
         setEventsError(null);
         const signature = snapshot.text.trim();
-        if (signature !== lastSignature) {
+        if (lastSignature === undefined) {
+          // The first snapshot establishes the cursor. It is the same state
+          // loadFeed just rendered, so fetching it again only adds queue and
+          // TinyCloud connection-pool pressure during initial hydration.
+          lastSignature = signature;
+        } else if (signature !== lastSignature) {
           lastSignature = signature;
           await loadFeed();
         }
@@ -262,13 +443,35 @@ export function App() {
 
   const connect = async () => {
     setSignInError(null);
+    const loginStartedAt = performance.now();
+    const trace: FeedLoginTrace = {
+      traceId: crypto.randomUUID(),
+      loginStartedAt,
+      systemElapsedBeforeApprovalMs: 0,
+    };
+    loginTrace.current = trace;
+    restoredHostSession.current = false;
+    client.setTraceId(trace.traceId);
+    reportClientEvent("info", "login_clicked", undefined, undefined, { traceId: trace.traceId });
     try {
-      const nextPolicy = policy ?? (await client.getDelegationPolicy());
+      let nextPolicy = policy;
+      if (!nextPolicy) {
+        const policyStartedAt = performance.now();
+        nextPolicy = await client.getDelegationPolicy();
+        trace.systemElapsedBeforeApprovalMs = performance.now() - policyStartedAt;
+        reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
+      }
       setPolicy(nextPolicy);
       resetFeedState();
-      setSession(await signIn(nextPolicy));
+      const nextSession = await signIn(nextPolicy, trace);
+      trace.systemStartedAt = performance.now();
+      reportClientEvent("info", "login_permissions_complete", undefined, nextSession.readerDid, {
+        traceId: trace.traceId,
+        elapsedMs: Math.round(trace.systemStartedAt - trace.loginStartedAt),
+      });
+      setSession(nextSession);
     } catch (error) {
-      reportClientEvent("error", "sign_in_failed", errorDetail(error));
+      reportClientEvent("error", "sign_in_failed", errorDetail(error), undefined, { traceId: trace.traceId });
       setSignInError(error instanceof Error ? error.message : String(error));
     }
   };
@@ -281,15 +484,20 @@ export function App() {
     } finally {
       await signOut().catch(() => undefined);
       setSession(null);
+      restoredHostSession.current = false;
       resetFeedState();
     }
   };
 
   const hydrateArtifact = useCallback(async (projection: FeedItemProjection): Promise<void> => {
-    const hydrated = await artifactCache.hydrate({ projection, artifact: null });
-    setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
-      ? { ...item, artifact: hydrated.artifact, error: hydrated.error ? "This artifact is temporarily unavailable." : undefined }
-      : item));
+    const hydrate = artifactHydrationQueue.current.catch(() => undefined).then(async () => {
+      const hydrated = await artifactCache.hydrate({ projection, artifact: null });
+      setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+        ? { ...item, artifact: hydrated.artifact, error: hydrated.error ? "This artifact is temporarily unavailable." : undefined }
+        : item));
+    });
+    artifactHydrationQueue.current = hydrate.catch(() => undefined);
+    await hydrate;
   }, [artifactCache]);
 
   const sendFeedback = async (
@@ -363,6 +571,22 @@ export function App() {
   const visibleItems = feedItemsForView(items, activeView);
   const visibleLoadError = loadError ?? eventsError;
 
+  useEffect(() => {
+    const trace = loginTrace.current;
+    if (!trace || firstContentReported.current === trace.traceId || items.length === 0) return;
+    if (!items.some((item) => item.projection.postBody || item.projection.postTitle || item.artifact)) return;
+    const frame = requestAnimationFrame(() => {
+      firstContentReported.current = trace.traceId;
+      reportClientTiming("login_first_content_visible", {
+        ...trace,
+        phaseStartedAt: trace.systemStartedAt ?? trace.loginStartedAt,
+        actorId: session?.readerDid,
+        detail: "budget_ms=5000 permission_time_excluded=true",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [items, session?.readerDid]);
+
   if (!restoreDone) {
     return <StatusScreen title="Opening Feed" detail="Checking your saved sign-in." />;
   }
@@ -372,14 +596,15 @@ export function App() {
   }
 
   if (feedState === "idle" || feedState === "starting") {
-    return <SetupScreen stage={setupStage} />;
+    return <SetupScreen stage={setupStage} setup={hostSetup} />;
   }
 
   if (feedState === "error") {
     return (
       <SetupFailurePanel
         error={setupError ?? "Feed could not finish connecting."}
-        onRetry={() => void startFeed()}
+        setup={hostSetup}
+        onRetry={() => void (hostSetup?.state === "failed" ? retryFeedSetup() : startFeed())}
         onSignInAgain={() => void disconnect()}
       />
     );
@@ -517,8 +742,16 @@ function SignInScreen({ error, onSignIn }: { error: string | null; onSignIn: () 
   );
 }
 
-function SetupScreen({ stage }: { stage: SetupStage }) {
+function SetupScreen({ stage, setup }: { stage: SetupStage; setup: FeedHostSetupStatus | null }) {
   const contextReady = stage === "preparing";
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!contextReady || setup?.state !== "preparing") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [contextReady, setup?.state]);
+  const elapsedSeconds = setup ? Math.max(0, Math.floor((now - Date.parse(setup.startedAt)) / 1000)) : 0;
+  const activity = setupActivityLabel(setup?.phase);
   return (
     <main className="setup-screen" aria-labelledby="setup-title">
       <header className="setup-header"><strong>Feed</strong></header>
@@ -532,13 +765,26 @@ function SetupScreen({ stage }: { stage: SetupStage }) {
           </li>
           <li className={contextReady ? "complete" : "current"}>
             <span className="progress-mark" aria-hidden="true">{contextReady ? "✓" : ""}</span>
-            <span><strong>Context connected</strong><small>Allowed sources are readable.</small></span>
+            <span>
+              <strong>{contextReady ? "Context connected" : "Connecting context"}</strong>
+              <small>{contextReady ? "Allowed sources are readable." : "Activating secure access with Feed…"}</small>
+            </span>
           </li>
           <li className={contextReady ? "current" : "pending"}>
             <span className="progress-mark" aria-hidden="true" />
             <span><strong>Preparing your first Feed</strong><small>Making useful items now.</small></span>
           </li>
         </ol>
+        {contextReady && setup && (
+          <div className="setup-live" aria-label="Backend setup status">
+            <div className="setup-live-bar" aria-hidden="true"><span /></div>
+            <p>
+              <strong>{activity}</strong>
+              <span>{elapsedSeconds}s</span>
+            </p>
+            <small>Backend phase: {setup.phase.replaceAll("_", " ")} · attempt {setup.attempt}</small>
+          </div>
+        )}
         <p className="setup-help">If anything needs attention, Feed will say what to reconnect.</p>
       </section>
     </main>
@@ -547,10 +793,12 @@ function SetupScreen({ stage }: { stage: SetupStage }) {
 
 function SetupFailurePanel({
   error,
+  setup,
   onRetry,
   onSignInAgain,
 }: {
   error: string;
+  setup: FeedHostSetupStatus | null;
   onRetry: () => void;
   onSignInAgain: () => void;
 }) {
@@ -559,12 +807,31 @@ function SetupFailurePanel({
       <p className="status-label">Feed needs attention</p>
       <h1>We couldn’t finish setting up your Feed.</h1>
       <p>{error}</p>
+      {setup?.state === "failed" && (
+        <details className="setup-error-detail">
+          <summary>Backend details</summary>
+          <p>Phase: {setup.phase} · attempt {setup.attempt}</p>
+          {setup.error?.message && <p>{setup.error.message}</p>}
+        </details>
+      )}
       <div className="panel-actions">
-        <button className="primary" onClick={onRetry}>Try again</button>
+        <button className="primary" onClick={onRetry}>{setup?.state === "failed" ? "Retry backend setup" : "Try again"}</button>
         <button onClick={onSignInAgain}>Sign in again</button>
       </div>
     </main>
   );
+}
+
+function setupActivityLabel(phase: FeedHostSetupStatus["phase"] | undefined): string {
+  switch (phase) {
+    case "bootstrap": return "Preparing secure storage…";
+    case "artifact_check": return "Checking existing artifacts…";
+    case "seed": return "Creating starter items…";
+    case "reconcile": return "Building your Feed…";
+    case "ready": return "Feed is ready";
+    case "failed": return "Backend setup stopped";
+    default: return "Starting the Feed backend…";
+  }
 }
 
 function NoticePanel({
@@ -647,6 +914,7 @@ function FeedCard({
   const [note, setNote] = useState("");
   const [noteAttemptKey, setNoteAttemptKey] = useState(() => crypto.randomUUID());
   const [interactionStatus, setInteractionStatus] = useState<string | null>(null);
+  const cardRef = useRef<HTMLElement>(null);
   const artifact = item.artifact;
   const post = projectedPost(item);
   const provenance = readableProvenance(item);
@@ -661,13 +929,24 @@ function FeedCard({
     await onExpand(item.projection);
     setArtifactLoading(false);
   };
+  useEffect(() => {
+    const element = cardRef.current;
+    if (!element || artifact || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      void loadArtifact();
+    }, { rootMargin: "300px 0px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [artifact, item.projection.feedItemId]);
   const act = async (signal: FeedbackEvent["signal"]) => {
     setInteractionStatus(null);
     const ok = await onFeedback(item.projection, signal);
     setInteractionStatus(ok ? feedbackSuccessLabel(signal) : "That change did not go through. Try again.");
   };
   return (
-    <article className="feed-card">
+    <article ref={cardRef} className="feed-card">
       <div className="card-meta">
         <span>{readablePostKind(item)}</span>
         <span>{readableFeedTime(item.projection.publishedAt)}</span>
@@ -676,7 +955,9 @@ function FeedCard({
       {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
       {isPost ? (
         <>
-          <p className="post-body">{item.projection.postBody ?? post?.body ?? "Open the artifact to read this post in context."}</p>
+          <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
+            ? "This post’s preview is temporarily unavailable."
+            : "Loading this post…")}</p>
           <details
             className="artifact-expansion"
             onToggle={(event) => event.currentTarget.open && void loadArtifact()}
