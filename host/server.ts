@@ -2093,6 +2093,14 @@ function jsonError(status: number, code: string, message: string): Response {
 }
 
 function mapError(error: unknown, pathname: string): Response {
+  // The node rejecting the Host's delegated action (e.g. after stricter
+  // lifecycle enforcement invalidates a stored chain) is an authority
+  // problem, not a server fault. Surface it as a 403 "denied" so the web
+  // client's delegation-recovery flow re-submits instead of showing every
+  // artifact as unavailable behind a 500.
+  if (error instanceof Error && /Unauthorized Action/i.test(error.message)) {
+    return json({ error: { code: "denied", message: "the Feed Host's delegated access was denied by the storage node" } }, 403);
+  }
   if (error instanceof FeedHostError) {
     return json(
       {
