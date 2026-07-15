@@ -215,9 +215,9 @@ type WorkflowRunIndexRow = {
 };
 
 type WorkflowExampleRow = {
+  // No post_title column exists on feed_item_projection; kept absent on purpose.
   artifact_id: string;
   package_id: string;
-  post_title: string | null;
   published_at: string;
 };
 
@@ -1469,9 +1469,12 @@ export class FeedHostStorage {
       if (!latestRunByPackage.has(run.package_id)) latestRunByPackage.set(run.package_id, run);
     }
 
+    // feed_item_projection carries no post title (see FEED_V1 schema); the
+    // example is a "there is a recent ranked output" signal — artifact id +
+    // date. Titles for reviewed starters come from presentation.exampleTitles.
     const exampleRows = await queryRows<WorkflowExampleRow>(
       this.db(actor, "feed_index"),
-      `SELECT artifact_id, package_id, post_title, published_at
+      `SELECT artifact_id, package_id, published_at
          FROM feed_item_projection
         WHERE package_id IN (${placeholders}) AND visibility = 'ranked'
         ORDER BY published_at DESC
@@ -2319,7 +2322,7 @@ function toWireWorkflowState(
   if (example) {
     state.example = {
       artifactId: example.artifact_id,
-      title: example.post_title ?? null,
+      title: null,
       publishedAt: example.published_at,
     };
   }
@@ -2783,51 +2786,59 @@ function projectionDispositionParams(
   }
 }
 
-function generationRequestSql(request: FeedGenerationRequestRecord): SqlStatement {
+const GENERATION_REQUEST_INSERT_COLUMNS = [
+  "request_id", "reader_nonce", "actor_id", "status", "scope_json", "package_id", "dedupe_key",
+  "prompt", "run_id", "workflow_id", "max_attempts", "claim_owner", "lease_expires_at", "fencing_token", "attempt_count",
+  "next_retry_at", "cancellation_requested", "phase", "phase_started_at", "started_at",
+  "completed_at", "last_attempt_at", "source_cursor_before", "source_cursor_after", "source_refs_json",
+  "publication_key", "artifact_ids_json", "publication_manifest_json", "error_json", "timing_events_json",
+  "expires_at", "created_at", "updated_at",
+] as const;
+
+export function generationRequestSql(request: FeedGenerationRequestRecord): SqlStatement {
+  const params = [
+    request.requestId,
+    request.readerNonce,
+    request.actorId,
+    request.status,
+    JSON.stringify(request.scope),
+    request.packageId,
+    request.dedupeKey,
+    request.prompt,
+    request.runId,
+    request.workflowId,
+    request.maxAttempts,
+    request.claimOwner,
+    request.leaseExpiresAt,
+    request.fencingToken,
+    request.attemptCount,
+    request.nextRetryAt,
+    request.cancellationRequested ? 1 : 0,
+    request.phase,
+    request.phaseStartedAt,
+    request.startedAt,
+    request.completedAt,
+    request.lastAttemptAt,
+    serializeJson(request.sourceCursorBefore),
+    serializeJson(request.sourceCursorAfter),
+    JSON.stringify(request.sourceRefs),
+    request.publicationKey,
+    JSON.stringify(request.artifactIds),
+    request.publicationManifest === null ? null : stableJson(request.publicationManifest),
+    request.error === null ? null : JSON.stringify(request.error),
+    JSON.stringify(request.timingEvents),
+    request.expiresAt,
+    request.createdAt,
+    request.updatedAt,
+  ];
+  // Placeholders derive from the column list so the two can never drift (a
+  // hardcoded count previously produced 35 placeholders for 33 columns).
+  if (params.length !== GENERATION_REQUEST_INSERT_COLUMNS.length) {
+    throw new Error(`generation_request column/param mismatch: ${GENERATION_REQUEST_INSERT_COLUMNS.length} columns, ${params.length} params`);
+  }
   return {
-    sql: `INSERT OR REPLACE INTO generation_request (
-      request_id, reader_nonce, actor_id, status, scope_json, package_id, dedupe_key,
-      prompt, run_id, workflow_id, max_attempts, claim_owner, lease_expires_at, fencing_token, attempt_count,
-      next_retry_at, cancellation_requested, phase, phase_started_at, started_at,
-      completed_at, last_attempt_at, source_cursor_before, source_cursor_after, source_refs_json,
-      publication_key, artifact_ids_json, publication_manifest_json, error_json, timing_events_json,
-      expires_at, created_at, updated_at
-    ) VALUES (${Array.from({ length: 35 }, () => "?").join(", ")})`,
-    params: [
-      request.requestId,
-      request.readerNonce,
-      request.actorId,
-      request.status,
-      JSON.stringify(request.scope),
-      request.packageId,
-      request.dedupeKey,
-      request.prompt,
-      request.runId,
-      request.workflowId,
-      request.maxAttempts,
-      request.claimOwner,
-      request.leaseExpiresAt,
-      request.fencingToken,
-      request.attemptCount,
-      request.nextRetryAt,
-      request.cancellationRequested ? 1 : 0,
-      request.phase,
-      request.phaseStartedAt,
-      request.startedAt,
-      request.completedAt,
-      request.lastAttemptAt,
-      serializeJson(request.sourceCursorBefore),
-      serializeJson(request.sourceCursorAfter),
-      JSON.stringify(request.sourceRefs),
-      request.publicationKey,
-      JSON.stringify(request.artifactIds),
-      request.publicationManifest === null ? null : stableJson(request.publicationManifest),
-      request.error === null ? null : JSON.stringify(request.error),
-      JSON.stringify(request.timingEvents),
-      request.expiresAt,
-      request.createdAt,
-      request.updatedAt,
-    ],
+    sql: `INSERT OR REPLACE INTO generation_request (${GENERATION_REQUEST_INSERT_COLUMNS.join(", ")}) VALUES (${GENERATION_REQUEST_INSERT_COLUMNS.map(() => "?").join(", ")})`,
+    params,
   };
 }
 
