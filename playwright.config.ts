@@ -44,6 +44,9 @@ export default defineConfig({
         ...process.env,
         VITE_FEED_HOST_URL: `http://127.0.0.1:${HOST_PORT}`,
         VITE_TINYCLOUD_HOST: process.env.VITE_TINYCLOUD_HOST ?? "https://node.tinycloud.xyz",
+        // The smoke host always runs current code, so keep the traced-request
+        // path exercised here even though production defaults it off.
+        VITE_FEED_TRACE_HEADER: "1",
       },
     },
   ],
