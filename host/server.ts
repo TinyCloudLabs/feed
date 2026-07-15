@@ -1497,8 +1497,13 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
           if (!hasArtifacts) {
             await runActorPreparationPhase(actor, "seed", () =>
               retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access)));
+            // Full reconciliation, not just the compatibility pass: a freshly
+            // seeded space has artifacts but no projections yet, so without it
+            // the first feed shows a single item until something else triggers
+            // reconciliation. This runs inside background preparation, so the
+            // reader-path stays lightweight.
             await runActorPreparationPhase(actor, "reconcile", () =>
-              retryTinyCloudTransaction("reconcile_compatibility", actor.actorId, () => storage.reconcileProjectionCompatibility(access)));
+              retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access)));
           }
         }
         const completedAt = new Date().toISOString();
