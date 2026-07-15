@@ -862,7 +862,8 @@ button:disabled {
   font-size: 12px;
 }
 
-.skill-actions input {
+.skill-actions input,
+.skill-actions select {
   min-height: 44px;
   min-width: 210px;
   border: 1px solid #bfc6cd;
@@ -870,6 +871,39 @@ button:disabled {
   background: var(--surface);
   color: var(--ink);
   padding: 9px 10px;
+}
+
+.routine-row {
+  gap: 10px;
+}
+
+.routine-summary {
+  align-items: baseline;
+}
+
+.routine-purpose {
+  max-width: 62ch;
+  margin: 0;
+  color: #3f4851;
+}
+
+.routine-example {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.routine-details summary {
+  width: fit-content;
+  min-height: 44px;
+  padding: 10px 2px;
+  color: var(--focus);
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.routine-edit-grid {
+  align-items: end;
+  padding-top: 8px;
 }
 
 @media (max-width: 720px) {
@@ -938,7 +972,8 @@ button:disabled {
 
   .skill-actions,
   .skill-actions label,
-  .skill-actions input {
+  .skill-actions input,
+  .skill-actions select {
     width: 100%;
   }
 

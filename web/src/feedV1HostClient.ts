@@ -52,6 +52,61 @@ export type FeedHostSkillsPage = {
   nextCursor?: string;
 };
 
+// Human-readable routine state for workflow controls (TC-182). Mirrors the
+// host redaction: no digests, manifest/workflow refs, budget ids, DIDs, or
+// capability paths — those stay behind advanced diagnostics.
+export type FeedHostWorkflowPresentation = {
+  schemaVersion: "feed.workflow_presentation.v1";
+  purpose: string;
+  triggerLabel: string;
+  cadenceLabel: string;
+  sourcesLabel: string;
+  audienceLabel: string;
+  exampleTitles: string[];
+};
+
+export type FeedHostWorkflowRunSummary = {
+  runId: string;
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  publishedArtifactCount: number;
+  error?: { code: string; message: string };
+};
+
+export type FeedHostWorkflowState = {
+  packageId: string;
+  displayName: string;
+  version: string;
+  settingsVersion: number;
+  admissionState: "candidate" | "enabled_local" | "reviewed_first_party" | "blocked";
+  disclosure: {
+    userCopy: string;
+    credentialOwner: string;
+    providerClass: string;
+    egressClass: string;
+  };
+  presentation?: FeedHostWorkflowPresentation;
+  paused: boolean;
+  disabled: boolean;
+  cadence?: "more" | "normal" | "less";
+  settings?: {
+    sourceSelection?: "recent_authorized" | "named_sources" | "all_authorized";
+    audience?: "private" | "team" | "draft";
+    outputVolume?: "short" | "standard" | "detailed";
+  };
+  enabledAt: string | null;
+  updatedAt: string;
+  lastRun?: FeedHostWorkflowRunSummary;
+  example?: { artifactId: string; title: string | null; publishedAt: string };
+};
+
+export type FeedHostWorkflowsPage = {
+  items: FeedHostWorkflowState[];
+  nextCursor?: string;
+};
+
 export type FeedHostInputAuthority = {
   sourceId: string;
   displayName: string;
@@ -199,6 +254,13 @@ export class FeedV1HostClient {
     if (input.limit !== undefined) params.set("limit", String(input.limit));
     if (input.cursor) params.set("cursor", input.cursor);
     return this.request<FeedHostSkillsPage>(`/skills${params.size ? `?${params}` : ""}`);
+  }
+
+  async listWorkflows(input: { limit?: number; cursor?: string } = {}): Promise<FeedHostWorkflowsPage> {
+    const params = new URLSearchParams();
+    if (input.limit !== undefined) params.set("limit", String(input.limit));
+    if (input.cursor) params.set("cursor", input.cursor);
+    return this.request<FeedHostWorkflowsPage>(`/workflows${params.size ? `?${params}` : ""}`);
   }
 
   async patchSkillCredentials(

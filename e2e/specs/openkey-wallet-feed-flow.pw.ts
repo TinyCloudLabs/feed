@@ -189,6 +189,9 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   });
   const savedFeedItemIds = new Set<string>();
   const noteAttempts: Array<{ eventId: string; readerNonce: string; signal: string; payload?: { note?: string } }> = [];
+  const controlIntentBodies: Array<{ intentKind: string; targetRef: string; payload?: Record<string, unknown> }> = [];
+  let routineTuneConflict = true;
+  let weeklyDigestRemoved = true;
   const consoleMessages: string[] = [];
   const clientEventBodies: string[] = [];
   page.on("console", (message) => consoleMessages.push(message.text()));
@@ -303,6 +306,127 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
       body: JSON.stringify({ accepted: true, eventId: body.eventId }),
     });
   });
+  await page.route(/\/workflows(\?.*)?$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({
+        items: [
+          {
+            packageId: RICH_ARTIFACT.producedBy.packageId,
+            displayName: "Daily Brief",
+            version: "0.1.0",
+            settingsVersion: 2,
+            admissionState: "reviewed_first_party",
+            disclosure: {
+              userCopy: "Turns authorized conversations into a private brief.",
+              credentialOwner: "none",
+              providerClass: "none",
+              egressClass: "none",
+            },
+            presentation: {
+              schemaVersion: "feed.workflow_presentation.v1",
+              purpose: "Turns authorized conversations into a private brief.",
+              triggerLabel: "Runs once a day",
+              cadenceLabel: "Daily",
+              sourcesLabel: "3 conversations this week",
+              audienceLabel: "Private to you",
+              exampleTitles: ["Where activation now stalls"],
+            },
+            paused: false,
+            disabled: false,
+            cadence: "normal",
+            settings: {
+              sourceSelection: "recent_authorized",
+              audience: "private",
+              outputVolume: "standard",
+            },
+            enabledAt: "2026-07-14T20:00:00.000Z",
+            updatedAt: "2026-07-14T20:00:00.000Z",
+            example: {
+              artifactId: RICH_ARTIFACT.artifactId,
+              title: "Where activation now stalls",
+              publishedAt: RICH_ARTIFACT.updatedAt,
+            },
+          },
+          {
+            packageId: "feed-weekly-digest",
+            displayName: "Weekly Digest",
+            version: "0.1.0",
+            settingsVersion: 5,
+            admissionState: "reviewed_first_party",
+            disclosure: {
+              userCopy: "Collects the week's authorized highlights into one digest.",
+              credentialOwner: "none",
+              providerClass: "none",
+              egressClass: "none",
+            },
+            paused: false,
+            disabled: weeklyDigestRemoved,
+            cadence: "less",
+            settings: {
+              sourceSelection: "named_sources",
+              audience: "team",
+              outputVolume: "short",
+            },
+            enabledAt: null,
+            updatedAt: "2026-07-14T20:00:00.000Z",
+          },
+        ],
+      }),
+    });
+  });
+  await page.route(/\/control-intents$/, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    const body = route.request().postDataJSON() as { eventId: string; intentKind: string; targetRef: string; payload?: Record<string, unknown> };
+    controlIntentBodies.push({ intentKind: body.intentKind, targetRef: body.targetRef, payload: body.payload });
+    if (body.intentKind === "enable_package" && body.targetRef === "package:feed-weekly-digest") {
+      weeklyDigestRemoved = false;
+    }
+    if (body.intentKind === "tune_package" && routineTuneConflict) {
+      routineTuneConflict = false;
+      await route.fulfill({
+        status: 409,
+        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+        body: JSON.stringify({ error: { code: "version_conflict", message: "preference version conflict" } }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({ accepted: true, eventId: body.eventId }),
+    });
+  });
+  await page.route(/\/skills(\?.*)?$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({ items: [] }),
+    });
+  });
+  await page.route(/\/input-authorities(\?.*)?$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({ items: [] }),
+    });
+  });
   await page.route(/\/skills\/smoke-new-skill\/credentials$/, async (route) => {
     if (route.request().method() !== "PATCH") {
       await route.fallback();
@@ -380,6 +504,31 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await page.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "Access & automation", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Access & automation" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Routines" })).toBeVisible();
+  await expect(page.getByText("Daily Brief", { exact: true })).toBeVisible();
+  const dailyBriefRow = page.locator(".routine-row", { hasText: "Daily Brief" });
+  await dailyBriefRow.getByText("Edit routine").click();
+  await dailyBriefRow.getByLabel("Frequency").selectOption("more");
+  await dailyBriefRow.getByRole("button", { name: "Save changes" }).click();
+  await expect(page.getByText("This changed elsewhere. Refresh and try again.")).toBeVisible();
+  await dailyBriefRow.getByRole("button", { name: "Run now" }).click();
+  await expect(page.getByText("Daily Brief is queued to run.")).toBeVisible();
+  const weeklyDigestRow = page.locator(".routine-row", { hasText: "Weekly Digest" });
+  await expect(weeklyDigestRow.getByText("Removed", { exact: true })).toBeVisible();
+  await weeklyDigestRow.getByRole("button", { name: "Add back" }).click();
+  await expect(page.getByText("Weekly Digest is active.")).toBeVisible();
+  await expect(weeklyDigestRow.getByText("Active", { exact: true })).toBeVisible();
+  await expect(weeklyDigestRow.getByRole("button", { name: "Add back" })).toHaveCount(0);
+  const addBackIntent = controlIntentBodies.find(
+    (body) => body.intentKind === "enable_package" && body.targetRef === "package:feed-weekly-digest",
+  );
+  expect(addBackIntent?.payload?.expectedVersion).toBe(5);
+  expect(controlIntentBodies.map((body) => body.intentKind)).toContain("tune_package");
+  expect(controlIntentBodies.map((body) => body.intentKind)).toContain("generate_new_request");
+  expect(controlIntentBodies.find((body) => body.intentKind === "tune_package")?.payload?.expectedVersion).toBe(2);
+  expect(controlIntentBodies.find((body) => body.intentKind === "generate_new_request")?.payload?.scope).toMatchObject({
+    packageId: RICH_ARTIFACT.producedBy.packageId,
+  });
   await page.getByLabel("Skill ID").fill("smoke-new-skill");
   await page.getByLabel("New skill provider").fill("openai");
   await page.getByLabel("New skill secret reference").fill("vault/secrets/smoke/openai");

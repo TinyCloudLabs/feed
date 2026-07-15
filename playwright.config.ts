@@ -43,7 +43,7 @@ export default defineConfig({
       env: {
         ...process.env,
         VITE_FEED_HOST_URL: `http://127.0.0.1:${HOST_PORT}`,
-        VITE_TINYCLOUD_HOST: "https://node.tinycloud.xyz",
+        VITE_TINYCLOUD_HOST: process.env.VITE_TINYCLOUD_HOST ?? "https://node.tinycloud.xyz",
       },
     },
   ],

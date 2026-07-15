@@ -49,6 +49,7 @@ import {
   type InputAuthorityRevoker,
   type InputAuthorityTruthCheck,
 } from "./input-authority.ts";
+import { REVIEWED_STARTER_PACKAGES, starterPackageById } from "../../artifactory/skills/_shared/lib/starter-packages.ts";
 import { seedDefaultFeed } from "./seed.ts";
 import {
   FeedHostError,
@@ -101,7 +102,7 @@ type ActorState = AcceptedFeedDelegation & {
   expiresAt: string;
 };
 
-type ActorPreparationPhase = "idle" | "bootstrap" | "artifact_check" | "seed" | "reconcile" | "ready" | "failed";
+type ActorPreparationPhase = "idle" | "bootstrap" | "starter_packages" | "artifact_check" | "seed" | "reconcile" | "ready" | "failed";
 
 type ActorPreparationStatus = {
   state: "not_started" | "preparing" | "ready" | "failed";
@@ -901,6 +902,29 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     );
   }
 
+  if (request.method === "GET" && url.pathname === "/workflows") {
+    const actor = await requireCompleteActor(request, context);
+    const limit = parseLimit(url.searchParams.get("limit"));
+    const cursor = url.searchParams.get("cursor") ?? undefined;
+    if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
+      throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
+    }
+    const page = await storage.listWorkflows(actorStorage(actor), {
+      actorId: actor.actorId,
+      limit,
+      cursor,
+    });
+    // Presentation copy is static per reviewed package version and never
+    // stored per-actor; merge it from the reviewed starter module.
+    return json({
+      ...page,
+      items: page.items.map((item) => ({
+        ...item,
+        presentation: item.presentation ?? starterPackageById(item.packageId)?.presentation,
+      })),
+    });
+  }
+
   const skillCredentialsMatch = url.pathname.match(/^\/skills\/([^/]+)\/credentials$/);
   if (request.method === "PATCH" && skillCredentialsMatch) {
     const actor = await requireCompleteActor(request, context);
@@ -1465,6 +1489,23 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
   return actor.storageAccess;
 }
 
+// Bootstraps for the same actor must never overlap: a re-submitted delegation
+// (page reload, Try again) replaces the ActorState with ready undefined and
+// would otherwise start a second migration/seed chain that keeps
+// serialization-conflicting with the first on TinyCloud until both die.
+// Chain bootstraps per actor key, scoped to the storage instance so parallel
+// test hosts stay isolated.
+const actorBootstrapChains = new WeakMap<object, Map<string, Promise<void>>>();
+
+function priorBootstrap(storage: FeedHostStorage, actorKey: string): Promise<void> {
+  let chains = actorBootstrapChains.get(storage);
+  if (!chains) {
+    chains = new Map();
+    actorBootstrapChains.set(storage, chains);
+  }
+  return chains.get(actorKey) ?? Promise.resolve();
+}
+
 function isMissingSchemaError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /no such table|does not exist|undefined table/i.test(message);
@@ -1472,6 +1513,7 @@ function isMissingSchemaError(error: unknown): boolean {
 
 async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, seedOnStart: boolean): Promise<void> {
   if (!actor.ready) {
+    const actorKey = normalizeActorId(actor.actorId);
     const preparationStartedAt = performance.now();
     const startedAt = new Date().toISOString();
     actor.preparation = {
@@ -1486,11 +1528,18 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
       attempt: actor.preparation.attempt,
       ...(actor.traceId ? { traceId: actor.traceId } : {}),
     });
-    const ready = (async () => {
+    const ready = priorBootstrap(storage, actorKey)
+      .catch(() => undefined)
+      .then(async () => {
       try {
         const access = actorStorage(actor);
         await runActorPreparationPhase(actor, "bootstrap", () =>
           retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access)));
+        // Admit the reviewed starter pack so routines exist before any run
+        // (TC-182); only missing packages insert, preserving pause state.
+        await runActorPreparationPhase(actor, "starter_packages", () =>
+          retryTinyCloudTransaction("starter_packages", actor.actorId, () =>
+            storage.ensureWorkflowPackages(access, REVIEWED_STARTER_PACKAGES, new Date().toISOString())));
         if (seedOnStart) {
           const hasArtifacts = await runActorPreparationPhase(actor, "artifact_check", () =>
             retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)));
@@ -1543,7 +1592,8 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
         });
         throw error;
       }
-    })();
+    });
+    actorBootstrapChains.get(storage)?.set(actorKey, ready);
     actor.ready = ready;
     ready.catch(() => {
       if (actor.ready === ready) actor.ready = undefined;

@@ -1,5 +1,6 @@
 import {
   artifactIndexRow,
+  packageStateRow,
 } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import type {
   DelegatedAccess,
@@ -13,6 +14,10 @@ import {
   type FeedArtifact,
   type FeedArtifactProjection,
   type FeedbackEvent,
+  type FeedWorkflowPackage,
+  type FeedWorkflowRun,
+  type WorkflowDisclosure,
+  type WorkflowPresentation,
   validateFeedArtifact,
 } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import {
@@ -186,6 +191,75 @@ export type FeedHostSkillState = {
 // it forward across upserts. Never returned to callers.
 type FeedHostSkillRecord = Omit<FeedHostSkillState, "hasSecret"> & {
   secretRef?: string;
+};
+
+type WorkflowPackageStateRow = {
+  package_id: string;
+  display_name: string;
+  version: string;
+  admission_state: string;
+  disclosure_json: string;
+  enabled_at: string | null;
+  paused_at: string | null;
+  updated_at: string;
+};
+
+type WorkflowRunIndexRow = {
+  run_id: string;
+  package_id: string;
+  status: string;
+  published_artifact_ids_json: string;
+  error_json: string | null;
+  started_at: string;
+  finished_at: string | null;
+};
+
+type WorkflowExampleRow = {
+  artifact_id: string;
+  package_id: string;
+  post_title: string | null;
+  published_at: string;
+};
+
+export type FeedHostWorkflowRunSummary = {
+  runId: string;
+  status: FeedWorkflowRun["status"];
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number | null;
+  publishedArtifactCount: number;
+  error?: { code: string; message: string };
+};
+
+export type FeedHostWorkflowExample = {
+  artifactId: string;
+  title: string | null;
+  publishedAt: string;
+};
+
+// Wire shape for GET /workflows. Deliberately excludes package digests,
+// manifest/workflow refs, budget ids, and any capability material — those
+// belong to a future advanced-diagnostics disclosure, not the routine list.
+export type FeedHostWorkflowState = {
+  packageId: string;
+  displayName: string;
+  version: string;
+  settingsVersion: number;
+  admissionState: FeedWorkflowPackage["admissionState"];
+  disclosure: WorkflowDisclosure;
+  presentation?: WorkflowPresentation;
+  paused: boolean;
+  disabled: boolean;
+  cadence?: "more" | "normal" | "less";
+  settings?: {
+    sourceSelection?: "recent_authorized" | "named_sources" | "all_authorized";
+    audience?: "private" | "team" | "draft";
+    outputVolume?: "short" | "standard" | "detailed";
+  };
+  enabledAt: string | null;
+  updatedAt: string;
+  lastRun?: FeedHostWorkflowRunSummary;
+  example?: FeedHostWorkflowExample;
 };
 
 export type FeedHostSkillCredentialsPatch = {
@@ -375,6 +449,26 @@ export class FeedHostStorage {
       this.db(actor, dbName),
       rows.map((row) => ({ sql: insertSql(row), params: Object.values(row.values).map(sqlValue) })),
     );
+  }
+
+  // Admit reviewed packages for this actor so unrun routines appear in the
+  // workflow library. Inserts only missing package ids — existing rows keep
+  // their enabled_at/paused_at state (seed inserts use INSERT OR REPLACE,
+  // which would otherwise clobber a user's pause).
+  async ensureWorkflowPackages(
+    actor: FeedHostActorStorage,
+    packages: FeedWorkflowPackage[],
+    now: string,
+  ): Promise<void> {
+    if (packages.length === 0) return;
+    const rows = await queryRows<{ package_id: string }>(
+      this.db(actor, "artifacts_index"),
+      "SELECT package_id FROM workflow_package_state",
+    );
+    const existing = new Set(rows.map((row) => row.package_id));
+    const missing = packages.filter((pkg) => !existing.has(pkg.packageId));
+    if (missing.length === 0) return;
+    await this.insertSeedRows(actor, "artifacts_index", missing.map((pkg) => packageStateRow(pkg, now)));
   }
 
   async writeArtifactDocument(actor: FeedHostActorStorage, artifact: FeedArtifact | MigratedFeedArtifact): Promise<void> {
@@ -1332,6 +1426,85 @@ export class FeedHostStorage {
     };
   }
 
+  // Redacted routine read model for workflow controls (TC-182): joins package
+  // state, the actor's package preferences (paused/disabled/cadence), the
+  // latest run summary, and the latest published post example. Raw authority
+  // material (digests, manifest/workflow refs, budget ids) never leaves here —
+  // it stays available for a future advanced-diagnostics surface.
+  async listWorkflows(
+    actor: FeedHostActorStorage,
+    input: { actorId: string; limit: number; cursor?: string },
+  ): Promise<{ items: FeedHostWorkflowState[]; nextCursor?: string }> {
+    const offset = input.cursor ? Number(input.cursor) : 0;
+    if (!Number.isInteger(offset) || offset < 0) {
+      throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
+    }
+    const limit = Math.max(1, Math.min(input.limit, 100));
+    const packages = await queryRows<WorkflowPackageStateRow>(
+      this.db(actor, "artifacts_index"),
+      `SELECT package_id, display_name, version, admission_state, disclosure_json, enabled_at, paused_at, updated_at
+         FROM workflow_package_state
+        ORDER BY display_name ASC, package_id ASC
+        LIMIT ? OFFSET ?`,
+      [limit + 1, offset],
+    );
+    const pagePackages = packages.slice(0, limit);
+    if (pagePackages.length === 0) {
+      return { items: [], nextCursor: undefined };
+    }
+    const packageIds = pagePackages.map((row) => row.package_id);
+    const placeholders = packageIds.map(() => "?").join(", ");
+
+    const runRows = await queryRows<WorkflowRunIndexRow>(
+      this.db(actor, "artifacts_index"),
+      `SELECT run_id, package_id, status, published_artifact_ids_json, error_json, started_at, finished_at
+         FROM workflow_run_index
+        WHERE package_id IN (${placeholders})
+        ORDER BY started_at DESC
+        LIMIT 200`,
+      packageIds,
+    );
+    const latestRunByPackage = new Map<string, WorkflowRunIndexRow>();
+    for (const run of runRows) {
+      if (!latestRunByPackage.has(run.package_id)) latestRunByPackage.set(run.package_id, run);
+    }
+
+    const exampleRows = await queryRows<WorkflowExampleRow>(
+      this.db(actor, "feed_index"),
+      `SELECT artifact_id, package_id, post_title, published_at
+         FROM feed_item_projection
+        WHERE package_id IN (${placeholders}) AND visibility = 'ranked'
+        ORDER BY published_at DESC
+        LIMIT 200`,
+      packageIds,
+    );
+    const exampleByPackage = new Map<string, WorkflowExampleRow>();
+    for (const example of exampleRows) {
+      if (!exampleByPackage.has(example.package_id)) exampleByPackage.set(example.package_id, example);
+    }
+
+    const normalizedActorId = normalizeActorId(input.actorId);
+    const scopes = packageIds.map((packageId) => `package:${packageId}`);
+    const scopePlaceholders = scopes.map(() => "?").join(", ");
+    const preferenceRows = await queryRows<{ scope: string; value_json: string; version: number }>(
+      this.db(actor, "feed_index"),
+      `SELECT scope, value_json, version FROM preference_profile WHERE actor_id = ? AND scope IN (${scopePlaceholders})`,
+      [normalizedActorId, ...scopes],
+    );
+    const preferenceByPackage = new Map<string, { value: FeedPreferenceValue; version: number }>();
+    for (const row of preferenceRows) {
+      const packageId = row.scope.slice("package:".length);
+      preferenceByPackage.set(packageId, { value: parsePreferenceValueJson(row.value_json), version: Number(row.version) });
+    }
+
+    return {
+      items: pagePackages.map((row) =>
+        toWireWorkflowState(row, latestRunByPackage.get(row.package_id), exampleByPackage.get(row.package_id), preferenceByPackage.get(row.package_id)),
+      ),
+      nextCursor: packages.length > limit ? String(offset + limit) : undefined,
+    };
+  }
+
   async upsertSkillCredentials(
     actor: FeedHostActorStorage,
     input: { actorId: string; skillId: string; patch: FeedHostSkillCredentialsPatch },
@@ -1686,12 +1859,22 @@ export class FeedHostStorage {
           const scope = preferenceScopeForIntent(event.intentKind, payload, event.targetRef);
           if (event.intentKind === "reset_preferences" || event.intentKind === "reset_package") {
             const current = await this.readPreferenceProfileByActor(actor, event.actorId, scope);
+            const currentVersion = current?.version ?? 0;
+            const expectedVersion =
+              typeof payload?.version === "number"
+                ? payload.version
+                : typeof payload?.expectedVersion === "number"
+                  ? payload.expectedVersion
+                  : currentVersion;
+            if (current ? expectedVersion !== currentVersion : expectedVersion !== 0) {
+              throw new FeedHostError("preference version conflict", 409, "version_conflict", { currentVersion });
+            }
             await this.writePreferenceProfileRecord(actor, {
               profileId: preferenceProfileId(event.actorId, scope),
               actorId: event.actorId,
               scope,
               value: scope === FEED_HOST_PREFERENCES_SCOPE ? defaultPreferenceValue() : {},
-              version: (current?.version ?? 0) + 1,
+              version: currentVersion + 1,
               updatedAt: event.createdAt,
             });
             return { status: "applied" };
@@ -2081,6 +2264,98 @@ function mergeSkillState(
     version: (current?.version ?? 0) + 1,
     updatedAt: now,
   };
+}
+
+function parsePreferenceValueJson(raw: string): FeedPreferenceValue {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as FeedPreferenceValue;
+  } catch {
+    // Malformed preference payloads read as defaults rather than failing the list.
+  }
+  return {};
+}
+
+function toWireWorkflowState(
+  row: WorkflowPackageStateRow,
+  run: WorkflowRunIndexRow | undefined,
+  example: WorkflowExampleRow | undefined,
+  preferences: { value: FeedPreferenceValue; version: number } | undefined,
+): FeedHostWorkflowState {
+  const value = preferences?.value;
+  const disclosure = parseWorkflowDisclosure(row.disclosure_json);
+  const state: FeedHostWorkflowState = {
+    packageId: row.package_id,
+    displayName: row.display_name,
+    version: row.version,
+    settingsVersion: preferences?.version ?? 0,
+    admissionState: row.admission_state as FeedWorkflowPackage["admissionState"],
+    disclosure,
+    paused: value?.paused === true || (row.paused_at !== null && row.paused_at !== undefined),
+    disabled: value?.disabled === true,
+    cadence: value?.cadence,
+    settings: {
+      sourceSelection: value?.sourceSelection,
+      audience: value?.audience,
+      outputVolume: value?.outputVolume,
+    },
+    enabledAt: row.enabled_at ?? null,
+    updatedAt: row.updated_at,
+  };
+  if (run) {
+    const startedMs = Date.parse(run.started_at);
+    const finishedMs = run.finished_at ? Date.parse(run.finished_at) : Number.NaN;
+    state.lastRun = {
+      runId: run.run_id,
+      status: run.status as FeedWorkflowRun["status"],
+      startedAt: run.started_at,
+      finishedAt: run.finished_at ?? null,
+      durationMs:
+        Number.isFinite(startedMs) && Number.isFinite(finishedMs) ? Math.max(0, finishedMs - startedMs) : null,
+      publishedArtifactCount: parseJsonArrayLength(run.published_artifact_ids_json),
+      error: parseRunError(run.error_json),
+    };
+  }
+  if (example) {
+    state.example = {
+      artifactId: example.artifact_id,
+      title: example.post_title ?? null,
+      publishedAt: example.published_at,
+    };
+  }
+  return state;
+}
+
+function parseWorkflowDisclosure(raw: string): WorkflowDisclosure {
+  try {
+    const parsed = JSON.parse(raw) as WorkflowDisclosure;
+    if (parsed && typeof parsed === "object" && typeof parsed.userCopy === "string") return parsed;
+  } catch {
+    // Fall through to the redacted default below.
+  }
+  return { userCopy: "", credentialOwner: "none", providerClass: "none", egressClass: "none" };
+}
+
+function parseJsonArrayLength(raw: string): number {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function parseRunError(raw: string | null): { code: string; message: string } | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { code?: unknown; message?: unknown };
+    if (typeof parsed?.code === "string") {
+      return { code: parsed.code, message: typeof parsed.message === "string" ? parsed.message.slice(0, 300) : "" };
+    }
+  } catch {
+    // Unreadable errors stay hidden rather than leaking raw payloads.
+  }
+  return undefined;
 }
 
 function resolveNextSecretRef(

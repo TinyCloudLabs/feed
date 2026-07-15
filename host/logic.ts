@@ -29,6 +29,9 @@ export type FeedPreferenceValue = {
   paused?: boolean;
   disabled?: boolean;
   cadence?: "more" | "normal" | "less";
+  sourceSelection?: "recent_authorized" | "named_sources" | "all_authorized";
+  audience?: "private" | "team" | "draft";
+  outputVolume?: "short" | "standard" | "detailed";
   [key: string]: unknown;
 };
 
@@ -694,11 +697,14 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       },
       "/control-intents": {
         get: { responses: { 200: { description: "control intents", content: jsonResponse } } },
-        post: { responses: { 200: { description: "applied", content: jsonResponse }, 202: { description: "accepted", content: jsonResponse } } },
+        post: { responses: { 200: { description: "applied", content: jsonResponse }, 202: { description: "accepted", content: jsonResponse }, 409: { description: "version conflict", content: jsonResponse } } },
       },
       "/preferences": {
         get: { responses: { 200: { description: "preferences", content: jsonResponse } } },
         put: { responses: { 200: { description: "updated", content: jsonResponse }, 409: { description: "version conflict", content: jsonResponse } } },
+      },
+      "/workflows": {
+        get: { responses: { 200: { description: "workflow routines", content: jsonResponse } } },
       },
       "/generation-requests": {
         get: { responses: { 200: { description: "generation requests", content: jsonResponse } } },
@@ -783,6 +789,19 @@ export function sanitizePreferenceValue(value: FeedPreferenceValue): FeedPrefere
   if (typeof value.paused === "boolean") sanitized.paused = value.paused;
   if (typeof value.disabled === "boolean") sanitized.disabled = value.disabled;
   if (value.cadence === "more" || value.cadence === "normal" || value.cadence === "less") sanitized.cadence = value.cadence;
+  if (
+    value.sourceSelection === "recent_authorized" ||
+    value.sourceSelection === "named_sources" ||
+    value.sourceSelection === "all_authorized"
+  ) {
+    sanitized.sourceSelection = value.sourceSelection;
+  }
+  if (value.audience === "private" || value.audience === "team" || value.audience === "draft") {
+    sanitized.audience = value.audience;
+  }
+  if (value.outputVolume === "short" || value.outputVolume === "standard" || value.outputVolume === "detailed") {
+    sanitized.outputVolume = value.outputVolume;
+  }
   return sanitized;
 }
 
@@ -804,6 +823,9 @@ function mergePreferenceValue(base: FeedPreferenceValue, patch: FeedPreferenceVa
   if (sanitized.paused !== undefined) base.paused = sanitized.paused;
   if (sanitized.disabled !== undefined) base.disabled = sanitized.disabled;
   if (sanitized.cadence !== undefined) base.cadence = sanitized.cadence;
+  if (sanitized.sourceSelection !== undefined) base.sourceSelection = sanitized.sourceSelection;
+  if (sanitized.audience !== undefined) base.audience = sanitized.audience;
+  if (sanitized.outputVolume !== undefined) base.outputVolume = sanitized.outputVolume;
 }
 
 function uniqueStrings(values: readonly string[]): string[] {

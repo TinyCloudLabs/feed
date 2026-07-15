@@ -165,6 +165,7 @@ describe("Feed Host server", () => {
         "/feedback",
         "/control-intents",
         "/preferences",
+        "/workflows",
         "/generation-requests",
         "/generation-requests/{requestId}/cancel",
         "/api/worker/generation-requests/claim",
@@ -1832,6 +1833,262 @@ describe("Feed Host skill credential settings", () => {
   });
 });
 
+describe("Feed Host actor bootstrap serialization", () => {
+  test("concurrent delegation submissions never run overlapping bootstraps", async () => {
+    const storage = new OverlapTrackingStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const combined = policy.resources.map((resource) => resource.path).join("|");
+    const submit = () =>
+      postJson(
+        `${runtime.url}/api/delegations`,
+        { actorId: ACTOR_ID, serializedDelegation: combined },
+        { "content-type": "application/json" },
+      );
+
+    const responses = await Promise.all([submit(), submit(), submit()]);
+    for (const response of responses) expect(response.ok).toBe(true);
+    // Re-submissions may re-bootstrap, but never concurrently — overlapping
+    // chains serialization-conflict against real TinyCloud until they die.
+    expect(storage.bootstraps).toBeGreaterThanOrEqual(1);
+    expect(storage.maxActive).toBe(1);
+  });
+});
+
+describe("Feed Host workflow routines", () => {
+  test("GET /workflows lists admitted starters with presentation, run summary, and no raw authority", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const unauthenticated = await fetch(`${runtime.url}/workflows`);
+    expect(unauthenticated.status).toBe(401);
+
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+    const response = await fetch(`${runtime.url}/workflows?limit=50`, {
+      headers: { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    });
+    expect(response.status).toBe(200);
+    const bodyText = await response.text();
+    const body = JSON.parse(bodyText) as {
+      items: Array<{
+        packageId: string;
+        displayName: string;
+        paused: boolean;
+        disabled: boolean;
+        presentation?: { purpose: string; triggerLabel: string; cadenceLabel: string };
+        lastRun?: { status: string; startedAt: string };
+      }>;
+    };
+
+    // The six reviewed starters are admitted at bootstrap, before any run.
+    const ids = body.items.map((item) => item.packageId);
+    for (const starter of [
+      "feed-daily-brief",
+      "feed-short-insights",
+      "feed-exception-alert",
+      "feed-synthesis-report",
+      "feed-decision-memo",
+      "feed-playbook",
+    ]) {
+      expect(ids).toContain(starter);
+    }
+
+    const dailyBrief = body.items.find((item) => item.packageId === "feed-daily-brief")!;
+    expect(dailyBrief.displayName).toBe("Daily Brief");
+    expect(dailyBrief.paused).toBe(false);
+    expect(dailyBrief.presentation?.purpose.length).toBeGreaterThan(0);
+    expect(dailyBrief.presentation?.triggerLabel).toBe("Runs once a day");
+    expect(dailyBrief.lastRun).toBeUndefined();
+
+    // The seeded fixture package has run once and reports a summary.
+    const seeded = body.items.find((item) => item.displayName === "Weekly Product Brief");
+    expect(seeded?.lastRun?.status).toBe("published");
+
+    // Raw authority material stays out of the routine list.
+    expect(bodyText).not.toContain("sha256:");
+    expect(bodyText).not.toContain("manifestKey");
+    expect(bodyText).not.toContain("workflowDigest");
+    expect(bodyText).not.toContain("did:key");
+  });
+
+  test("pausing a routine through control intents is reflected in /workflows", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const pause = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-pause-001",
+        readerNonce: "wf-pause-nonce-001",
+        intentKind: "pause_package",
+        targetRef: "package:feed-daily-brief",
+        createdAt: "2026-07-14T22:00:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(pause.ok).toBe(true);
+
+    const body = await getJson<{ items: Array<{ packageId: string; paused: boolean; settingsVersion: number }> }>(
+      `${runtime.url}/workflows?limit=50`,
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    const dailyBrief = body.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(dailyBrief?.paused).toBe(true);
+    expect(dailyBrief?.settingsVersion).toBe(1);
+
+    const stale = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-stale-001",
+        readerNonce: "wf-stale-nonce-001",
+        intentKind: "enable_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 0 },
+        createdAt: "2026-07-14T22:01:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(stale.status).toBe(409);
+    expect(((await stale.json()) as { error: { code: string } }).error.code).toBe("version_conflict");
+
+    const staleReset = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-stale-reset-001",
+        readerNonce: "wf-stale-reset-nonce-001",
+        intentKind: "reset_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 0 },
+        createdAt: "2026-07-14T22:02:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(staleReset.status).toBe(409);
+    expect(((await staleReset.json()) as { error: { code: string } }).error.code).toBe("version_conflict");
+
+    const reset = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-reset-001",
+        readerNonce: "wf-reset-nonce-001",
+        intentKind: "reset_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 1 },
+        createdAt: "2026-07-14T22:03:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(reset.ok).toBe(true);
+
+    const resetBody = await getJson<{ items: Array<{ packageId: string; paused: boolean; settingsVersion: number }> }>(
+      `${runtime.url}/workflows?limit=50`,
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    const resetDailyBrief = resetBody.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(resetDailyBrief?.paused).toBe(false);
+    expect(resetDailyBrief?.settingsVersion).toBe(2);
+  });
+
+  test("removing a routine keeps its settings and add-back restores it", async () => {
+    const storage = new FakeFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const tune = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-tune-001",
+        readerNonce: "wf-tune-nonce-001",
+        intentKind: "tune_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 0, settings: { cadence: "less", audience: "team", outputVolume: "short" } },
+        createdAt: "2026-07-14T22:10:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(tune.ok).toBe(true);
+
+    const remove = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-remove-001",
+        readerNonce: "wf-remove-nonce-001",
+        intentKind: "disable_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 1 },
+        createdAt: "2026-07-14T22:11:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(remove.ok).toBe(true);
+
+    const removedBody = await getJson<{
+      items: Array<{ packageId: string; disabled: boolean; settingsVersion: number; cadence?: string; settings?: { audience?: string; outputVolume?: string } }>;
+    }>(`${runtime.url}/workflows?limit=50`, { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie });
+    const removed = removedBody.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(removed?.disabled).toBe(true);
+    expect(removed?.cadence).toBe("less");
+    expect(removed?.settings?.audience).toBe("team");
+
+    const addBack = await postJson(
+      `${runtime.url}/control-intents`,
+      {
+        actorId: ACTOR_ID,
+        eventId: "wf-addback-001",
+        readerNonce: "wf-addback-nonce-001",
+        intentKind: "enable_package",
+        targetRef: "package:feed-daily-brief",
+        payload: { expectedVersion: 2 },
+        createdAt: "2026-07-14T22:12:00.000Z",
+      },
+      { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    );
+    expect(addBack.ok).toBe(true);
+
+    const restoredBody = await getJson<{
+      items: Array<{ packageId: string; disabled: boolean; paused: boolean; settingsVersion: number; cadence?: string; settings?: { audience?: string; outputVolume?: string } }>;
+    }>(`${runtime.url}/workflows?limit=50`, { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie });
+    const restored = restoredBody.items.find((item) => item.packageId === "feed-daily-brief");
+    expect(restored?.disabled).toBe(false);
+    expect(restored?.paused).toBe(false);
+    expect(restored?.settingsVersion).toBe(3);
+    expect(restored?.cadence).toBe("less");
+    expect(restored?.settings?.audience).toBe("team");
+    expect(restored?.settings?.outputVolume).toBe("short");
+  });
+});
+
 class FakeFeedHostStorage {
   private readonly artifactIndex = new Map<string, StoredArtifactIndexRow>();
   private readonly artifacts = new Map<string, FeedArtifact>();
@@ -1842,9 +2099,96 @@ class FakeFeedHostStorage {
   private readonly controlIntents: StoredControlIntentRow[] = [];
   private readonly generationRequests: StoredGenerationRequestRow[] = [];
   private readonly skillCredentials = new Map<string, FakeSkillRecord>();
+  private readonly packages = new Map<string, StoredWorkflowPackageRow>();
 
   async bootstrapSchema(_actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
     return emptyMigrationSummary();
+  }
+
+  async ensureWorkflowPackages(
+    _actor: FeedHostActorStorage,
+    packages: Array<{
+      packageId: string;
+      displayName: string;
+      version: string;
+      admissionState: string;
+      disclosure: Record<string, unknown>;
+    }>,
+    now: string,
+  ): Promise<void> {
+    for (const pkg of packages) {
+      if (this.packages.has(pkg.packageId)) continue;
+      this.packages.set(pkg.packageId, {
+        package_id: pkg.packageId,
+        display_name: pkg.displayName,
+        version: pkg.version,
+        admission_state: pkg.admissionState,
+        disclosure_json: JSON.stringify(pkg.disclosure),
+        enabled_at: now,
+        paused_at: null,
+        updated_at: now,
+      });
+    }
+  }
+
+  async listWorkflows(
+    _actor: FeedHostActorStorage,
+    input: { actorId: string; limit: number; cursor?: string },
+  ): Promise<{ items: Array<Record<string, unknown>>; nextCursor?: string }> {
+    const offset = input.cursor ? Number(input.cursor) : 0;
+    if (!Number.isInteger(offset) || offset < 0) throw new Error("cursor must be a non-negative integer offset");
+    const limit = Math.max(1, Math.min(input.limit, 100));
+    const sorted = [...this.packages.values()].sort((left, right) =>
+      left.display_name.localeCompare(right.display_name) || left.package_id.localeCompare(right.package_id),
+    );
+    const page = sorted.slice(offset, offset + limit);
+    const items = page.map((row) => {
+      const latestRun = [...this.runs.values()]
+        .filter((run) => run.package_id === row.package_id)
+        .sort((left, right) => right.started_at.localeCompare(left.started_at))[0];
+      const example = [...this.projections.values()]
+        .filter((projection) => projection.packageId === row.package_id && projection.visibility === "ranked")
+        .sort((left, right) => right.publishedAt.localeCompare(left.publishedAt))[0];
+      const preferenceRecord = this.preferenceProfiles.get(`${input.actorId.toLowerCase()}:package:${row.package_id}`);
+      const preferences = preferenceRecord?.value;
+      return {
+        packageId: row.package_id,
+        displayName: row.display_name,
+        version: row.version,
+        settingsVersion: preferenceRecord?.version ?? 0,
+        admissionState: row.admission_state,
+        disclosure: JSON.parse(row.disclosure_json) as Record<string, unknown>,
+        paused: preferences?.paused === true || row.paused_at !== null,
+        disabled: preferences?.disabled === true,
+        cadence: preferences?.cadence,
+        settings: {
+          sourceSelection: preferences?.sourceSelection,
+          audience: preferences?.audience,
+          outputVolume: preferences?.outputVolume,
+        },
+        enabledAt: row.enabled_at,
+        updatedAt: row.updated_at,
+        ...(latestRun
+          ? {
+              lastRun: {
+                runId: latestRun.run_id,
+                status: latestRun.status,
+                startedAt: latestRun.started_at,
+                finishedAt: latestRun.finished_at,
+                durationMs:
+                  latestRun.finished_at === null
+                    ? null
+                    : Math.max(0, Date.parse(latestRun.finished_at) - Date.parse(latestRun.started_at)),
+                publishedArtifactCount: 0,
+              },
+            }
+          : {}),
+        ...(example
+          ? { example: { artifactId: example.artifactId, title: null, publishedAt: example.publishedAt } }
+          : {}),
+      };
+    });
+    return { items, nextCursor: sorted.length > offset + limit ? String(offset + limit) : undefined };
   }
 
   async hasArtifacts(_actor: FeedHostActorStorage): Promise<boolean> {
@@ -2081,6 +2425,17 @@ class FakeFeedHostStorage {
         const key = preferenceKey(event.actorId, scope);
         const current = this.preferenceProfiles.get(key);
         const currentVersion = current?.version ?? 0;
+        const expectedVersion =
+          typeof payload?.version === "number"
+            ? payload.version
+            : typeof payload?.expectedVersion === "number"
+              ? payload.expectedVersion
+              : currentVersion;
+        if (expectedVersion !== currentVersion) {
+          capError = new FeedHostError("preference version conflict", 409, "version_conflict", { currentVersion });
+          status = capError.code;
+          break;
+        }
         const value =
           normalizedKind === "reset_preferences" || normalizedKind === "reset_package"
             ? scope === FEED_HOST_PREFERENCES_SCOPE
@@ -2377,6 +2732,20 @@ class FakeFeedHostStorage {
           updatedAt: String(row.values.updated_at),
         });
         break;
+      case "workflow_package_state":
+        if (!this.packages.has(String(row.values.package_id))) {
+          this.packages.set(String(row.values.package_id), {
+            package_id: String(row.values.package_id),
+            display_name: String(row.values.display_name),
+            version: String(row.values.version),
+            admission_state: String(row.values.admission_state),
+            disclosure_json: String(row.values.disclosure_json),
+            enabled_at: row.values.enabled_at === null ? null : String(row.values.enabled_at),
+            paused_at: row.values.paused_at === null ? null : String(row.values.paused_at),
+            updated_at: String(row.values.updated_at),
+          });
+        }
+        break;
       case "workflow_run_index":
         this.runs.set(String(row.values.run_id), {
           run_id: String(row.values.run_id),
@@ -2405,6 +2774,21 @@ class FakeFeedHostStorage {
     return this.generationRequests.find(
       (row) => row.actor_id === actorId && row.reader_nonce === readerNonce,
     )?.request_id;
+  }
+}
+
+class OverlapTrackingStorage extends FakeFeedHostStorage {
+  active = 0;
+  maxActive = 0;
+  bootstraps = 0;
+
+  override async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
+    this.active += 1;
+    this.bootstraps += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    this.active -= 1;
+    return super.bootstrapSchema(actor);
   }
 }
 
@@ -2515,6 +2899,17 @@ type StoredArtifactIndexRow = {
   source_fingerprint: string;
   doc_key: string;
   published_at: string;
+  updated_at: string;
+};
+
+type StoredWorkflowPackageRow = {
+  package_id: string;
+  display_name: string;
+  version: string;
+  admission_state: string;
+  disclosure_json: string;
+  enabled_at: string | null;
+  paused_at: string | null;
   updated_at: string;
 };
 
@@ -2769,6 +3164,23 @@ function mergePreferencePatch(base: FeedPreferenceValue, patch: FeedPreferenceVa
   if (typeof sanitizedPatch.paused === "boolean") next.paused = sanitizedPatch.paused;
   if (typeof sanitizedPatch.disabled === "boolean") next.disabled = sanitizedPatch.disabled;
   if (sanitizedPatch.cadence === "more" || sanitizedPatch.cadence === "normal" || sanitizedPatch.cadence === "less") next.cadence = sanitizedPatch.cadence;
+  if (
+    sanitizedPatch.sourceSelection === "recent_authorized" ||
+    sanitizedPatch.sourceSelection === "named_sources" ||
+    sanitizedPatch.sourceSelection === "all_authorized"
+  ) {
+    next.sourceSelection = sanitizedPatch.sourceSelection;
+  }
+  if (sanitizedPatch.audience === "private" || sanitizedPatch.audience === "team" || sanitizedPatch.audience === "draft") {
+    next.audience = sanitizedPatch.audience;
+  }
+  if (
+    sanitizedPatch.outputVolume === "short" ||
+    sanitizedPatch.outputVolume === "standard" ||
+    sanitizedPatch.outputVolume === "detailed"
+  ) {
+    next.outputVolume = sanitizedPatch.outputVolume;
+  }
   return next;
 }
 

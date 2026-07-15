@@ -24,6 +24,7 @@ import {
   FeedV1HostError,
   type FeedHostInputAuthority,
   type FeedHostSkillState,
+  type FeedHostWorkflowState,
 } from "./feedV1HostClient.ts";
 import {
   createLazyArtifactCache,
@@ -42,10 +43,22 @@ import {
 type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
 type SetupStage = "identity" | "context" | "preparing";
+type RoutineDraft = {
+  cadence: "more" | "normal" | "less";
+  sourceSelection: "recent_authorized" | "named_sources" | "all_authorized";
+  audience: "private" | "team" | "draft";
+  outputVolume: "short" | "standard" | "detailed";
+};
 
 const FEED_EVENTS_RETRY_MS = 15_000;
 const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
+const DEFAULT_ROUTINE_DRAFT: RoutineDraft = {
+  cadence: "normal",
+  sourceSelection: "recent_authorized",
+  audience: "private",
+  outputVolume: "standard",
+};
 
 class FeedSetupFailedError extends Error {
   constructor(readonly setup: FeedHostSetupStatus) {
@@ -658,7 +671,7 @@ export function App() {
       )}
 
       {settingsOpen && (
-        <SkillCredentialsPanel client={client} policy={policy!} onDisconnect={() => void disconnect()} />
+        <SkillCredentialsPanel client={client} policy={policy!} actorId={session.readerDid} onDisconnect={() => void disconnect()} />
       )}
 
       <main
@@ -1121,35 +1134,105 @@ function isDelegationLostError(error: unknown): boolean {
   return false;
 }
 
+function routineDraftFromWorkflow(workflow: FeedHostWorkflowState): RoutineDraft {
+  return {
+    cadence: workflow.cadence ?? DEFAULT_ROUTINE_DRAFT.cadence,
+    sourceSelection: workflow.settings?.sourceSelection ?? DEFAULT_ROUTINE_DRAFT.sourceSelection,
+    audience: workflow.settings?.audience ?? DEFAULT_ROUTINE_DRAFT.audience,
+    outputVolume: workflow.settings?.outputVolume ?? DEFAULT_ROUTINE_DRAFT.outputVolume,
+  };
+}
+
+function seedRoutineDrafts(
+  workflows: FeedHostWorkflowState[],
+  current: Record<string, RoutineDraft>,
+): Record<string, RoutineDraft> {
+  const next: Record<string, RoutineDraft> = {};
+  for (const workflow of workflows) {
+    next[workflow.packageId] = current[workflow.packageId] ?? routineDraftFromWorkflow(workflow);
+  }
+  return next;
+}
+
+function cadenceLabel(value?: RoutineDraft["cadence"]): string {
+  switch (value) {
+    case "more": return "As new content arrives";
+    case "less": return "On demand";
+    case "normal":
+    default: return "Daily";
+  }
+}
+
+function sourceSelectionLabel(value: RoutineDraft["sourceSelection"]): string {
+  switch (value) {
+    case "named_sources": return "Named sources only";
+    case "all_authorized": return "Everything authorized";
+    case "recent_authorized":
+    default: return "Recent authorized conversations";
+  }
+}
+
+function audienceLabel(value: RoutineDraft["audience"]): string {
+  switch (value) {
+    case "team": return "Team-ready draft";
+    case "draft": return "Draft only";
+    case "private":
+    default: return "Private to me";
+  }
+}
+
+function routineSuccessMessage(intentKind: ControlIntentEvent["intentKind"], displayName: string): string {
+  switch (intentKind) {
+    case "generate_new_request": return `${displayName} is queued to run.`;
+    case "ask_feed": return `${displayName} was sent to Feed.`;
+    case "enable_package": return `${displayName} is active.`;
+    case "pause_package": return `${displayName} is paused.`;
+    case "disable_package": return `${displayName} was removed from your routine list.`;
+    case "reset_package": return `${displayName} settings were reset.`;
+    case "tune_package": return `${displayName} settings were saved.`;
+    default: return `${displayName} was updated.`;
+  }
+}
+
 function SkillCredentialsPanel({
   client,
   policy,
+  actorId,
   onDisconnect,
 }: {
   client: FeedV1HostClient;
   policy: FeedHostDelegationPolicy;
+  actorId: string;
   onDisconnect: () => void;
 }) {
   const [skills, setSkills] = useState<FeedHostSkillState[]>([]);
+  const [workflows, setWorkflows] = useState<FeedHostWorkflowState[]>([]);
   const [inputAuthorities, setInputAuthorities] = useState<FeedHostInputAuthority[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [inputAuthorityError, setInputAuthorityError] = useState<string | null>(null);
   const [busySkillId, setBusySkillId] = useState<string | null>(null);
+  const [busyWorkflowId, setBusyWorkflowId] = useState<string | null>(null);
   const [busySourceId, setBusySourceId] = useState<string | null>(null);
   const [inputs, setInputs] = useState<Record<string, { providerId: string; secretRef: string }>>({});
+  const [routineDrafts, setRoutineDrafts] = useState<Record<string, RoutineDraft>>({});
+  const [routineStatus, setRoutineStatus] = useState<string | null>(null);
   const [newSkill, setNewSkill] = useState({ skillId: "", providerId: "", secretRef: "" });
   const [newSource, setNewSource] = useState({ sourceId: "", displayName: "", tc1Link: "" });
 
   const reload = useCallback(async () => {
     setLoadState("loading");
     try {
-      const [skillsPage, authorityPage] = await Promise.allSettled([
+      const [skillsPage, authorityPage, workflowsPage] = await Promise.allSettled([
         client.listSkills({ limit: 50 }),
         client.listInputAuthorities(),
+        client.listWorkflows({ limit: 50 }),
       ]);
       if (skillsPage.status === "rejected") throw skillsPage.reason;
       setSkills(skillsPage.value.items);
+      if (workflowsPage.status === "rejected") throw workflowsPage.reason;
+      setWorkflows(workflowsPage.value.items);
+      setRoutineDrafts((current) => seedRoutineDrafts(workflowsPage.value.items, current));
       if (authorityPage.status === "fulfilled") {
         setInputAuthorities(authorityPage.value.items);
         setInputAuthorityError(null);
@@ -1197,6 +1280,40 @@ function SkillCredentialsPanel({
     }
   };
 
+  const postWorkflowIntent = async (
+    workflow: FeedHostWorkflowState,
+    intentKind: ControlIntentEvent["intentKind"],
+    payload: Record<string, unknown> = {},
+  ) => {
+    setBusyWorkflowId(workflow.packageId);
+    setRoutineStatus(null);
+    try {
+      await client.postControlIntent({
+        eventId: crypto.randomUUID(),
+        actorId,
+        readerNonce: newNonce(),
+        intentKind,
+        status: "accepted",
+        targetRef: `package:${workflow.packageId}`,
+        payload,
+        createdAt: new Date().toISOString(),
+      });
+      setRoutineStatus(routineSuccessMessage(intentKind, workflow.displayName));
+      if (intentKind === "reset_package") {
+        setRoutineDrafts((state) => {
+          const next = { ...state };
+          delete next[workflow.packageId];
+          return next;
+        });
+      }
+      await reload();
+    } catch (error) {
+      setLoadError(formatHostError(error));
+    } finally {
+      setBusyWorkflowId(null);
+    }
+  };
+
   return (
     <section className="panel settings-panel" aria-labelledby="skill-credentials-title">
       <div className="panel-copy">
@@ -1214,6 +1331,171 @@ function SkillCredentialsPanel({
       </ul>
       {loadState === "loading" && <p>Loading skill credential settings.</p>}
       {loadError && <p className="error">{loadError}</p>}
+      <div className="settings-subsection">
+        <h3>Routines</h3>
+        {routineStatus && <p className="interaction-status" role="status" aria-live="polite">{routineStatus}</p>}
+        {loadState === "ready" && workflows.length === 0 && (
+          <p>No routines are available yet.</p>
+        )}
+        <ul className="skill-list">
+          {workflows.map((workflow) => {
+            const draft = routineDrafts[workflow.packageId] ?? routineDraftFromWorkflow(workflow);
+            const busy = busyWorkflowId === workflow.packageId;
+            return (
+              <li key={workflow.packageId} className="skill-row routine-row">
+                <div className="skill-summary routine-summary">
+                  <strong>{workflow.displayName}</strong>
+                  <span>{workflow.disabled ? "Removed" : workflow.paused ? "Paused" : "Active"}</span>
+                  <span>{workflow.presentation?.cadenceLabel ?? cadenceLabel(workflow.cadence)}</span>
+                  <span>{workflow.presentation?.sourcesLabel ?? sourceSelectionLabel(draft.sourceSelection)}</span>
+                  <span>{workflow.presentation?.audienceLabel ?? audienceLabel(draft.audience)}</span>
+                </div>
+                <p className="routine-purpose">{workflow.presentation?.purpose ?? workflow.disclosure.userCopy}</p>
+                {workflow.example && (
+                  <span className="routine-example">Latest example: {workflow.example.title ?? workflow.example.artifactId}</span>
+                )}
+                {workflow.lastRun && (
+                  <span className="routine-example">
+                    Last run: {workflow.lastRun.status} · {new Date(workflow.lastRun.startedAt).toLocaleString()}
+                  </span>
+                )}
+                <details className="routine-details">
+                  <summary>Edit routine</summary>
+                  <div className="skill-actions routine-edit-grid">
+                    <label>
+                      Frequency
+                      <select
+                        value={draft.cadence}
+                        onChange={(event) => setRoutineDrafts((state) => ({
+                          ...state,
+                          [workflow.packageId]: { ...draft, cadence: event.target.value as RoutineDraft["cadence"] },
+                        }))}
+                        disabled={busy}
+                      >
+                        <option value="normal">Daily</option>
+                        <option value="more">As new content arrives</option>
+                        <option value="less">On demand</option>
+                      </select>
+                    </label>
+                    <label>
+                      Sources
+                      <select
+                        value={draft.sourceSelection}
+                        onChange={(event) => setRoutineDrafts((state) => ({
+                          ...state,
+                          [workflow.packageId]: { ...draft, sourceSelection: event.target.value as RoutineDraft["sourceSelection"] },
+                        }))}
+                        disabled={busy}
+                      >
+                        <option value="recent_authorized">Recent authorized conversations</option>
+                        <option value="named_sources">Named sources only</option>
+                        <option value="all_authorized">Everything authorized</option>
+                      </select>
+                    </label>
+                    <label>
+                      Audience
+                      <select
+                        value={draft.audience}
+                        onChange={(event) => setRoutineDrafts((state) => ({
+                          ...state,
+                          [workflow.packageId]: { ...draft, audience: event.target.value as RoutineDraft["audience"] },
+                        }))}
+                        disabled={busy}
+                      >
+                        <option value="private">Private to me</option>
+                        <option value="team">Team-ready draft</option>
+                        <option value="draft">Draft only</option>
+                      </select>
+                    </label>
+                    <label>
+                      Output volume
+                      <select
+                        value={draft.outputVolume}
+                        onChange={(event) => setRoutineDrafts((state) => ({
+                          ...state,
+                          [workflow.packageId]: { ...draft, outputVolume: event.target.value as RoutineDraft["outputVolume"] },
+                        }))}
+                        disabled={busy}
+                      >
+                        <option value="short">Short</option>
+                        <option value="standard">Standard</option>
+                        <option value="detailed">Detailed</option>
+                      </select>
+                    </label>
+                    <button
+                      onClick={() => void postWorkflowIntent(workflow, "tune_package", {
+                        expectedVersion: workflow.settingsVersion,
+                        settings: draft,
+                      })}
+                      disabled={busy}
+                    >
+                      Save changes
+                    </button>
+                  </div>
+                </details>
+                <div className="skill-actions">
+                  <button
+                    onClick={() => void postWorkflowIntent(workflow, "generate_new_request", {
+                      scope: { packageId: workflow.packageId, targetRef: `package:${workflow.packageId}` },
+                      prompt: `Run ${workflow.displayName} now.`,
+                    })}
+                    disabled={busy || workflow.disabled}
+                  >
+                    Run now
+                  </button>
+                  <button
+                    onClick={() => void postWorkflowIntent(workflow, "ask_feed", {
+                      prompt: `Use ${workflow.displayName} to answer from my latest authorized context.`,
+                    })}
+                    disabled={busy || workflow.disabled}
+                  >
+                    Ask Feed
+                  </button>
+                  {workflow.disabled ? (
+                    <button
+                      onClick={() => void postWorkflowIntent(workflow, "enable_package", {
+                        expectedVersion: workflow.settingsVersion,
+                      })}
+                      disabled={busy}
+                    >
+                      Add back
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => void postWorkflowIntent(
+                          workflow,
+                          workflow.paused ? "enable_package" : "pause_package",
+                          { expectedVersion: workflow.settingsVersion },
+                        )}
+                        disabled={busy}
+                      >
+                        {workflow.paused ? "Enable" : "Pause"}
+                      </button>
+                      <button
+                        onClick={() => void postWorkflowIntent(workflow, "disable_package", {
+                          expectedVersion: workflow.settingsVersion,
+                        })}
+                        disabled={busy}
+                      >
+                        Remove
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={() => void postWorkflowIntent(workflow, "reset_package", {
+                      expectedVersion: workflow.settingsVersion,
+                    })}
+                    disabled={busy}
+                  >
+                    Reset
+                  </button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
       <div className="settings-subsection">
         <h3>Named transcript sources</h3>
         <p>
