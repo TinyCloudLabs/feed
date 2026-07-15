@@ -14,7 +14,7 @@ import {
   submitFeedHostDelegations,
   type FeedLoginTrace,
   type FeedSession,
-} from "./auth.ts";
+} from "./authLazy.ts";
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
 import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
@@ -1200,6 +1200,44 @@ function routineSuccessMessage(intentKind: ControlIntentEvent["intentKind"], dis
   }
 }
 
+// The local state a routine will hold once the intent is applied, so the UI
+// can reflect it immediately. Returns the same reference for intents that
+// don't change routine state (Run now, Ask Feed) so callers can skip the
+// re-render. settingsVersion bumps optimistically to keep a fast second edit
+// from tripping its own stale-version guard before the reload lands.
+function optimisticWorkflow(
+  workflow: FeedHostWorkflowState,
+  intentKind: ControlIntentEvent["intentKind"],
+  payload: Record<string, unknown>,
+): FeedHostWorkflowState {
+  const bumped = workflow.settingsVersion + 1;
+  switch (intentKind) {
+    case "pause_package":
+      return { ...workflow, paused: true, settingsVersion: bumped };
+    case "enable_package":
+      return { ...workflow, paused: false, disabled: false, settingsVersion: bumped };
+    case "disable_package":
+      return { ...workflow, disabled: true, settingsVersion: bumped };
+    case "reset_package":
+      return { ...workflow, cadence: undefined, settings: undefined, settingsVersion: bumped };
+    case "tune_package": {
+      const settings = (payload.settings ?? {}) as Partial<RoutineDraft>;
+      return {
+        ...workflow,
+        cadence: settings.cadence ?? workflow.cadence,
+        settings: {
+          sourceSelection: settings.sourceSelection ?? workflow.settings?.sourceSelection,
+          audience: settings.audience ?? workflow.settings?.audience,
+          outputVolume: settings.outputVolume ?? workflow.settings?.outputVolume,
+        },
+        settingsVersion: bumped,
+      };
+    }
+    default:
+      return workflow;
+  }
+}
+
 function SkillCredentialsPanel({
   client,
   policy,
@@ -1293,6 +1331,14 @@ function SkillCredentialsPanel({
   ) => {
     setBusyWorkflowId(workflow.packageId);
     setRoutineStatus(null);
+    // Optimistic: reflect the change locally right away so the control feels
+    // instant, then post and reconcile in the background. A failed post
+    // surfaces the error and a reload snaps state back to the server truth.
+    const optimistic = optimisticWorkflow(workflow, intentKind, payload);
+    if (optimistic !== workflow) {
+      setWorkflows((current) =>
+        current.map((entry) => (entry.packageId === workflow.packageId ? optimistic : entry)));
+    }
     try {
       await client.postControlIntent({
         eventId: crypto.randomUUID(),
@@ -1312,9 +1358,11 @@ function SkillCredentialsPanel({
           return next;
         });
       }
-      await reload();
+      // Reconcile in the background — do not block the interaction on it.
+      void reload();
     } catch (error) {
       setLoadError(formatHostError(error));
+      void reload();
     } finally {
       setBusyWorkflowId(null);
     }
