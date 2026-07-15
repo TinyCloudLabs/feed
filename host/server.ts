@@ -97,6 +97,7 @@ type ActorState = AcceptedFeedDelegation & {
   storageAccess?: FeedHostActorStorage;
   ready?: Promise<void>;
   preparation?: ActorPreparationStatus;
+  traceId?: string;
   expiresAt: string;
 };
 
@@ -143,7 +144,7 @@ const PUBLIC_PATHS = new Set([
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, If-None-Match, Last-Event-ID",
+  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, X-Feed-Trace-Id, If-None-Match, Last-Event-ID",
 };
 
 const JSON_HEADERS = {
@@ -309,7 +310,10 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       }
 
       const startedAt = performance.now();
+      const traceId = requestTraceId(request);
       let authenticatedActor: string | undefined;
+      let queueWaitMs = 0;
+      let routeStartedAt = startedAt;
       const logRequest = (response: Response, errorCode?: string, error?: unknown) => {
         const finished = finish(response);
         if (request.method === "GET" && PUBLIC_PATHS.has(url.pathname)) return finished;
@@ -318,7 +322,10 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           path: url.pathname,
           status: response.status,
           ms: Math.round(performance.now() - startedAt),
+          queueWaitMs: Math.round(queueWaitMs),
+          routeMs: Math.round(performance.now() - routeStartedAt),
           actor: authenticatedActor,
+          ...(traceId ? { traceId } : {}),
           ...(errorCode ? { code: errorCode } : {}),
           ...(error ? errorLogFields(error) : {}),
         });
@@ -343,11 +350,17 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           }
           routedRequest = bindAuthenticatedActor(request, authenticatedActor);
         }
-        const runRoute = () => workerRoute
-          ? routeWorker(request, currentContext, actorRequestQueues)
-          : request.method === "GET" && authenticatedActor
-          ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
-          : route(routedRequest, currentContext);
+        let queuedAt: number | undefined;
+        const runRoute = () => {
+          routeStartedAt = performance.now();
+          queueWaitMs = queuedAt === undefined ? 0 : routeStartedAt - queuedAt;
+          return workerRoute
+            ? routeWorker(request, currentContext, actorRequestQueues)
+            : request.method === "GET" && authenticatedActor
+            ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
+            : route(routedRequest, currentContext);
+        };
+        if (authenticatedActor && !isActorControlRoute(request.method, url.pathname)) queuedAt = performance.now();
         const response = authenticatedActor && !isActorControlRoute(request.method, url.pathname)
           ? await serializeActorRequest(
               isArtifactReadRoute(request.method, url.pathname) ? actorArtifactQueues : actorRequestQueues,
@@ -443,6 +456,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       actor: actor.actorId,
       attempt: setup.attempt,
       phase: setup.phase,
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
     });
     return json({ accepted: true, actorId: actor.actorId, setup }, setup.state === "ready" ? 200 : 202);
   }
@@ -484,6 +498,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       actor: activated.actorId,
       ms: Math.round(performance.now() - activationStartedAt),
       resources: activated.resources.length,
+      ...(requestTraceId(request) ? { traceId: requestTraceId(request) } : {}),
     });
     if (payloadActorId && !actorIdsMatch(payloadActorId, activated.actorId)) {
       throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
@@ -508,10 +523,12 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         storageAccess: currentProofComplete ? undefined : existing?.storageAccess,
         ready: currentProofComplete ? undefined : existing?.ready,
         preparation: currentProofComplete ? undefined : existing?.preparation,
+        traceId: requestTraceId(request) ?? existing?.traceId,
       };
       const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
         ? existing
         : state;
+      if (requestTraceId(request)) actor.traceId = requestTraceId(request);
       if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, actor);
       if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
         const persistenceStartedAt = performance.now();
@@ -528,11 +545,13 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
           logEvent("info", "feed_delegation_persisted", {
             actor: activated.actorId,
             ms: Math.round(performance.now() - persistenceStartedAt),
+            ...(actor.traceId ? { traceId: actor.traceId } : {}),
           });
         }).catch((error) => {
           logEvent("warn", "feed_delegation_persist_failed", {
             actor: activated.actorId,
             ms: Math.round(performance.now() - persistenceStartedAt),
+            ...(actor.traceId ? { traceId: actor.traceId } : {}),
             ...errorLogFields(error),
           });
         });
@@ -617,6 +636,11 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       const level = record.level === "error" || record.level === "warn" ? record.level : "info";
       logEvent(level, `client_${eventName.slice(0, 64)}`, {
         source: "web",
+        ...(optionalString(record.traceId) ? { traceId: optionalString(record.traceId)!.slice(0, 100) } : {}),
+        ...(optionalString(record.phase) ? { phase: optionalString(record.phase)!.slice(0, 64) } : {}),
+        ...(optionalNumber(record.durationMs) === undefined ? {} : { durationMs: optionalNumber(record.durationMs) }),
+        ...(optionalNumber(record.elapsedMs) === undefined ? {} : { elapsedMs: optionalNumber(record.elapsedMs) }),
+        ...(optionalNumber(record.activeElapsedMs) === undefined ? {} : { activeElapsedMs: optionalNumber(record.activeElapsedMs) }),
         ...(optionalString(record.detail) ? { detail: optionalString(record.detail)!.slice(0, 500) } : {}),
       });
       accepted += 1;
@@ -704,13 +728,18 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   }
 
   if (request.method === "GET" && url.pathname === "/feed") {
-    const actor = await requireCompleteActor(request, context);
+    const actor = await requireDelegatedActor(request, context);
     const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
       throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
     }
-    return json(await storage.listFeed(actorStorage(actor), { limit, cursor }));
+    const page = await storage.listFeed(actorStorage(actor), { limit, cursor });
+    if (page.items.length === 0 && seedOnStart && actor.preparation?.state !== "ready") {
+      await ensureActorReady(storage, actor, seedOnStart);
+      return json(await storage.listFeed(actorStorage(actor), { limit, cursor }));
+    }
+    return json(page);
   }
 
   if (request.method === "GET" && url.pathname === "/feed/events") {
@@ -721,7 +750,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   const artifactMatch = url.pathname.match(/^\/artifacts\/([^/]+)(\/provenance)?$/);
   if (request.method === "GET" && artifactMatch) {
-    const actor = await requireCompleteActor(request, context);
+    const actor = await requireDelegatedActor(request, context);
     const artifactId = decodeURIComponent(artifactMatch[1]);
     const result = await storage.readArtifact(actorStorage(actor), artifactId);
     if (result.kind === "not_found") {
@@ -1166,6 +1195,10 @@ async function requireCompleteActor(request: Request, context: FeedHostContext):
   return requireDelegationAndReady(context, actorId);
 }
 
+async function requireDelegatedActor(request: Request, context: FeedHostContext): Promise<ActorState> {
+  return requireDelegation(context, requireRequestActorId(request));
+}
+
 async function requireDevPublisherActor(request: Request, context: FeedHostContext): Promise<ActorState> {
   const actorId = request.headers.get("x-feed-actor-id");
   if (actorId) return requireDelegationAndReady(context, actorId);
@@ -1187,6 +1220,11 @@ function requireRequestActorId(request: Request): string {
   const actorId = request.headers.get("x-feed-actor-id");
   if (!actorId) throw new FeedHostError("missing delegated actor", 401, "unauthorized");
   return actorId;
+}
+
+function requestTraceId(request: Request): string | undefined {
+  const traceId = request.headers.get("x-feed-trace-id")?.trim();
+  return traceId && /^[A-Za-z0-9._:-]{1,100}$/.test(traceId) ? traceId : undefined;
 }
 
 async function requireDelegation(context: FeedHostContext, actorId: string): Promise<ActorState> {
@@ -1421,6 +1459,7 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
 
 async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, seedOnStart: boolean): Promise<void> {
   if (!actor.ready) {
+    const preparationStartedAt = performance.now();
     const startedAt = new Date().toISOString();
     actor.preparation = {
       state: "preparing",
@@ -1429,16 +1468,25 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
       startedAt,
       updatedAt: startedAt,
     };
+    logEvent("info", "feed_preparation_started", {
+      actor: actor.actorId,
+      attempt: actor.preparation.attempt,
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+    });
     const ready = (async () => {
       try {
         const access = actorStorage(actor);
-        await retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access));
-        updateActorPreparation(actor, "artifact_check");
-        if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
-          updateActorPreparation(actor, "seed");
-          await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
-          updateActorPreparation(actor, "reconcile");
-          await retryTinyCloudTransaction("reconcile_compatibility", actor.actorId, () => storage.reconcileProjectionCompatibility(access));
+        await runActorPreparationPhase(actor, "bootstrap", () =>
+          retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access)));
+        if (seedOnStart) {
+          const hasArtifacts = await runActorPreparationPhase(actor, "artifact_check", () =>
+            retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)));
+          if (!hasArtifacts) {
+            await runActorPreparationPhase(actor, "seed", () =>
+              retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access)));
+            await runActorPreparationPhase(actor, "reconcile", () =>
+              retryTinyCloudTransaction("reconcile_compatibility", actor.actorId, () => storage.reconcileProjectionCompatibility(access)));
+          }
         }
         const completedAt = new Date().toISOString();
         actor.preparation = {
@@ -1449,6 +1497,12 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
           completedAt,
           error: undefined,
         };
+        logEvent("info", "feed_preparation_completed", {
+          actor: actor.actorId,
+          attempt: actor.preparation.attempt,
+          ms: Math.round(performance.now() - preparationStartedAt),
+          ...(actor.traceId ? { traceId: actor.traceId } : {}),
+        });
       } catch (error) {
         const completedAt = new Date().toISOString();
         actor.preparation = {
@@ -1462,6 +1516,13 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
             message: publicPreparationError(error),
           },
         };
+        logEvent("error", "feed_preparation_failed", {
+          actor: actor.actorId,
+          attempt: actor.preparation.attempt,
+          ms: Math.round(performance.now() - preparationStartedAt),
+          ...(actor.traceId ? { traceId: actor.traceId } : {}),
+          ...errorLogFields(error),
+        });
         throw error;
       }
     })();
@@ -1471,6 +1532,42 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
     });
   }
   await actor.ready;
+}
+
+async function runActorPreparationPhase<T>(
+  actor: ActorState,
+  phase: Exclude<ActorPreparationPhase, "idle" | "ready" | "failed">,
+  run: () => Promise<T>,
+): Promise<T> {
+  updateActorPreparation(actor, phase);
+  const startedAt = performance.now();
+  logEvent("info", "feed_preparation_phase_started", {
+    actor: actor.actorId,
+    attempt: actor.preparation?.attempt,
+    phase,
+    ...(actor.traceId ? { traceId: actor.traceId } : {}),
+  });
+  try {
+    const result = await run();
+    logEvent("info", "feed_preparation_phase_completed", {
+      actor: actor.actorId,
+      attempt: actor.preparation?.attempt,
+      phase,
+      ms: Math.round(performance.now() - startedAt),
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+    });
+    return result;
+  } catch (error) {
+    logEvent("error", "feed_preparation_phase_failed", {
+      actor: actor.actorId,
+      attempt: actor.preparation?.attempt,
+      phase,
+      ms: Math.round(performance.now() - startedAt),
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+      ...errorLogFields(error),
+    });
+    throw error;
+  }
 }
 
 function updateActorPreparation(actor: ActorState, phase: ActorPreparationPhase): void {

@@ -271,9 +271,15 @@ test("lists feed projections without hydrating artifact documents", async () => 
     }],
   });
 
-  const page = await new FeedHostStorage().listFeed(actor, { limit: 40 });
+  const storage = new FeedHostStorage();
+  const page = await storage.listFeed(actor, { limit: 40 });
   expect(page.items).toHaveLength(1);
   expect(page.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+
+  const refreshedAccess = makeHydrationActor({ artifacts: [], docs: {}, projections: [] });
+  const cachedPage = await storage.listFeed(refreshedAccess, { limit: 40 });
+  expect(cachedPage.items).toHaveLength(1);
+  expect(cachedPage.items[0]?.target.artifactId).toBe(artifact.artifact_id);
 });
 
 test("rejects feedback for a missing artifact before writing either interaction table", async () => {

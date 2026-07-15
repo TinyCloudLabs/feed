@@ -238,11 +238,16 @@ describe("Feed Host server", () => {
 
     const preflight = await fetch(`${runtime.url}/feed`, {
       method: "OPTIONS",
-      headers: { origin: allowedOrigin },
+      headers: {
+        origin: allowedOrigin,
+        "access-control-request-method": "GET",
+        "access-control-request-headers": "x-feed-trace-id",
+      },
     });
     expect(preflight.status).toBe(204);
     expect(preflight.headers.get("access-control-allow-origin")).toBe(allowedOrigin);
     expect(preflight.headers.get("access-control-allow-credentials")).toBe("true");
+    expect(preflight.headers.get("access-control-allow-headers")).toContain("X-Feed-Trace-Id");
 
     const deniedOrigin = await fetch(`${runtime.url}/delegation-policy`, {
       headers: { origin: "https://attacker.example" },
@@ -473,6 +478,36 @@ describe("Feed Host server", () => {
     expect(storage.bootstrapAttempts).toBe(1);
     storage.release();
     await waitForSetupStatus(runtime, "", "ready");
+  });
+
+  test("serves existing feed data while backend preparation is still running", async () => {
+    const storage = new BlockingPreparationStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      requireActorSession: true,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const grant = await postJson(`${runtime.url}/api/delegations`, {
+      actorId: ACTOR_ID,
+      serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+    });
+    expect(grant.status).toBe(202);
+    const cookie = grant.headers.get("set-cookie")?.split(";", 1)[0] ?? "";
+
+    const feed = await Promise.race([
+      fetch(`${runtime.url}/feed`, { headers: { cookie } }),
+      Bun.sleep(100).then(() => null),
+    ]);
+    expect(feed).not.toBeNull();
+    expect(feed?.status).toBe(200);
+    expect(((await feed?.json()) as { items: unknown[] }).items).toEqual([]);
+
+    storage.release();
+    await waitForSetupStatus(runtime, cookie, "ready");
   });
 
   test("serializes concurrent private requests for the same actor", async () => {

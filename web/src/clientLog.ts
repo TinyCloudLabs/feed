@@ -7,7 +7,21 @@ import { FEED_HOST_URL } from "./config.ts";
 
 export type ClientLogLevel = "info" | "warn" | "error";
 
-export function reportClientEvent(level: ClientLogLevel, event: string, detail?: string, actorId?: string): void {
+export type ClientLogFields = {
+  traceId?: string;
+  phase?: string;
+  durationMs?: number;
+  elapsedMs?: number;
+  activeElapsedMs?: number;
+};
+
+export function reportClientEvent(
+  level: ClientLogLevel,
+  event: string,
+  detail?: string,
+  actorId?: string,
+  fields: ClientLogFields = {},
+): void {
   try {
     void fetch(`${FEED_HOST_URL.replace(/\/+$/, "")}/api/client-events`, {
       method: "POST",
@@ -15,12 +29,39 @@ export function reportClientEvent(level: ClientLogLevel, event: string, detail?:
         "content-type": "application/json",
         ...(actorId ? { "x-feed-actor-id": actorId } : {}),
       },
-      body: JSON.stringify({ level, event, detail: detail?.slice(0, 500) }),
+      body: JSON.stringify({ level, event, detail: detail?.slice(0, 500), ...fields }),
       keepalive: true,
     }).catch(() => undefined);
   } catch {
     // Reporting must never break the app.
   }
+}
+
+export function reportClientTiming(
+  event: string,
+  input: {
+    traceId: string;
+    phaseStartedAt: number;
+    loginStartedAt: number;
+    systemStartedAt?: number;
+    systemElapsedBeforeApprovalMs?: number;
+    actorId?: string;
+    detail?: string;
+  },
+): void {
+  const now = performance.now();
+  reportClientEvent("info", event, input.detail, input.actorId, {
+    traceId: input.traceId,
+    durationMs: Math.round(now - input.phaseStartedAt),
+    elapsedMs: Math.round(now - input.loginStartedAt),
+    ...(input.systemStartedAt === undefined
+      ? {}
+      : {
+          activeElapsedMs: Math.round(
+            (input.systemElapsedBeforeApprovalMs ?? 0) + now - input.systemStartedAt,
+          ),
+        }),
+  });
 }
 
 export function errorDetail(error: unknown): string {

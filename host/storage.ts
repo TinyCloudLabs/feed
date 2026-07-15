@@ -316,9 +316,15 @@ const GENERATION_REQUEST_COLUMNS = `request_id, reader_nonce, actor_id, status, 
   publication_key, artifact_ids_json, publication_manifest_json, error_json, timing_events_json,
   expires_at, created_at, updated_at`;
 
+function storageCacheKey(actor: FeedHostActorStorage): string {
+  return normalizeActorId(actor.actorId);
+}
+
 export class FeedHostStorage {
   private readonly bootstrapped = new WeakSet<object>();
-  private readonly projectionCache = new WeakMap<object, FeedProjectionState[]>();
+  private readonly projectionCache = new Map<string, FeedProjectionState[]>();
+  private readonly feedbackCache = new Map<string, FeedbackRow[]>();
+  private readonly preferenceCache = new Map<string, FeedPreferenceProfileRecord[]>();
   private readonly migrateLegacyDataHook: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
   private readonly maxPendingGenerationRequests: number;
 
@@ -352,7 +358,7 @@ export class FeedHostStorage {
   async reconcileProjectionCompatibility(actor: FeedHostActorStorage): Promise<void> {
     await execute(this.db(actor, "feed_index"), FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
     await execute(this.db(actor, "feed_index"), FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
-    this.projectionCache.delete(actor);
+    this.projectionCache.delete(storageCacheKey(actor));
   }
 
   async hasArtifacts(actor: FeedHostActorStorage): Promise<boolean> {
@@ -387,8 +393,8 @@ export class FeedHostStorage {
     const limit = Math.max(1, Math.min(input.limit, 100));
     const [projectionRows, feedbackRows, preferenceRows] = await Promise.all([
       this.readCachedProjectionStates(actor),
-      this.readFeedbackRows(actor),
-      this.listPreferenceProfiles(actor),
+      this.readCachedFeedbackRows(actor),
+      this.readCachedPreferenceProfiles(actor),
     ]);
     const postArtifactIds = new Set(
       projectionRows.filter((row) => row.target.kind === "post").map((row) => row.target.artifactId),
@@ -539,7 +545,7 @@ export class FeedHostStorage {
     // Reconciliation can spend minutes validating remote artifact documents.
     // Keep the last complete projection snapshot readable while that repair
     // continues instead of making /feed repeat the same remote index scans.
-    this.projectionCache.set(actor, currentRows);
+    this.projectionCache.set(storageCacheKey(actor), currentRows);
     const artifacts: FeedReconcileArtifact[] = [];
     for (const artifactRow of artifactRows) {
       const current = currentRows.find((row) => row.target.artifactId === artifactRow.artifact_id);
@@ -608,7 +614,7 @@ export class FeedHostStorage {
     if (!parity.readyToRetireLegacyReads) {
       console.warn("Feed Host projection parity gate remains closed", parity);
     }
-    this.projectionCache.set(actor, plan.desired);
+    this.projectionCache.set(storageCacheKey(actor), plan.desired);
     return plan;
   }
 
@@ -671,6 +677,8 @@ export class FeedHostStorage {
       });
     }
     await batch(this.db(actor, "feed_index"), statements);
+    this.feedbackCache.delete(storageCacheKey(actor));
+    if (disposition) this.projectionCache.delete(storageCacheKey(actor));
 
     if (event.signal === "show_fewer") {
       if (projection) {
@@ -1457,10 +1465,11 @@ export class FeedHostStorage {
   }
 
   private async readCachedProjectionStates(actor: FeedHostActorStorage): Promise<FeedProjectionState[]> {
-    const cached = this.projectionCache.get(actor);
+    const key = storageCacheKey(actor);
+    const cached = this.projectionCache.get(key);
     if (cached) return cached;
     const projections = await this.readProjectionStates(actor);
-    this.projectionCache.set(actor, projections);
+    this.projectionCache.set(key, projections);
     return projections;
   }
 
@@ -1494,6 +1503,24 @@ export class FeedHostStorage {
       signal: row.signal,
       createdAt: row.createdAt,
     }));
+  }
+
+  private async readCachedFeedbackRows(actor: FeedHostActorStorage): Promise<FeedbackRow[]> {
+    const key = storageCacheKey(actor);
+    const cached = this.feedbackCache.get(key);
+    if (cached) return cached;
+    const rows = await this.readFeedbackRows(actor);
+    this.feedbackCache.set(key, rows);
+    return rows;
+  }
+
+  private async readCachedPreferenceProfiles(actor: FeedHostActorStorage): Promise<FeedPreferenceProfileRecord[]> {
+    const key = storageCacheKey(actor);
+    const cached = this.preferenceCache.get(key);
+    if (cached) return cached;
+    const rows = await this.listPreferenceProfiles(actor);
+    this.preferenceCache.set(key, rows);
+    return rows;
   }
 
   private async readArtifactDocument(
@@ -1563,6 +1590,7 @@ export class FeedHostStorage {
         params: [record.profileId, record.actorId, record.scope, JSON.stringify(record.value), record.version, record.updatedAt],
       },
     ]);
+    this.preferenceCache.delete(storageCacheKey(actor));
     const result = await actor.settings.kv.put(preferenceKey(record.actorId, record.scope), record, {
       contentType: "application/json",
     });
@@ -1720,6 +1748,7 @@ export class FeedHostStorage {
         params: [disposition, updatedAt, artifactId],
       },
     ]);
+    this.projectionCache.delete(storageCacheKey(actor));
   }
 
   private async upsertGenerationRequest(

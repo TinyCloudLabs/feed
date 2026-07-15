@@ -12,10 +12,11 @@ import {
   signIn,
   signOut,
   submitFeedHostDelegations,
+  type FeedLoginTrace,
   type FeedSession,
 } from "./auth.ts";
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
-import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
 import type { FeedHostSetupStatus } from "./delegation.ts";
 import {
@@ -83,10 +84,18 @@ export function App() {
   const setupInFlight = useRef(false);
   const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastRecoveryAt = useRef(0);
+  const loginTrace = useRef<FeedLoginTrace | null>(null);
+  const firstContentReported = useRef<string | null>(null);
+  const restoredHostSession = useRef(false);
   const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
 
   const client = useMemo(
-    () => new FeedV1HostClient({ baseUrl: FEED_HOST_URL, token: FEED_HOST_TOKEN || undefined, actorId: session?.readerDid }),
+    () => new FeedV1HostClient({
+      baseUrl: FEED_HOST_URL,
+      token: FEED_HOST_TOKEN || undefined,
+      actorId: session?.readerDid,
+      traceId: loginTrace.current?.traceId,
+    }),
     [session?.readerDid],
   );
   const artifactCache = useMemo(() => createLazyArtifactCache((artifactId) => client.getArtifact(artifactId)), [client]);
@@ -94,11 +103,33 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
+      const startedAt = performance.now();
+      const trace: FeedLoginTrace = {
+        traceId: crypto.randomUUID(),
+        loginStartedAt: startedAt,
+        systemStartedAt: startedAt,
+      };
+      loginTrace.current = trace;
+      client.setTraceId(trace.traceId);
+      const policyStartedAt = performance.now();
       const nextPolicy = await client.getDelegationPolicy();
+      reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
       if (cancelled) return;
       setPolicy(nextPolicy);
+      const restoreStartedAt = performance.now();
       const restored = await restoreSession(nextPolicy);
-      if (!cancelled && restored) setSession(restored);
+      if (!cancelled && restored) {
+        restoredHostSession.current = true;
+        reportClientTiming("login_session_restored", {
+          ...trace,
+          phaseStartedAt: restoreStartedAt,
+          actorId: restored.readerDid,
+        });
+        setSession(restored);
+      } else if (!restored) {
+        loginTrace.current = null;
+        client.setTraceId(undefined);
+      }
     };
     bootstrap()
       .then(() => undefined)
@@ -121,6 +152,7 @@ export function App() {
     const now = Date.now();
     if (now - lastRecoveryAt.current < RECOVERY_COOLDOWN_MS) return false;
     lastRecoveryAt.current = now;
+    restoredHostSession.current = false;
     reportClientEvent("warn", "delegation_lost_recovering", undefined, session?.readerDid);
     try {
       const nextPolicy = await client.getDelegationPolicy();
@@ -134,10 +166,17 @@ export function App() {
     }
   }, [client, session]);
 
-  const loadFeed = useCallback(async () => {
-    if (!session || feedLoadInFlight.current) return;
+  const loadFeed = useCallback(async (options: {
+    recoverDelegation?: boolean;
+    surfaceError?: boolean;
+    reason?: string;
+  } = {}): Promise<boolean> => {
+    if (!session || feedLoadInFlight.current) return false;
+    const recoverLostDelegation = options.recoverDelegation !== false;
+    const surfaceError = options.surfaceError !== false;
     feedLoadInFlight.current = true;
-    setLoadState("loading");
+    if (surfaceError) setLoadState("loading");
+    const phaseStartedAt = performance.now();
     try {
       const page = await client.listFeed({ limit: 40 });
       setItems((current) => {
@@ -149,14 +188,32 @@ export function App() {
       });
       setLoadError(null);
       setLoadState("ready");
-    } catch (error) {
-      if (isDelegationLostError(error)) {
-        feedLoadInFlight.current = false;
-        if (await recoverDelegation()) return;
+      if (loginTrace.current) {
+        reportClientTiming("login_feed_projections_received", {
+          ...loginTrace.current,
+          phaseStartedAt,
+          actorId: session.readerDid,
+          detail: `items=${page.items.length} reason=${options.reason ?? "refresh"}`,
+        });
       }
-      reportClientEvent("error", "feed_load_failed", errorDetail(error), session.readerDid);
-      setLoadState("error");
-      setLoadError(formatHostError(error));
+      return true;
+    } catch (error) {
+      if (recoverLostDelegation && isDelegationLostError(error)) {
+        feedLoadInFlight.current = false;
+        if (await recoverDelegation()) return false;
+      }
+      reportClientEvent(
+        surfaceError ? "error" : "info",
+        surfaceError ? "feed_load_failed" : "feed_fast_path_missed",
+        errorDetail(error),
+        session.readerDid,
+        loginTrace.current ? { traceId: loginTrace.current.traceId } : {},
+      );
+      if (surfaceError) {
+        setLoadState("error");
+        setLoadError(formatHostError(error));
+      }
+      return false;
     } finally {
       feedLoadInFlight.current = false;
     }
@@ -178,18 +235,44 @@ export function App() {
     setActiveView("for_you");
     artifactCache.clear();
     feedbackAttempts.current.clear();
+    firstContentReported.current = null;
   }, [artifactCache]);
 
   const waitForHostSetup = useCallback(async (): Promise<void> => {
+    let previousPhase: FeedHostSetupStatus["phase"] | undefined;
+    let phaseStartedAt = performance.now();
     for (;;) {
       const status = await client.getDelegationStatus();
       if (!status.complete) throw new Error(`Feed Host delegation is ${status.state}`);
-      if (status.setup) setHostSetup(status.setup);
-      if (status.setup?.state === "ready") return;
+      if (status.setup) {
+        setHostSetup(status.setup);
+        if (status.setup.phase !== previousPhase) {
+          if (loginTrace.current) {
+            reportClientTiming("login_setup_phase", {
+              ...loginTrace.current,
+              phaseStartedAt,
+              actorId: session?.readerDid,
+              detail: `phase=${status.setup.phase}`,
+            });
+          }
+          previousPhase = status.setup.phase;
+          phaseStartedAt = performance.now();
+        }
+      }
+      if (status.setup?.state === "ready") {
+        if (loginTrace.current) {
+          reportClientTiming("login_setup_ready", {
+            ...loginTrace.current,
+            phaseStartedAt,
+            actorId: session?.readerDid,
+          });
+        }
+        return;
+      }
       if (status.setup?.state === "failed") throw new FeedSetupFailedError(status.setup);
       await new Promise((resolve) => window.setTimeout(resolve, SETUP_STATUS_POLL_MS));
     }
-  }, [client]);
+  }, [client, session?.readerDid]);
 
   const recordSetupFailure = useCallback((error: unknown) => {
     console.error("[Feed setup]", error);
@@ -204,16 +287,59 @@ export function App() {
       if (!session || !policy || setupInFlight.current) return;
       setupInFlight.current = true;
       setFeedState("starting");
-      setSetupStage("context");
       setHostSetup(null);
       setSetupError(null);
       setLoadError(null);
       try {
-        const [receipt] = await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
+        // A returning browser usually still has a valid Feed Host session.
+        // Read first so existing content never waits for delegation refresh or
+        // schema preparation.
+        if (restoredHostSession.current) {
+          const restoredFeed = await loadFeed({
+            recoverDelegation: false,
+            surfaceError: false,
+            reason: "restored_host_session",
+          });
+          if (restoredFeed) {
+            setFeedState("running");
+            return;
+          }
+          restoredHostSession.current = false;
+        }
+
+        setSetupStage("context");
+        const [receipt] = await submitFeedHostDelegations({
+          client,
+          policy,
+          actorId: session.readerDid,
+          trace: loginTrace.current ?? undefined,
+        });
         if (receipt?.setup) setHostSetup(receipt.setup);
         setSetupStage("preparing");
-        await waitForHostSetup();
-        await loadFeed();
+        const setup = waitForHostSetup().then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        const existingFeed = await loadFeed({
+          recoverDelegation: false,
+          surfaceError: false,
+          reason: "new_host_session",
+        });
+        if (existingFeed) {
+          setFeedState("running");
+          void setup.then((result) => {
+            if (result.ok) return;
+            reportClientEvent("warn", "feed_background_setup_failed", errorDetail(result.error), session.readerDid,
+              loginTrace.current ? { traceId: loginTrace.current.traceId } : {});
+            setEventsError("Feed is available, but background preparation needs attention.");
+          });
+          return;
+        }
+
+        const setupResult = await setup;
+        if (!setupResult.ok) throw setupResult.error;
+        const firstFeed = await loadFeed({ reason: "setup_complete" });
+        if (!firstFeed) throw new Error("Feed did not become readable after setup completed");
         setFeedState("running");
       } catch (error) {
         if (isFeedReconnectRequiredError(error)) {
@@ -304,13 +430,35 @@ export function App() {
 
   const connect = async () => {
     setSignInError(null);
+    const loginStartedAt = performance.now();
+    const trace: FeedLoginTrace = {
+      traceId: crypto.randomUUID(),
+      loginStartedAt,
+      systemElapsedBeforeApprovalMs: 0,
+    };
+    loginTrace.current = trace;
+    restoredHostSession.current = false;
+    client.setTraceId(trace.traceId);
+    reportClientEvent("info", "login_clicked", undefined, undefined, { traceId: trace.traceId });
     try {
-      const nextPolicy = policy ?? (await client.getDelegationPolicy());
+      let nextPolicy = policy;
+      if (!nextPolicy) {
+        const policyStartedAt = performance.now();
+        nextPolicy = await client.getDelegationPolicy();
+        trace.systemElapsedBeforeApprovalMs = performance.now() - policyStartedAt;
+        reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
+      }
       setPolicy(nextPolicy);
       resetFeedState();
-      setSession(await signIn(nextPolicy));
+      const nextSession = await signIn(nextPolicy, trace);
+      trace.systemStartedAt = performance.now();
+      reportClientEvent("info", "login_permissions_complete", undefined, nextSession.readerDid, {
+        traceId: trace.traceId,
+        elapsedMs: Math.round(trace.systemStartedAt - trace.loginStartedAt),
+      });
+      setSession(nextSession);
     } catch (error) {
-      reportClientEvent("error", "sign_in_failed", errorDetail(error));
+      reportClientEvent("error", "sign_in_failed", errorDetail(error), undefined, { traceId: trace.traceId });
       setSignInError(error instanceof Error ? error.message : String(error));
     }
   };
@@ -323,6 +471,7 @@ export function App() {
     } finally {
       await signOut().catch(() => undefined);
       setSession(null);
+      restoredHostSession.current = false;
       resetFeedState();
     }
   };
@@ -408,6 +557,22 @@ export function App() {
 
   const visibleItems = feedItemsForView(items, activeView);
   const visibleLoadError = loadError ?? eventsError;
+
+  useEffect(() => {
+    const trace = loginTrace.current;
+    if (!trace || firstContentReported.current === trace.traceId || items.length === 0) return;
+    if (!items.some((item) => item.projection.postBody || item.projection.postTitle || item.artifact)) return;
+    const frame = requestAnimationFrame(() => {
+      firstContentReported.current = trace.traceId;
+      reportClientTiming("login_first_content_visible", {
+        ...trace,
+        phaseStartedAt: trace.systemStartedAt ?? trace.loginStartedAt,
+        actorId: session?.readerDid,
+        detail: "budget_ms=5000 permission_time_excluded=true",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [items, session?.readerDid]);
 
   if (!restoreDone) {
     return <StatusScreen title="Opening Feed" detail="Checking your saved sign-in." />;
