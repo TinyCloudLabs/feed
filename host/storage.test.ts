@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { FEED_HOST_ARTIFACT_DOC_PREFIX, FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_FEED_DB_PATH } from "./delegation.ts";
 import type { FeedHostActorStorage } from "./storage.ts";
-import { FeedHostStorage } from "./storage.ts";
+import { FeedHostStorage, generationRequestSql } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import type { FeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { feedV1MigrationApplyPlans } from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
@@ -173,6 +173,90 @@ test("reconciliation is monotonic, repairs both rollout directions, and closes t
     'fresh', '[]', 'pkg', 'sha256:orphan', '2026-07-01T00:00:00.000Z', '2026-07-01T00:00:00.000Z'
   )`);
   expect(Number(db.query<{ mismatch_count: number }, []>(FEED_V1_LEGACY_PROJECTION_PARITY_SQL).get()?.mismatch_count)).toBe(1);
+  db.close();
+});
+
+// Real-SQLite handle over the actual migrated schema, so read-model queries
+// are checked against the columns that really exist (the in-memory fake store
+// used elsewhere cannot catch a SELECT of a non-existent column).
+function realHandle(dbName: "artifacts_index" | "feed_index") {
+  const db = new Database(":memory:");
+  const plan = feedV1MigrationApplyPlans().find((p) => p.dbName === dbName)!;
+  const migrations = dbName === "feed_index" ? withFeedHostMigrations(plan.migrations) : plan.migrations;
+  for (const migration of migrations) for (const sql of migration.sql) db.exec(sql);
+  return {
+    db,
+    handle: {
+      query: async (sql: string, params: unknown[] = []) => {
+        try {
+          return { ok: true as const, data: { columns: [], rows: db.query(sql).all(...(params as never[])) } };
+        } catch (error) {
+          return { ok: false as const, error: { code: "SQL", message: String(error) } };
+        }
+      },
+      batch: async (statements: Array<{ sql: string; params?: unknown[] }>) => {
+        for (const s of statements) db.query(s.sql).run(...((s.params ?? []) as never[]));
+        return { ok: true as const };
+      },
+      execute: async (sql: string) => {
+        db.exec(sql);
+        return { ok: true as const };
+      },
+    },
+  };
+}
+
+test("listWorkflows read model runs against the real schema and returns a recent example", async () => {
+  const artifacts = realHandle("artifacts_index");
+  const feed = realHandle("feed_index");
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xabc",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    feed: { sql: { db: () => feed.handle } },
+  } as unknown as FeedHostActorStorage;
+
+  artifacts.db.exec(`INSERT INTO workflow_package_state
+    (package_id, display_name, version, digest, manifest_key, workflow_ref, workflow_digest,
+     admission_state, disclosure_json, enabled_at, paused_at, updated_at)
+    VALUES ('feed-daily-brief', 'Daily Brief', '0.1.0', 'sha256:d', 'mk', 'ref', 'sha256:w',
+      'reviewed_first_party',
+      '{"userCopy":"c","credentialOwner":"none","providerClass":"none","egressClass":"none"}',
+      '2026-07-14T20:00:00.000Z', NULL, '2026-07-14T20:00:00.000Z')`);
+  feed.db.exec(`INSERT INTO feed_item_projection
+    (feed_item_id, target_kind, artifact_id, post_id, rank_score, disposition, visibility,
+     freshness_label, reason_codes_json, package_id, source_fingerprint, published_at, updated_at)
+    VALUES ('fi-1', 'post', 'art-1', 'post-1', 0.9, 'default', 'ranked', 'fresh', '[]',
+      'feed-daily-brief', 'sha256:src', '2026-07-14T21:00:00.000Z', '2026-07-14T21:00:00.000Z')`);
+
+  const storage = new FeedHostStorage();
+  const result = await storage.listWorkflows(actor, { actorId: "did:pkh:eip155:1:0xabc", limit: 50 });
+  const daily = result.items.find((item) => item.packageId === "feed-daily-brief");
+  expect(daily).toBeDefined();
+  expect(daily?.example?.artifactId).toBe("art-1");
+  expect(daily?.example?.publishedAt).toBe("2026-07-14T21:00:00.000Z");
+  artifacts.db.close();
+  feed.db.close();
+});
+
+test("generation_request insert matches its column list and runs against the real schema", () => {
+  const record = {
+    requestId: "req-1", readerNonce: "n-1", actorId: "did:pkh:eip155:1:0xabc", status: "accepted",
+    scope: { packageId: "feed-daily-brief" }, packageId: "feed-daily-brief", dedupeKey: null, prompt: "run it",
+    runId: null, workflowId: null, maxAttempts: 3, claimOwner: null, leaseExpiresAt: null, fencingToken: 0,
+    attemptCount: 0, nextRetryAt: null, cancellationRequested: false, phase: "queued", phaseStartedAt: null,
+    startedAt: null, completedAt: null, lastAttemptAt: null, sourceCursorBefore: null, sourceCursorAfter: null,
+    sourceRefs: [], publicationKey: null, artifactIds: [], publicationManifest: null, error: null,
+    timingEvents: [], expiresAt: "2026-07-15T00:00:00.000Z", createdAt: "2026-07-14T00:00:00.000Z",
+    updatedAt: "2026-07-14T00:00:00.000Z",
+  } as unknown as Parameters<typeof generationRequestSql>[0];
+  const statement = generationRequestSql(record);
+  const placeholders = (statement.sql.match(/\?/g) ?? []).length;
+  expect(placeholders).toBe(statement.params.length); // the 35-vs-33 regression
+
+  // And it actually executes against the migrated generation_request table.
+  const { db } = realHandle("feed_index");
+  db.query(statement.sql).run(...(statement.params as never[]));
+  expect(db.query("SELECT request_id FROM generation_request").get()).toEqual({ request_id: "req-1" });
   db.close();
 });
 
