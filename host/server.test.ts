@@ -515,12 +515,23 @@ describe("Feed Host server", () => {
     expect(status.status).toBe(200);
     expect(((await status.json()) as { setup: { state: string } }).setup.state).toBe("ready");
 
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const reconnect = await Promise.race([
+      postJson(`${runtime.url}/api/delegations`, {
+        actorId: ACTOR_ID,
+        serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+      }),
+      Bun.sleep(100).then(() => null),
+    ]);
+    expect(reconnect).not.toBeNull();
+    expect(reconnect?.status).toBe(200);
+
     storage.release();
     expect((await feed).status).toBe(200);
   });
 
-  test("serves the current feed when read-time reconciliation is temporarily unavailable", async () => {
-    const storage = new ReadTimeReconcileFailureStorage();
+  test("does not reconcile projections on reader endpoints", async () => {
+    const storage = new ReconcileCountingStorage();
     runtime = startFeedHost({
       port: 0,
       hostname: "127.0.0.1",
@@ -534,7 +545,7 @@ describe("Feed Host server", () => {
     expect(feed.status).toBe(200);
     const events = await fetch(`${runtime.url}/feed/events`, { headers: { "x-feed-actor-id": ACTOR_ID } });
     expect(events.status).toBe(200);
-    expect(storage.reconcileAttempts).toBe(2);
+    expect(storage.reconcileAttempts).toBe(0);
   });
 
   test("attaches, inspects, revokes, and removes a redacted named input authority", async () => {
@@ -1805,6 +1816,8 @@ class FakeFeedHostStorage {
     return this.artifactIndex.size > 0;
   }
 
+  async reconcileProjectionCompatibility(_actor: FeedHostActorStorage): Promise<void> {}
+
   async insertSeedRows(_actor: FeedHostActorStorage, _dbName: string, rows: SqlSeedRow[]): Promise<void> {
     for (const row of rows) this.applySeedRow(row);
   }
@@ -2451,12 +2464,11 @@ class BlockingFeedReadStorage extends FakeFeedHostStorage {
   }
 }
 
-class ReadTimeReconcileFailureStorage extends FakeFeedHostStorage {
+class ReconcileCountingStorage extends FakeFeedHostStorage {
   reconcileAttempts = 0;
 
   override async reconcileFeedProjection(actor: FeedHostActorStorage) {
     this.reconcileAttempts += 1;
-    if (this.reconcileAttempts > 1) throw new Error("planned read-time reconciliation failure");
     return super.reconcileFeedProjection(actor);
   }
 }

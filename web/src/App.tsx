@@ -42,7 +42,7 @@ type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
 type SetupStage = "identity" | "context" | "preparing";
 
-const FEED_EVENTS_RETRY_MS = 5000;
+const FEED_EVENTS_RETRY_MS = 15_000;
 const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
 
@@ -81,6 +81,7 @@ export function App() {
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef(false);
+  const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastRecoveryAt = useRef(0);
   const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
 
@@ -263,7 +264,7 @@ export function App() {
     if (!session || feedState !== "running") return;
     let cancelled = false;
     let timer: number | undefined;
-    let lastSignature = "";
+    let lastSignature: string | undefined;
 
     const pollFeedEvents = async () => {
       if (cancelled) return;
@@ -272,7 +273,12 @@ export function App() {
         if (cancelled) return;
         setEventsError(null);
         const signature = snapshot.text.trim();
-        if (signature !== lastSignature) {
+        if (lastSignature === undefined) {
+          // The first snapshot establishes the cursor. It is the same state
+          // loadFeed just rendered, so fetching it again only adds queue and
+          // TinyCloud connection-pool pressure during initial hydration.
+          lastSignature = signature;
+        } else if (signature !== lastSignature) {
           lastSignature = signature;
           await loadFeed();
         }
@@ -322,10 +328,14 @@ export function App() {
   };
 
   const hydrateArtifact = useCallback(async (projection: FeedItemProjection): Promise<void> => {
-    const hydrated = await artifactCache.hydrate({ projection, artifact: null });
-    setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
-      ? { ...item, artifact: hydrated.artifact, error: hydrated.error ? "This artifact is temporarily unavailable." : undefined }
-      : item));
+    const hydrate = artifactHydrationQueue.current.catch(() => undefined).then(async () => {
+      const hydrated = await artifactCache.hydrate({ projection, artifact: null });
+      setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+        ? { ...item, artifact: hydrated.artifact, error: hydrated.error ? "This artifact is temporarily unavailable." : undefined }
+        : item));
+    });
+    artifactHydrationQueue.current = hydrate.catch(() => undefined);
+    await hydrate;
   }, [artifactCache]);
 
   const sendFeedback = async (
@@ -726,6 +736,7 @@ function FeedCard({
   const [note, setNote] = useState("");
   const [noteAttemptKey, setNoteAttemptKey] = useState(() => crypto.randomUUID());
   const [interactionStatus, setInteractionStatus] = useState<string | null>(null);
+  const cardRef = useRef<HTMLElement>(null);
   const artifact = item.artifact;
   const post = projectedPost(item);
   const provenance = readableProvenance(item);
@@ -740,13 +751,24 @@ function FeedCard({
     await onExpand(item.projection);
     setArtifactLoading(false);
   };
+  useEffect(() => {
+    const element = cardRef.current;
+    if (!element || artifact || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      void loadArtifact();
+    }, { rootMargin: "300px 0px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [artifact, item.projection.feedItemId]);
   const act = async (signal: FeedbackEvent["signal"]) => {
     setInteractionStatus(null);
     const ok = await onFeedback(item.projection, signal);
     setInteractionStatus(ok ? feedbackSuccessLabel(signal) : "That change did not go through. Try again.");
   };
   return (
-    <article className="feed-card">
+    <article ref={cardRef} className="feed-card">
       <div className="card-meta">
         <span>{readablePostKind(item)}</span>
         <span>{readableFeedTime(item.projection.publishedAt)}</span>
@@ -755,7 +777,9 @@ function FeedCard({
       {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
       {isPost ? (
         <>
-          <p className="post-body">{item.projection.postBody ?? post?.body ?? "Open the artifact to read this post in context."}</p>
+          <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
+            ? "This post’s preview is temporarily unavailable."
+            : "Loading this post…")}</p>
           <details
             className="artifact-expansion"
             onToggle={(event) => event.currentTarget.open && void loadArtifact()}

@@ -130,6 +130,7 @@ type FeedHostContext = {
   requireActorSession: boolean;
   actorSessions: Map<string, { actorKey: string; expiresAt: string; policyHash: string }>;
   actorRequestQueues: Map<string, Promise<void>>;
+  actorSetupQueues: Map<string, Promise<void>>;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -223,6 +224,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         : null;
   const actors = new Map<string, ActorState>();
   const actorRequestQueues = new Map<string, Promise<void>>();
+  const actorArtifactQueues = new Map<string, Promise<void>>();
+  const actorSetupQueues = new Map<string, Promise<void>>();
   const inputAuthorities = new InputAuthorityRegistry();
   const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
   const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
@@ -264,6 +267,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       requireActorSession: options.requireActorSession !== false,
       actorSessions: new Map(),
       actorRequestQueues,
+      actorSetupQueues,
     };
     return context;
   };
@@ -345,7 +349,11 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
           : route(routedRequest, currentContext);
         const response = authenticatedActor && !isActorControlRoute(request.method, url.pathname)
-          ? await serializeActorRequest(actorRequestQueues, authenticatedActor, runRoute)
+          ? await serializeActorRequest(
+              isArtifactReadRoute(request.method, url.pathname) ? actorArtifactQueues : actorRequestQueues,
+              authenticatedActor,
+              runRoute,
+            )
           : await runRoute();
         return logRequest(response);
       } catch (error) {
@@ -481,7 +489,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
     }
 
-    return serializeActorRequest(context.actorRequestQueues, activated.actorId, async () => {
+    return serializeActorRequest(context.actorSetupQueues, activated.actorId, async () => {
       const actorKey = normalizeActorId(activated.actorId);
       const prior = actors.get(actorKey);
       const existing = prior && !isDelegationExpired(prior) ? prior : undefined;
@@ -697,14 +705,6 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
 
   if (request.method === "GET" && url.pathname === "/feed") {
     const actor = await requireCompleteActor(request, context);
-    try {
-      await storage.reconcileFeedProjection(actorStorage(actor));
-    } catch (error) {
-      logEvent("warn", "feed_reconcile_degraded", {
-        actor: actor.actorId,
-        ...errorLogFields(error),
-      });
-    }
     const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
@@ -1067,6 +1067,10 @@ function requiresActorSession(request: Request, url: URL): boolean {
 
 function isActorControlRoute(method: string, pathname: string): boolean {
   return pathname === "/api/delegations/status" || (method === "POST" && pathname === "/api/delegations/retry");
+}
+
+function isArtifactReadRoute(method: string, pathname: string): boolean {
+  return method === "GET" && pathname.startsWith("/artifacts/");
 }
 
 function authenticatedSessionActor(request: Request, context: FeedHostContext): string | undefined {
@@ -1433,9 +1437,9 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
         if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
           updateActorPreparation(actor, "seed");
           await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
+          updateActorPreparation(actor, "reconcile");
+          await retryTinyCloudTransaction("reconcile_compatibility", actor.actorId, () => storage.reconcileProjectionCompatibility(access));
         }
-        updateActorPreparation(actor, "reconcile");
-        await retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access));
         const completedAt = new Date().toISOString();
         actor.preparation = {
           ...actorPreparationSnapshot(actor),

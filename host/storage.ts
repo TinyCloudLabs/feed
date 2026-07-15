@@ -318,6 +318,7 @@ const GENERATION_REQUEST_COLUMNS = `request_id, reader_nonce, actor_id, status, 
 
 export class FeedHostStorage {
   private readonly bootstrapped = new WeakSet<object>();
+  private readonly projectionCache = new WeakMap<object, FeedProjectionState[]>();
   private readonly migrateLegacyDataHook: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
   private readonly maxPendingGenerationRequests: number;
 
@@ -346,6 +347,12 @@ export class FeedHostStorage {
     const migrationSummary = await this.migrateLegacyDataHook(actor);
     this.bootstrapped.add(actor);
     return migrationSummary;
+  }
+
+  async reconcileProjectionCompatibility(actor: FeedHostActorStorage): Promise<void> {
+    await execute(this.db(actor, "feed_index"), FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
+    await execute(this.db(actor, "feed_index"), FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
+    this.projectionCache.delete(actor);
   }
 
   async hasArtifacts(actor: FeedHostActorStorage): Promise<boolean> {
@@ -379,7 +386,7 @@ export class FeedHostStorage {
     if (!Number.isInteger(offset) || offset < 0) throw new Error("cursor must be a non-negative integer offset");
     const limit = Math.max(1, Math.min(input.limit, 100));
     const [projectionRows, feedbackRows, preferenceRows] = await Promise.all([
-      this.readProjectionStates(actor),
+      this.readCachedProjectionStates(actor),
       this.readFeedbackRows(actor),
       this.listPreferenceProfiles(actor),
     ]);
@@ -395,24 +402,11 @@ export class FeedHostStorage {
       preferences: mergeFeedPreferences(preferenceRows),
     });
     const page = ranked.slice(offset, offset + limit);
-    const artifacts = new Map<string, Promise<FeedArtifact | null>>();
-    const items = await Promise.all(page.map(async (row) => {
-      const artifactId = row.target.artifactId;
-      let artifactRequest = artifacts.get(artifactId);
-      if (!artifactRequest) {
-        artifactRequest = this.getArtifact(actor, artifactId).catch((error) => {
-          console.warn("Feed Host skipped unavailable artifact doc during feed listing", {
-            artifactId,
-            error: error instanceof Error ? error.message : String(error),
-          });
-          return null;
-        });
-        artifacts.set(artifactId, artifactRequest);
-      }
-      return stripProjectionState(row, await artifactRequest);
-    }));
     return {
-      items,
+      // Keep the ranked page request lightweight. Artifact documents are
+      // hydrated progressively by the client; fetching dozens of documents
+      // here can exhaust TinyCloud's connection pool and outlive the proxy.
+      items: page.map((row) => stripProjectionState(row)),
       nextCursor: ranked.length > offset + limit ? String(offset + limit) : undefined,
     };
   }
@@ -542,6 +536,10 @@ export class FeedHostStorage {
     await execute(this.db(actor, "feed_index"), FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
     const artifactRows = await this.readArtifactIndexRows(actor);
     const currentRows = await this.readProjectionStates(actor, artifactRows);
+    // Reconciliation can spend minutes validating remote artifact documents.
+    // Keep the last complete projection snapshot readable while that repair
+    // continues instead of making /feed repeat the same remote index scans.
+    this.projectionCache.set(actor, currentRows);
     const artifacts: FeedReconcileArtifact[] = [];
     for (const artifactRow of artifactRows) {
       const current = currentRows.find((row) => row.target.artifactId === artifactRow.artifact_id);
@@ -610,6 +608,7 @@ export class FeedHostStorage {
     if (!parity.readyToRetireLegacyReads) {
       console.warn("Feed Host projection parity gate remains closed", parity);
     }
+    this.projectionCache.set(actor, plan.desired);
     return plan;
   }
 
@@ -1407,7 +1406,7 @@ export class FeedHostStorage {
 
 
   async listFeedEvents(actor: FeedHostActorStorage, afterEventId?: string): Promise<string> {
-    const projections = await this.readProjectionStates(actor);
+    const projections = await this.readCachedProjectionStates(actor);
     return renderFeedEventStream(filterFeedEventsAfterId(buildFeedEvents({ projections }), afterEventId));
   }
 
@@ -1455,6 +1454,14 @@ export class FeedHostStorage {
       const artifactType = artifactTypes.get(row.artifact_id);
       return artifactType ? [projectionStateFromRow({ ...row, artifact_type: artifactType })] : [];
     });
+  }
+
+  private async readCachedProjectionStates(actor: FeedHostActorStorage): Promise<FeedProjectionState[]> {
+    const cached = this.projectionCache.get(actor);
+    if (cached) return cached;
+    const projections = await this.readProjectionStates(actor);
+    this.projectionCache.set(actor, projections);
+    return projections;
   }
 
   private async readArtifactIndexRows(actor: FeedHostActorStorage): Promise<ArtifactIndexRow[]> {
