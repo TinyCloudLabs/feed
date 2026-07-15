@@ -1,69 +1,77 @@
+/* "Folio" design language, ported from the distillery feed
+   (legacy-distillery DESIGN_MEMORY.md): editorial restraint, structure
+   from hairlines instead of boxes, serif carries meaning, mono carries
+   metadata, one signal-red accent. Dark is the canonical presentation
+   (exact Folio tokens); light is its warm-paper equivalent. */
 :root {
   color-scheme: light;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--sans);
   background: var(--bg);
   color: var(--ink);
   font-synthesis: none;
   line-height: 1.5;
-  --ink: #15171a;
-  --muted: #555e68;
-  --quiet: #5f6872;
-  --line: #d8dde2;
-  --soft-line: #e7eaed;
-  --surface: #ffffff;
-  --soft: #f0f2f4;
-  --focus: #2854d7;
+  --serif: "Iowan Old Style", "New York", "Palatino", Georgia, serif;
+  --sans: -apple-system, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+  --mono: "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --ink: #1c1b18;
+  --muted: #54524b;
+  --quiet: #6e6c64;
+  --line: rgba(28, 27, 24, 0.16);
+  --soft-line: rgba(28, 27, 24, 0.1);
+  --surface: #f7f5f0;
+  --soft: #efece5;
+  --accent: #c9382a;
+  --focus: #c9382a;
   --danger: #a32626;
-  --bg: #f5f6f7;
-  --hover: #f7f8f9;
-  --input-border: #bfc6cd;
-  --mid-border: #aeb6be;
-  --strong-border: #7d8791;
-  --primary: #2b2f34;
-  --on-primary: #ffffff;
+  --bg: #f7f5f0;
+  --hover: #f1eee7;
+  --input-border: rgba(28, 27, 24, 0.28);
+  --mid-border: rgba(28, 27, 24, 0.36);
+  --strong-border: rgba(28, 27, 24, 0.55);
+  --primary: #1c1b18;
+  --on-primary: #f7f5f0;
   --success: #246b46;
-  --text-1: #25292e;
-  --text-2: #3f4851;
-  --text-3: #343a41;
-  --danger-text: #7e2020;
-  --danger-border: #e4b8b8;
-  --danger-strong-border: #c98585;
-  --danger-soft: #fff7f7;
-  --warn-border: #e4c49f;
-  --warn-soft: #fffaf4;
+  --text-1: #26251f;
+  --text-2: #4c4a43;
+  --text-3: #3b3933;
+  --danger-text: #8c2b20;
+  --danger-border: rgba(163, 38, 38, 0.35);
+  --danger-strong-border: rgba(163, 38, 38, 0.55);
+  --danger-soft: rgba(163, 38, 38, 0.06);
+  --warn-border: rgba(150, 110, 40, 0.4);
+  --warn-soft: rgba(150, 110, 40, 0.08);
 }
 
-/* Dark theme: warm near-black with cream ink, following the feed dark
-   design pass. Only tokens change; component rules stay identical. */
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --ink: #ece7dd;
-    --muted: #a8a294;
-    --quiet: #9c968a;
-    --line: #2e2e33;
-    --soft-line: #242428;
-    --surface: #161618;
-    --soft: #1e1e21;
-    --focus: #8fadff;
+    --ink: #ebeae6;
+    --muted: #b4b3ad;
+    --quiet: #7e7d78;
+    --line: rgba(235, 234, 230, 0.14);
+    --soft-line: rgba(235, 234, 230, 0.09);
+    --surface: #0d0d0e;
+    --soft: #17171a;
+    --accent: #ff4f3d;
+    --focus: #ff4f3d;
     --danger: #e59a9a;
-    --bg: #0b0b0c;
-    --hover: #1b1b1e;
-    --input-border: #43434b;
-    --mid-border: #50505a;
-    --strong-border: #6e6e78;
-    --primary: #e8e2d5;
-    --on-primary: #16161a;
+    --bg: #0d0d0e;
+    --hover: #141416;
+    --input-border: rgba(235, 234, 230, 0.24);
+    --mid-border: rgba(235, 234, 230, 0.32);
+    --strong-border: rgba(235, 234, 230, 0.5);
+    --primary: #ebeae6;
+    --on-primary: #0d0d0e;
     --success: #79c79c;
-    --text-1: #ded9cd;
-    --text-2: #c9c3b6;
-    --text-3: #d3cdc0;
+    --text-1: #dedcd6;
+    --text-2: #b4b3ad;
+    --text-3: #c6c4be;
     --danger-text: #eda9a9;
-    --danger-border: #5c3434;
-    --danger-strong-border: #7a4646;
-    --danger-soft: #251617;
-    --warn-border: #6a5533;
-    --warn-soft: #211a0f;
+    --danger-border: rgba(229, 154, 154, 0.32);
+    --danger-strong-border: rgba(229, 154, 154, 0.5);
+    --danger-soft: rgba(229, 154, 154, 0.07);
+    --warn-border: rgba(212, 175, 110, 0.35);
+    --warn-soft: rgba(212, 175, 110, 0.08);
   }
 }
 
@@ -1044,4 +1052,190 @@ button:disabled {
     animation-iteration-count: 1 !important;
     transition-duration: .01ms !important;
   }
+}
+
+/* ===== Folio layer =====
+   Component-level port of the distillery feed's editorial language.
+   Serif carries meaning, mono carries metadata, sans carries the rest;
+   structure comes from hairlines, radius stays near zero, and the only
+   accent is signal red. Class names and copy are unchanged so behavior
+   and tests are untouched. */
+
+button,
+input,
+textarea,
+select {
+  border-radius: 2px;
+}
+
+button {
+  background: transparent;
+}
+
+button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.primary {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+
+.primary:hover:not(:disabled) {
+  border-color: var(--primary);
+  background: var(--primary);
+  opacity: .9;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Serif display for meaning-bearing headings. */
+.signin-copy h1,
+.setup-copy h1,
+.status-screen h1,
+.signin-header strong,
+.setup-header strong,
+.topbar-brand strong,
+.feed-card h2,
+.panel-copy h2,
+.artifact-label,
+.routine-summary strong {
+  font-family: var(--serif);
+}
+
+.feed-card h2 {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.16;
+  letter-spacing: -.012em;
+}
+
+.signin-copy h1,
+.setup-copy h1,
+.status-screen h1 {
+  font-weight: 600;
+  letter-spacing: -.015em;
+}
+
+/* Mono micro-labels for metadata: kickers, provenance, uppercase labels. */
+.card-meta,
+.status-label,
+.panel-kicker,
+.signin-access h2,
+.provenance dt,
+.advanced-details code,
+.card-foot,
+.routine-example {
+  font-family: var(--mono);
+}
+
+.card-meta {
+  gap: 10px;
+  align-items: baseline;
+  color: var(--quiet);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+}
+
+.card-meta span + span::before {
+  content: "·";
+  margin-right: 10px;
+}
+
+.status-label,
+.panel-kicker,
+.signin-access h2 {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.provenance dt {
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--quiet);
+}
+
+/* Expansion + provenance summaries: quiet mono affordances instead of
+   colored links; red is reserved for active/focus. */
+.artifact-expansion summary,
+.why-this summary,
+.advanced-details summary,
+.artifact-complete summary,
+.routine-details summary {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+.artifact-expansion summary:hover,
+.why-this summary:hover,
+.advanced-details summary:hover,
+.artifact-complete summary:hover,
+.routine-details summary:hover {
+  color: var(--ink);
+}
+
+.artifact-expansion[open] > summary,
+.why-this[open] > summary,
+.routine-details[open] > summary {
+  color: var(--accent);
+}
+
+/* The artifact summary reads as a serif lede, distillery's pull treatment. */
+.artifact-content .summary {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 17px;
+  line-height: 1.45;
+  color: var(--muted);
+  max-width: 58ch;
+}
+
+.artifact-content {
+  border-top: 1px solid var(--soft-line);
+}
+
+/* Feedback actions: bare, quiet, never buttony. */
+.card-actions button {
+  min-height: 44px;
+  border: none;
+  background: transparent;
+  color: var(--quiet);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: .04em;
+  padding: 10px 10px;
+}
+
+.card-actions button:hover:not(:disabled) {
+  background: transparent;
+  color: var(--ink);
+}
+
+.card-actions {
+  border-top: 1px solid var(--soft-line);
+  padding-top: 6px;
+}
+
+/* Body copy stays sans, slightly quieter than headings. */
+.post-body,
+.artifact-text {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-2);
 }
