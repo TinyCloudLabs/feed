@@ -1923,6 +1923,25 @@ describe("Feed Host workflow routines", () => {
     expect(bodyText).not.toContain("did:key");
   });
 
+  test("a node authorization denial surfaces as a recoverable 403, not a 500", async () => {
+    const storage = new UnauthorizedReadStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const sessionCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const response = await fetch(`${runtime.url}/artifacts/some-artifact`, {
+      headers: { "x-feed-actor-id": ACTOR_ID, cookie: sessionCookie },
+    });
+    expect(response.status).toBe(403);
+    const body = (await response.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("denied");
+  });
+
   test("pausing a routine through control intents is reflected in /workflows", async () => {
     const storage = new FakeFeedHostStorage();
     runtime = startFeedHost({
@@ -2801,6 +2820,14 @@ class TransientBootstrapStorage extends FakeFeedHostStorage {
       throw new Error("SQL batch failed: could not serialize access due to read/write dependencies among transactions");
     }
     return super.bootstrapSchema(actor);
+  }
+}
+
+class UnauthorizedReadStorage extends FakeFeedHostStorage {
+  override async readArtifact(): Promise<never> {
+    throw new Error(
+      "TinyCloud SQL query failed: SQL query failed: 401 - Unauthorized Action: tinycloud:pkh:eip155:1:0xabc:applications/sql/xyz.tinycloud.artifacts/index / tinycloud.sql/read",
+    );
   }
 }
 
