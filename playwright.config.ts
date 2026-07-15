@@ -23,6 +23,9 @@ export default defineConfig({
     trace: "off",
     screenshot: "off",
     ...devices["Desktop Chrome"],
+    // FEED_SMOKE_COLOR_SCHEME=dark runs the suite (incl. axe AA contrast
+    // checks) against the dark theme.
+    colorScheme: process.env.FEED_SMOKE_COLOR_SCHEME === "dark" ? "dark" : "light",
   },
   webServer: [
     {
