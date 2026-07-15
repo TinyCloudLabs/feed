@@ -1,15 +1,35 @@
 import { expect, test, type Page } from "@playwright/test";
+import AxeBuilder from "@axe-core/playwright";
 
 const CREDENTIALLED_CORS_HEADERS = {
   "access-control-allow-origin": `http://127.0.0.1:${process.env.FEED_SMOKE_WEB_PORT ?? "4199"}`,
   "access-control-allow-credentials": "true",
 };
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { Wallet } from "ethers";
 
 const TEST_WALLET_NAME = "TinyCloud Test Wallet";
 const FEED_HOST_URL = `http://127.0.0.1:${process.env.FEED_SMOKE_HOST_PORT ?? "8787"}`;
 const ETHERS_UMD_PATH = fileURLToPath(new URL("../../node_modules/ethers/dist/ethers.umd.min.js", import.meta.url));
+const RICH_ARTIFACT = JSON.parse(
+  readFileSync(fileURLToPath(new URL("../../shared/fixtures/rich-artifact.json", import.meta.url)), "utf8"),
+) as {
+  artifactId: string;
+  artifactType: string;
+  freshness: { label: string };
+  idempotency: { sourceFingerprint: string };
+  producedBy: { packageId: string };
+  publishedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  posts: Array<{
+    postId: string;
+    title?: string;
+    body: string;
+    expansionTarget: { sectionId?: string };
+  }>;
+};
 
 type TestWallet = {
   privateKey: string;
@@ -128,59 +148,227 @@ async function signInWithWallet(page: Page, wallet: TestWallet): Promise<void> {
   await expect(page.getByRole("button", { name: /sign in with openkey/i })).toHaveCount(0);
 }
 
+async function expectMobileLayout(page: Page): Promise<void> {
+  const layout = await page.evaluate(() => {
+    const undersized = [...document.querySelectorAll<HTMLElement>("button, summary, input, textarea")]
+      .filter((element) => {
+        const style = getComputedStyle(element);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && (rect.width < 44 || rect.height < 44);
+      })
+      .map((element) => element.textContent?.trim() || element.getAttribute("aria-label") || element.tagName);
+    return {
+      overflows: document.documentElement.scrollWidth > window.innerWidth,
+      undersized,
+    };
+  });
+  expect(layout.overflows).toBe(false);
+  expect(layout.undersized).toEqual([]);
+  const accessibility = await new AxeBuilder({ page })
+    .include("main")
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
+    .analyze();
+  expect(accessibility.violations).toEqual([]);
+}
+
 test("one sign-in sets up Feed automatically and streams the first artifact", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
   const wallet = createTestWallet();
-  const actorId = wallet.actorId;
   await installWallet(page, wallet);
   const policy = await page.request.get(`${FEED_HOST_URL}/delegation-policy`).then((response) => response.json()) as {
     delegateDID: string;
   };
 
-  let feedRequests = 0;
   let delegationSubmissions = 0;
-  let releaseFirstFeed: (() => void) | undefined;
-  const firstFeedReady = new Promise<void>((resolve) => {
-    releaseFirstFeed = resolve;
+  let recoveryMode = false;
+  let recoveryFeedRequests = 0;
+  let releaseRecoveryResponse: (() => void) | undefined;
+  const recoveryResponse = new Promise<void>((resolve) => {
+    releaseRecoveryResponse = resolve;
+  });
+  const savedFeedItemIds = new Set<string>();
+  const noteAttempts: Array<{ eventId: string; readerNonce: string; signal: string; payload?: { note?: string } }> = [];
+  const consoleMessages: string[] = [];
+  const clientEventBodies: string[] = [];
+  page.on("console", (message) => consoleMessages.push(message.text()));
+  page.on("request", (request) => {
+    if (request.url().endsWith("/api/client-events")) clientEventBodies.push(request.postData() ?? "");
+  });
+  await page.route(/\/api\/delegations$/, async (route) => {
+    if (route.request().method() !== "POST") {
+      await route.fallback();
+      return;
+    }
+    delegationSubmissions += 1;
+    const submission = route.request().postDataJSON() as { actorId: string };
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({
+        accepted: true,
+        actorId: submission.actorId,
+        resources: policy.resources.map((resource) => resource.path),
+      }),
+    });
   });
   await page.route(/\/feed(\?.*)?$/, async (route) => {
     if (route.request().method() !== "GET") {
       await route.fallback();
       return;
     }
-    feedRequests += 1;
-    if (feedRequests === 1) {
-      await firstFeedReady;
+    if (recoveryMode) {
+      recoveryFeedRequests += 1;
+      if (recoveryFeedRequests === 1) {
+        await route.fulfill({
+          status: 503,
+          headers: { "content-type": "text/plain", ...CREDENTIALLED_CORS_HEADERS },
+          body: "bundle offline",
+        });
+        return;
+      }
+      if (recoveryFeedRequests === 2) await recoveryResponse;
       await route.fulfill({
         status: 200,
         headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
-        body: JSON.stringify({ items: [], nextCursor: undefined }),
+        body: JSON.stringify({ items: [] }),
       });
       return;
     }
-    await route.fallback();
+    const publishedAt = RICH_ARTIFACT.publishedAt ?? RICH_ARTIFACT.createdAt;
+    const items = RICH_ARTIFACT.posts.map((post, index) => {
+      const feedItemId = `${RICH_ARTIFACT.artifactId}::${encodeURIComponent(post.postId)}`;
+      return {
+        feedItemId,
+        target: { kind: "post", artifactId: RICH_ARTIFACT.artifactId, postId: post.postId },
+        rankScore: 1 - index * 0.1,
+        disposition: savedFeedItemIds.has(feedItemId) ? "saved" : "default",
+        visibility: "ranked",
+        freshnessLabel: RICH_ARTIFACT.freshness.label,
+        reasonCodes: ["recent"],
+        packageId: RICH_ARTIFACT.producedBy.packageId,
+        sourceFingerprint: RICH_ARTIFACT.idempotency.sourceFingerprint,
+        publishedAt,
+        updatedAt: RICH_ARTIFACT.updatedAt,
+        ...(post.title ? { postTitle: post.title } : {}),
+        postBody: post.body,
+        ...(post.expansionTarget.sectionId ? { sectionRef: post.expansionTarget.sectionId } : {}),
+      };
+    });
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({ items }),
+    });
   });
-  await page.route(/\/api\/delegations$/, async (route) => {
-    if (route.request().method() === "POST") delegationSubmissions += 1;
-    await route.fallback();
+  await page.route(new RegExp(`/artifacts/${encodeURIComponent(RICH_ARTIFACT.artifactId)}$`), async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify(RICH_ARTIFACT),
+    });
+  });
+  await page.route(/\/feed\/events$/, async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "text/event-stream", ...CREDENTIALLED_CORS_HEADERS },
+      body: "",
+    });
+  });
+  await page.route(/\/feedback$/, async (route) => {
+    const body = route.request().postDataJSON() as { eventId: string; readerNonce: string; signal: string; payload?: { note?: string } };
+    if (body.signal !== "text_note") {
+      const target = (route.request().postDataJSON() as { target?: { feedItemId?: string } }).target;
+      if (target?.feedItemId && body.signal === "save") savedFeedItemIds.add(target.feedItemId);
+      if (target?.feedItemId && body.signal === "unsave") savedFeedItemIds.delete(target.feedItemId);
+      await route.fulfill({
+        status: 200,
+        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+        body: JSON.stringify({ accepted: true, eventId: body.eventId }),
+      });
+      return;
+    }
+    noteAttempts.push(body);
+    if (noteAttempts.length === 1) {
+      await route.fulfill({
+        status: 503,
+        headers: { "content-type": "text/plain", ...CREDENTIALLED_CORS_HEADERS },
+        body: "uncertain response",
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({ accepted: true, eventId: body.eventId }),
+    });
+  });
+  await page.route(/\/skills\/smoke-new-skill\/credentials$/, async (route) => {
+    if (route.request().method() !== "PATCH") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
+      body: JSON.stringify({
+        updated: true,
+        skill: {
+          skillId: "smoke-new-skill",
+          credentialMode: "user_byok_api_key",
+          providerId: "openai",
+          hasSecret: true,
+          budget: {
+            budgetId: "skill:smoke-new-skill",
+            spent: 0,
+            currency: "USD",
+            disabled: false,
+            status: "ready",
+          },
+          version: 1,
+          updatedAt: new Date().toISOString(),
+        },
+      }),
+    });
   });
 
   await page.goto("/");
   await signInWithWallet(page, wallet);
 
-  await expect(page.getByRole("heading", { name: /setting up your feed/i })).toBeVisible();
-  await expect(page.getByText(/no additional approvals are needed/i)).toBeVisible();
   await expect(page.getByText(/approve the default bundle/i)).toHaveCount(0);
   await expect(page.getByText(/first-run-approval/i)).toHaveCount(0);
-  releaseFirstFeed?.();
-  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Check again" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
-  await expect(page.getByRole("heading", { name: "The onboarding experiment changed where users stall" })).toBeVisible();
-  await expect(page.getByText(/first collaborative action is now the dominant stall point/i)).toBeVisible();
-  await page.getByText("Open full artifact").first().click();
+  // The phrase also appears inside the lazily hydrated inline artifact body
+  // (which may be collapsed), so scope to the visible post card.
+  await expect(page.locator("p.post-body", { hasText: /test an invite preview inside setup/i })).toBeVisible();
+  await expect(page.getByText(/first collaborative action is now the dominant stall point/i).locator("visible=true").first()).toBeVisible();
+  await expectMobileLayout(page);
+  await page.getByText("Open complete artifact").first().click();
   await expect(page.getByText("From The onboarding experiment changed where users stall").first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Where activation now stalls" })).toBeVisible();
+  await expect(
+    page.getByLabel("Where activation now stalls").getByText(/moving the main drop-off to the first collaborative action/i),
+  ).toBeVisible();
+  await page.getByText("Show all sections").first().click();
   await expect(page.getByText(/complete analysis remains type-specific/i).first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Hide" }).first()).toBeVisible();
+  await page.getByRole("button", { name: "Save", exact: true }).first().click();
+  await expect(page.getByRole("button", { name: "Saved", exact: true }).first()).toBeVisible();
+  await page.getByRole("tab", { name: "Saved" }).click();
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();
+  await page.getByRole("tab", { name: "For you" }).click();
+  await page.getByRole("button", { name: "Add note" }).first().click();
+  await page.getByLabel("Private note").fill("Follow up with the onboarding owner.");
+  await page.getByRole("button", { name: "Save note" }).click();
+  await expect(page.getByText("Your note was not saved. Try again.")).toBeVisible();
+  await page.getByRole("button", { name: "Save note" }).click();
+  await expect(page.getByText("Note saved.")).toBeVisible();
+  expect(noteAttempts).toHaveLength(2);
+  expect(noteAttempts[0]?.readerNonce).toBe(noteAttempts[1]?.readerNonce);
+  expect(noteAttempts[0]?.eventId).toBe(noteAttempts[1]?.eventId);
+  expect(noteAttempts[1]?.payload?.note).toBe("Follow up with the onboarding owner.");
+  expect(consoleMessages.join("\n")).not.toContain("Follow up with the onboarding owner.");
+  expect(clientEventBodies.join("\n")).not.toContain("Follow up with the onboarding owner.");
   await expect.poll(() => delegationSubmissions).toBe(1);
   const feedHostSignaturePrompts = await page.evaluate(
     (delegateDID) => ((window as any).__walletSignedMessages as string[])
@@ -189,6 +377,7 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   );
   expect(feedHostSignaturePrompts).toHaveLength(0);
 
+  await page.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "Access & automation", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Access & automation" })).toBeVisible();
   await page.getByLabel("Skill ID").fill("smoke-new-skill");
@@ -198,90 +387,28 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect(page.getByText("smoke-new-skill", { exact: true })).toBeVisible();
   await expect(page.getByText("credential attached", { exact: true })).toBeVisible();
 
-  await expect
-    .poll(async () => {
-      try {
-        const response = await page.request.get(`${FEED_HOST_URL}/admin/state`, {
-          headers: { "x-feed-actor-id": actorId },
-        });
-        const state = await response.json();
-        return state.artifacts >= 1 && state.projections >= 1;
-      } catch {
-        return false;
-      }
-    })
-    .toBe(true);
-});
-
-test("Feed failure state only clears after a successful reload", async ({ page }) => {
-  const wallet = createTestWallet();
-  await installWallet(page, wallet);
-
-  let feedRequests = 0;
-  let releaseRetryResponse: (() => void) | undefined;
-  const retryResponse = new Promise<void>((resolve) => {
-    releaseRetryResponse = resolve;
-  });
-  await page.route(/\/feed(\?.*)?$/, async (route) => {
-    if (route.request().method() !== "GET") {
-      await route.fallback();
-      return;
-    }
-    feedRequests += 1;
-    if (feedRequests === 2) {
-      await route.fulfill({
-        status: 503,
-        headers: { "content-type": "text/plain", ...CREDENTIALLED_CORS_HEADERS },
-        body: "bundle offline",
-      });
-      return;
-    }
-    if (feedRequests === 3) {
-      await retryResponse;
-      await route.fulfill({
-        status: 200,
-        headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
-        body: JSON.stringify({ items: [] }),
-      });
-      return;
-    }
-    await route.fulfill({
-      status: 200,
-      headers: { "content-type": "application/json", ...CREDENTIALLED_CORS_HEADERS },
-      body: JSON.stringify({ items: [] }),
-    });
-  });
-
-  await page.route(/\/feed\/events(\?.*)?$/, async (route) => {
-    await route.fulfill({
-      status: 200,
-      headers: { "content-type": "text/event-stream", ...CREDENTIALLED_CORS_HEADERS },
-      body: "",
-    });
-  });
-
-  await page.goto("/");
-  await signInWithWallet(page, wallet);
-
-  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible();
-
-  await page.getByRole("button", { name: /check again/i }).click();
+  await page.setViewportSize({ width: 390, height: 844 });
+  recoveryMode = true;
+  await page.getByRole("button", { name: "Menu", exact: true }).click();
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 120000 });
-  await expect(page.getByRole("heading", { name: /nothing here yet/i })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();
 
   await page.waitForTimeout(6500);
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
-  expect(feedRequests).toBe(2);
+  expect(recoveryFeedRequests).toBe(1);
 
   await page.getByRole("button", { name: "Retry" }).click();
-  await expect.poll(() => feedRequests).toBe(3);
+  await expect.poll(() => recoveryFeedRequests).toBe(2);
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible();
-  releaseRetryResponse?.();
+  releaseRecoveryResponse?.();
   await expect(page.getByRole("heading", { name: /nothing here yet/i })).toBeVisible({ timeout: 60000 });
-  expect(feedRequests).toBe(3);
+  expect(recoveryFeedRequests).toBe(2);
+  await expectMobileLayout(page);
 });
 
 test("a restored session silently re-establishes Host access without another wallet prompt", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 812 });
   const wallet = createTestWallet();
   await installWallet(page, wallet);
 

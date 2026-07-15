@@ -1,4 +1,5 @@
 import type { DelegatedAccess, TinyCloudNode } from "@tinycloud/node-sdk";
+import { createHash, timingSafeEqual } from "node:crypto";
 import type {
   ControlIntentEvent,
   FeedArtifact,
@@ -64,6 +65,7 @@ export type FeedHostServerOptions = {
   port: number;
   hostname: string;
   token?: string;
+  workerToken?: string;
   tinycloudHost?: string;
   hostPrivateKey?: string;
   seedOnStart?: boolean;
@@ -94,7 +96,21 @@ type ActorState = AcceptedFeedDelegation & {
   accessByResource: Map<string, DelegatedAccess>;
   storageAccess?: FeedHostActorStorage;
   ready?: Promise<void>;
+  preparation?: ActorPreparationStatus;
+  traceId?: string;
   expiresAt: string;
+};
+
+type ActorPreparationPhase = "idle" | "bootstrap" | "artifact_check" | "seed" | "reconcile" | "ready" | "failed";
+
+type ActorPreparationStatus = {
+  state: "not_started" | "preparing" | "ready" | "failed";
+  phase: ActorPreparationPhase;
+  attempt: number;
+  startedAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  error?: { code: "preparation_failed"; message: string };
 };
 
 type FeedHostContext = {
@@ -114,6 +130,8 @@ type FeedHostContext = {
   inputAuthorityExpectedHost: string;
   requireActorSession: boolean;
   actorSessions: Map<string, { actorKey: string; expiresAt: string; policyHash: string }>;
+  actorRequestQueues: Map<string, Promise<void>>;
+  actorSetupQueues: Map<string, Promise<void>>;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -126,7 +144,7 @@ const PUBLIC_PATHS = new Set([
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, If-None-Match, Last-Event-ID",
+  "access-control-allow-headers": "Content-Type, Authorization, X-Feed-Actor-Id, X-Feed-Trace-Id, If-None-Match, Last-Event-ID",
 };
 
 const JSON_HEADERS = {
@@ -137,6 +155,9 @@ const JSON_HEADERS = {
 const FEEDBACK_NOTE_MAX_CHARS = 1024;
 const TINYCLOUD_TRANSACTION_RETRY_DELAYS_MS = [250, 750, 1500, 3000, 6000];
 const MAX_ACTOR_SESSIONS = 5;
+const MIN_WORKER_TOKEN_BYTES = 32;
+const DEFAULT_WORKER_LEASE_SECONDS = 120;
+const DEFAULT_WORKER_MAX_ATTEMPTS = 3;
 
 const SSE_HEADERS = {
   ...CORS_HEADERS,
@@ -204,6 +225,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         : null;
   const actors = new Map<string, ActorState>();
   const actorRequestQueues = new Map<string, Promise<void>>();
+  const actorArtifactQueues = new Map<string, Promise<void>>();
+  const actorSetupQueues = new Map<string, Promise<void>>();
   const inputAuthorities = new InputAuthorityRegistry();
   const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
   const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
@@ -244,6 +267,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       inputAuthorityExpectedHost: options.inputAuthorityExpectedHost ?? options.tinycloudHost ?? "https://node.tinycloud.xyz",
       requireActorSession: options.requireActorSession !== false,
       actorSessions: new Map(),
+      actorRequestQueues,
+      actorSetupQueues,
     };
     return context;
   };
@@ -256,24 +281,39 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     maxRequestBodySize: 1024 * 1024,
     async fetch(request) {
       const url = new URL(request.url);
+      const workerRoute = isWorkerRoute(url.pathname);
       const privateRoute = requiresActorSession(request, url);
-      const noStoreRoute = privateRoute || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
-      const finish = (response: Response) => applyResponsePolicy(
-        response,
-        request,
-        options.allowedOrigins,
-        noStoreRoute,
-        options.requireActorSession !== false,
-      );
-      if (!isAllowedOrigin(request, options.allowedOrigins, options.requireActorSession !== false)) {
+      const noStoreRoute = workerRoute || privateRoute || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
+      const finish = (response: Response) => {
+        const finished = applyResponsePolicy(
+          response,
+          request,
+          options.allowedOrigins,
+          noStoreRoute,
+          options.requireActorSession !== false,
+        );
+        if (!workerRoute) return finished;
+        const headers = new Headers(finished.headers);
+        for (const name of [...headers.keys()]) {
+          if (name.startsWith("access-control-")) headers.delete(name);
+        }
+        return new Response(finished.body, { status: finished.status, statusText: finished.statusText, headers });
+      };
+      if (workerRoute && request.headers.has("origin")) {
+        return finish(jsonError(403, "origin_denied", "worker API does not accept browser requests"));
+      }
+      if (!workerRoute && !isAllowedOrigin(request, options.allowedOrigins, options.requireActorSession !== false)) {
         return finish(jsonError(403, "origin_denied", "browser origin is not allowed"));
       }
-      if (request.method === "OPTIONS") {
+      if (!workerRoute && request.method === "OPTIONS") {
         return finish(new Response(null, { status: 204, headers: CORS_HEADERS }));
       }
 
       const startedAt = performance.now();
+      const traceId = requestTraceId(request);
       let authenticatedActor: string | undefined;
+      let queueWaitMs = 0;
+      let routeStartedAt = startedAt;
       const logRequest = (response: Response, errorCode?: string, error?: unknown) => {
         const finished = finish(response);
         if (request.method === "GET" && PUBLIC_PATHS.has(url.pathname)) return finished;
@@ -282,7 +322,10 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           path: url.pathname,
           status: response.status,
           ms: Math.round(performance.now() - startedAt),
+          queueWaitMs: Math.round(queueWaitMs),
+          routeMs: Math.round(performance.now() - routeStartedAt),
           actor: authenticatedActor,
+          ...(traceId ? { traceId } : {}),
           ...(errorCode ? { code: errorCode } : {}),
           ...(error ? errorLogFields(error) : {}),
         });
@@ -290,7 +333,10 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       };
 
       const publicRoute = PUBLIC_PATHS.has(url.pathname);
-      if (!publicRoute && !authorized(request, options.token)) {
+      if (workerRoute && !workerAuthorized(request, options.workerToken)) {
+        return logRequest(jsonError(401, "unauthorized", "missing or invalid worker bearer token"), "unauthorized");
+      }
+      if (!workerRoute && !publicRoute && !authorized(request, options.token)) {
         return logRequest(jsonError(401, "unauthorized", "missing or invalid bearer token"), "unauthorized");
       }
 
@@ -304,11 +350,23 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           }
           routedRequest = bindAuthenticatedActor(request, authenticatedActor);
         }
-        const runRoute = () => request.method === "GET" && authenticatedActor
-          ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
-          : route(routedRequest, currentContext);
-        const response = authenticatedActor
-          ? await serializeActorRequest(actorRequestQueues, authenticatedActor, runRoute)
+        let queuedAt: number | undefined;
+        const runRoute = () => {
+          routeStartedAt = performance.now();
+          queueWaitMs = queuedAt === undefined ? 0 : routeStartedAt - queuedAt;
+          return workerRoute
+            ? routeWorker(request, currentContext, actorRequestQueues)
+            : request.method === "GET" && authenticatedActor
+            ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
+            : route(routedRequest, currentContext);
+        };
+        if (authenticatedActor && !isActorControlRoute(request.method, url.pathname)) queuedAt = performance.now();
+        const response = authenticatedActor && !isActorControlRoute(request.method, url.pathname)
+          ? await serializeActorRequest(
+              isArtifactReadRoute(request.method, url.pathname) ? actorArtifactQueues : actorRequestQueues,
+              authenticatedActor,
+              runRoute,
+            )
           : await runRoute();
         return logRequest(response);
       } catch (error) {
@@ -388,6 +446,21 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     return json(await readDelegationStatus(context, actorId));
   }
 
+  if (request.method === "POST" && url.pathname === "/api/delegations/retry") {
+    const actorId = requireRequestActorId(request);
+    const actor = await requireDelegation(context, actorId);
+    if (actor.preparation?.state === "failed") actor.ready = undefined;
+    void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
+    const setup = actorPreparationSnapshot(actor);
+    logEvent("info", "feed_preparation_retry_requested", {
+      actor: actor.actorId,
+      attempt: setup.attempt,
+      phase: setup.phase,
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+    });
+    return json({ accepted: true, actorId: actor.actorId, setup }, setup.state === "ready" ? 200 : 202);
+  }
+
   if (request.method === "DELETE" && url.pathname === "/api/delegations") {
     const actorId = requireRequestActorId(request);
     await removeDelegation(context, actorId);
@@ -401,6 +474,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const body = await readJsonObject(request, "invalid_delegation", "delegation body must be JSON");
     const serializedDelegation = readString(body, "serializedDelegation", "invalid_delegation", "serializedDelegation is required");
     const payloadActorId = optionalString(body.actorId);
+    const activationStartedAt = performance.now();
     const activated = await retryTinyCloudTransaction(
       "delegation_activate",
       undefined,
@@ -420,61 +494,91 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       }
       throw error;
     });
+    logEvent("info", "feed_delegation_activated", {
+      actor: activated.actorId,
+      ms: Math.round(performance.now() - activationStartedAt),
+      resources: activated.resources.length,
+      ...(requestTraceId(request) ? { traceId: requestTraceId(request) } : {}),
+    });
     if (payloadActorId && !actorIdsMatch(payloadActorId, activated.actorId)) {
       throw new FeedHostError("actorId does not match the delegation owner identity", 403, "actor_mismatch");
     }
 
-    const actorKey = normalizeActorId(activated.actorId);
-    const prior = actors.get(actorKey);
-    const existing = prior && !isDelegationExpired(prior) ? prior : undefined;
-    const currentProofComplete = policy.resources.every((resource) => activated.resources.includes(resource.path));
-    const resources = currentProofComplete
-      ? [...activated.resources]
-      : [...new Set([...(existing?.resources ?? []), ...activated.resources])];
-    const accessByResource = new Map(currentProofComplete ? undefined : existing?.accessByResource);
-    for (const resource of activated.resources) accessByResource.set(resource, activated.access);
-    const state: ActorState = {
-      actorId: activated.actorId,
-      acceptedAt: activated.acceptedAt,
-      expiresAt: currentProofComplete ? activated.expiresAt : earliestExpiry(existing?.expiresAt, activated.expiresAt),
-      resources,
-      accessByResource,
-      storageAccess: currentProofComplete ? undefined : existing?.storageAccess,
-      ready: currentProofComplete ? undefined : existing?.ready,
-    };
-    if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, state);
-    if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
-      await retryTinyCloudTransaction(
-        "delegation_persist",
-        activated.actorId,
-        () => persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
-          serializedDelegation,
+    return serializeActorRequest(context.actorSetupQueues, activated.actorId, async () => {
+      const actorKey = normalizeActorId(activated.actorId);
+      const prior = actors.get(actorKey);
+      const existing = prior && !isDelegationExpired(prior) ? prior : undefined;
+      const currentProofComplete = policy.resources.every((resource) => activated.resources.includes(resource.path));
+      const resources = currentProofComplete
+        ? [...activated.resources]
+        : [...new Set([...(existing?.resources ?? []), ...activated.resources])];
+      const accessByResource = new Map(currentProofComplete ? undefined : existing?.accessByResource);
+      for (const resource of activated.resources) accessByResource.set(resource, activated.access);
+      const state: ActorState = {
+        actorId: activated.actorId,
+        acceptedAt: activated.acceptedAt,
+        expiresAt: currentProofComplete ? activated.expiresAt : earliestExpiry(existing?.expiresAt, activated.expiresAt),
+        resources,
+        accessByResource,
+        storageAccess: currentProofComplete ? undefined : existing?.storageAccess,
+        ready: currentProofComplete ? undefined : existing?.ready,
+        preparation: currentProofComplete ? undefined : existing?.preparation,
+        traceId: requestTraceId(request) ?? existing?.traceId,
+      };
+      const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
+        ? existing
+        : state;
+      if (requestTraceId(request)) actor.traceId = requestTraceId(request);
+      if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, actor);
+      if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
+        const persistenceStartedAt = performance.now();
+        void retryTinyCloudTransaction(
+          "delegation_persist",
+          activated.actorId,
+          () => persistAcceptedDelegation(delegationStore, policy, policyHash, actorKey, {
+            serializedDelegation,
+            resources: activated.resources,
+            acceptedAt: activated.acceptedAt,
+            expiresAt: activated.expiresAt,
+          }),
+        ).then(() => {
+          logEvent("info", "feed_delegation_persisted", {
+            actor: activated.actorId,
+            ms: Math.round(performance.now() - persistenceStartedAt),
+            ...(actor.traceId ? { traceId: actor.traceId } : {}),
+          });
+        }).catch((error) => {
+          logEvent("warn", "feed_delegation_persist_failed", {
+            actor: activated.actorId,
+            ms: Math.round(performance.now() - persistenceStartedAt),
+            ...(actor.traceId ? { traceId: actor.traceId } : {}),
+            ...errorLogFields(error),
+          });
+        });
+      }
+      if (!currentProofComplete) {
+        return json({
+          accepted: true,
+          actorId: activated.actorId,
           resources: activated.resources,
-          acceptedAt: activated.acceptedAt,
-          expiresAt: activated.expiresAt,
-        }),
-      );
-    }
-    if (!currentProofComplete) {
+          policyHash,
+          status: "activation_pending",
+        }, 202);
+      }
+      void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
+      const setup = actorPreparationSnapshot(actor);
+      const sessionToken = issueActorSession(context, actorKey, actor.expiresAt);
       return json({
         accepted: true,
         actorId: activated.actorId,
-        resources: activated.resources,
+        resources: actor.resources,
         policyHash,
-        status: "activation_pending",
-      }, 202);
-    }
-    await ensureActorReady(storage, state, seedOnStart);
-    const sessionToken = issueActorSession(context, actorKey, state.expiresAt);
-    return json({
-      accepted: true,
-      actorId: activated.actorId,
-      resources,
-      policyHash,
-      status: "active",
-    }, 200, {
-      "set-cookie": actorSessionCookie(sessionToken, request, state.expiresAt),
-      "cache-control": "private, no-store",
+        status: setup.state === "ready" ? "active" : "preparing",
+        setup,
+      }, setup.state === "ready" ? 200 : 202, {
+        "set-cookie": actorSessionCookie(sessionToken, request, actor.expiresAt),
+        "cache-control": "private, no-store",
+      });
     });
   }
 
@@ -532,6 +636,11 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       const level = record.level === "error" || record.level === "warn" ? record.level : "info";
       logEvent(level, `client_${eventName.slice(0, 64)}`, {
         source: "web",
+        ...(optionalString(record.traceId) ? { traceId: optionalString(record.traceId)!.slice(0, 100) } : {}),
+        ...(optionalString(record.phase) ? { phase: optionalString(record.phase)!.slice(0, 64) } : {}),
+        ...(optionalNumber(record.durationMs) === undefined ? {} : { durationMs: optionalNumber(record.durationMs) }),
+        ...(optionalNumber(record.elapsedMs) === undefined ? {} : { elapsedMs: optionalNumber(record.elapsedMs) }),
+        ...(optionalNumber(record.activeElapsedMs) === undefined ? {} : { activeElapsedMs: optionalNumber(record.activeElapsedMs) }),
         ...(optionalString(record.detail) ? { detail: optionalString(record.detail)!.slice(0, 500) } : {}),
       });
       accepted += 1;
@@ -619,26 +728,37 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   }
 
   if (request.method === "GET" && url.pathname === "/feed") {
-    const actor = await requireCompleteActor(request, context);
-    await storage.reconcileFeedProjection(actorStorage(actor));
+    const actor = await requireDelegatedActor(request, context);
     const limit = parseLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? undefined;
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
       throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
     }
-    return json(await storage.listFeed(actorStorage(actor), { limit, cursor }));
+    // A fresh space has no schema yet, so the lightweight read can fail with
+    // "no such table" before it can return an empty page — treat that the
+    // same as an empty first read and run preparation before retrying.
+    let page: Awaited<ReturnType<typeof storage.listFeed>> | undefined;
+    try {
+      page = await storage.listFeed(actorStorage(actor), { limit, cursor });
+    } catch (error) {
+      if (!isMissingSchemaError(error) || actor.preparation?.state === "ready") throw error;
+    }
+    if ((!page || page.items.length === 0) && seedOnStart && actor.preparation?.state !== "ready") {
+      await ensureActorReady(storage, actor, seedOnStart);
+      return json(await storage.listFeed(actorStorage(actor), { limit, cursor }));
+    }
+    return json(page ?? (await storage.listFeed(actorStorage(actor), { limit, cursor })));
   }
 
   if (request.method === "GET" && url.pathname === "/feed/events") {
     const actor = await requireCompleteActor(request, context);
-    await storage.reconcileFeedProjection(actorStorage(actor));
     const body = await storage.listFeedEvents(actorStorage(actor), optionalString(request.headers.get("last-event-id")));
     return new Response(body, { status: 200, headers: SSE_HEADERS });
   }
 
   const artifactMatch = url.pathname.match(/^\/artifacts\/([^/]+)(\/provenance)?$/);
   if (request.method === "GET" && artifactMatch) {
-    const actor = await requireCompleteActor(request, context);
+    const actor = await requireDelegatedActor(request, context);
     const artifactId = decodeURIComponent(artifactMatch[1]);
     const result = await storage.readArtifact(actorStorage(actor), artifactId);
     if (result.kind === "not_found") {
@@ -697,6 +817,23 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const limit = parseLimit(url.searchParams.get("limit"));
     const items = await storage.listGenerationRequests(actorStorage(actor), limit);
     return json({ items: items.map(normalizeGenerationRequestRecord) });
+  }
+
+  const generationCancelMatch = url.pathname.match(/^\/generation-requests\/([^/]+)\/cancel$/);
+  if (request.method === "POST" && generationCancelMatch) {
+    const actor = await requireCompleteActor(request, context);
+    const requestId = decodeURIComponent(generationCancelMatch[1]);
+    const record = await storage.requestGenerationCancellation(actorStorage(actor), {
+      requestId,
+      now: new Date().toISOString(),
+    });
+    logEvent("info", "generation_request_cancellation", {
+      requestId,
+      status: record.status,
+      phase: record.phase,
+      actor: actor.actorId,
+    });
+    return json({ cancellationRequested: record.cancellationRequested, request: record });
   }
 
   if (request.method === "GET" && url.pathname === "/control-intents") {
@@ -781,9 +918,147 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
   return json({ error: { code: "not_found", message: `${request.method} ${url.pathname}` } }, 404);
 }
 
+async function routeWorker(
+  request: Request,
+  context: FeedHostContext,
+  actorRequestQueues: Map<string, Promise<void>>,
+): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method !== "POST") {
+    throw new FeedHostError("worker control endpoints require POST", 405, "method_not_allowed");
+  }
+  const body = await readJsonObject(request, "invalid_worker_request", "worker request body must be JSON");
+  const actorId = readString(body, "actorId", "invalid_worker_request", "actorId is required");
+  return serializeActorRequest(actorRequestQueues, actorId, async () => {
+    const actor = await requireDelegationAndReady(context, actorId);
+    const access = actorStorage(actor);
+    const now = new Date().toISOString();
+
+  if (url.pathname === "/api/worker/generation-requests/claim") {
+    const workflowId = readString(body, "workflowId", "invalid_worker_request", "workflowId is required");
+    const claimOwner = readString(body, "claimOwner", "invalid_worker_request", "claimOwner is required");
+    const leaseSeconds = boundedInteger(body.leaseSeconds, DEFAULT_WORKER_LEASE_SECONDS, 15, 900);
+    const maxAttempts = boundedInteger(body.maxAttempts, DEFAULT_WORKER_MAX_ATTEMPTS, 1, 10);
+    const requestRecord = await context.storage.claimGenerationRequest(access, {
+      workflowId,
+      claimOwner,
+      now,
+      leaseExpiresAt: new Date(Date.parse(now) + leaseSeconds * 1000).toISOString(),
+      maxAttempts,
+    });
+    if (requestRecord) {
+      logEvent("info", "generation_request_claimed", {
+        requestId: requestRecord.requestId,
+        runId: requestRecord.runId,
+        claimOwner: requestRecord.claimOwner,
+        fencingToken: requestRecord.fencingToken,
+        attemptCount: requestRecord.attemptCount,
+        actor: actor.actorId,
+      });
+    }
+    return json({ request: requestRecord, committedCursor: requestRecord?.sourceCursorBefore ?? null });
+  }
+
+  const match = url.pathname.match(
+    /^\/api\/worker\/generation-requests\/([^/]+)\/(heartbeat|phase|artifacts|reconcile|complete|retry|assert)$/,
+  );
+  if (!match) throw new FeedHostError("worker endpoint not found", 404, "not_found");
+  const requestId = decodeURIComponent(match[1]);
+  const action = match[2];
+  const identity = {
+    requestId,
+    runId: readString(body, "runId", "invalid_worker_request", "runId is required"),
+    claimOwner: readString(body, "claimOwner", "invalid_worker_request", "claimOwner is required"),
+    fencingToken: boundedInteger(body.fencingToken, -1, 1, Number.MAX_SAFE_INTEGER),
+    now,
+  };
+
+  if (action === "heartbeat") {
+    const leaseSeconds = boundedInteger(body.leaseSeconds, DEFAULT_WORKER_LEASE_SECONDS, 15, 900);
+    const record = await context.storage.heartbeatGenerationRequest(access, {
+      ...identity,
+      leaseExpiresAt: new Date(Date.parse(now) + leaseSeconds * 1000).toISOString(),
+    });
+    return json({ request: record });
+  }
+  if (action === "phase") {
+    const phase = readWorkerPhase(body.phase);
+    const record = await context.storage.updateGenerationRequestPhase(access, {
+      ...identity,
+      phase,
+      metadata: readWorkerMetadata(body.metadata),
+    });
+    return json({ request: record });
+  }
+  if (action === "artifacts") {
+    const result = await context.storage.publishGenerationArtifacts(access, {
+      ...identity,
+      publicationKey: optionalString(body.publicationKey),
+      artifacts: Object.hasOwn(body, "artifacts") ? readWorkerArtifacts(body.artifacts) : undefined,
+      timingEvents: readWorkerTimingEvents(body.timingEvents),
+    });
+    return json(result);
+  }
+  if (action === "reconcile") {
+    return json(await context.storage.reconcileGenerationRequest(access, identity));
+  }
+  if (action === "assert") {
+    return json({ request: await context.storage.assertGenerationRequestFence(access, identity) });
+  }
+  if (action === "complete") {
+    if (!Object.hasOwn(body, "cursor")) {
+      throw new FeedHostError("cursor is required", 400, "invalid_worker_request");
+    }
+    const record = await context.storage.completeGenerationRequest(access, {
+      ...identity,
+      outcome: readWorkerOutcome(body.outcome),
+      cursor: body.cursor,
+      artifactIds: readStringArray(body.artifactIds, "artifactIds"),
+      timingEvents: readWorkerTimingEvents(body.timingEvents),
+    });
+    return json({ request: record });
+  }
+
+  const retryAfterSeconds = boundedInteger(body.retryAfterSeconds, 60, 1, 86_400);
+  const errorCode = readWorkerErrorCode(body.errorCode);
+  const record = await context.storage.retryGenerationRequest(access, {
+    ...identity,
+    nextRetryAt: new Date(Date.parse(now) + retryAfterSeconds * 1000).toISOString(),
+    retryable: optionalBoolean(body.retryable) ?? true,
+    error: { code: errorCode, message: optionalString(body.errorMessage) },
+    timingEvents: readWorkerTimingEvents(body.timingEvents),
+  });
+  logEvent("warn", "generation_request_retry", {
+    requestId,
+    runId: identity.runId,
+    claimOwner: identity.claimOwner,
+    fencingToken: identity.fencingToken,
+    attemptCount: record.attemptCount,
+    status: record.status,
+    errorCode,
+    actor: actor.actorId,
+  });
+    return json({ request: record });
+  });
+}
+
 function authorized(request: Request, token: string | undefined): boolean {
   if (!token) return true;
   return request.headers.get("authorization") === `Bearer ${token}`;
+}
+
+function isWorkerRoute(pathname: string): boolean {
+  return pathname === "/api/worker/generation-requests/claim" || pathname.startsWith("/api/worker/generation-requests/");
+}
+
+function workerAuthorized(request: Request, configuredToken: string | undefined): boolean {
+  if (!configuredToken || Buffer.byteLength(configuredToken, "utf8") < MIN_WORKER_TOKEN_BYTES) return false;
+  const header = request.headers.get("authorization");
+  if (!header?.startsWith("Bearer ")) return false;
+  const supplied = header.slice("Bearer ".length);
+  const expectedDigest = createHash("sha256").update(configuredToken).digest();
+  const suppliedDigest = createHash("sha256").update(supplied).digest();
+  return timingSafeEqual(expectedDigest, suppliedDigest);
 }
 
 function isAllowedOrigin(request: Request, allowedOrigins: string[] | undefined, requireActorSession: boolean): boolean {
@@ -819,11 +1094,20 @@ function applyResponsePolicy(
 }
 
 function requiresActorSession(request: Request, url: URL): boolean {
+  if (isWorkerRoute(url.pathname)) return false;
   if (PUBLIC_PATHS.has(url.pathname)) return false;
   if (request.method === "POST" && (url.pathname === "/api/delegations" || url.pathname === "/api/client-events")) {
     return false;
   }
   return true;
+}
+
+function isActorControlRoute(method: string, pathname: string): boolean {
+  return pathname === "/api/delegations/status" || (method === "POST" && pathname === "/api/delegations/retry");
+}
+
+function isArtifactReadRoute(method: string, pathname: string): boolean {
+  return method === "GET" && pathname.startsWith("/artifacts/");
 }
 
 function authenticatedSessionActor(request: Request, context: FeedHostContext): string | undefined {
@@ -919,6 +1203,10 @@ async function requireCompleteActor(request: Request, context: FeedHostContext):
   return requireDelegationAndReady(context, actorId);
 }
 
+async function requireDelegatedActor(request: Request, context: FeedHostContext): Promise<ActorState> {
+  return requireDelegation(context, requireRequestActorId(request));
+}
+
 async function requireDevPublisherActor(request: Request, context: FeedHostContext): Promise<ActorState> {
   const actorId = request.headers.get("x-feed-actor-id");
   if (actorId) return requireDelegationAndReady(context, actorId);
@@ -940,6 +1228,11 @@ function requireRequestActorId(request: Request): string {
   const actorId = request.headers.get("x-feed-actor-id");
   if (!actorId) throw new FeedHostError("missing delegated actor", 401, "unauthorized");
   return actorId;
+}
+
+function requestTraceId(request: Request): string | undefined {
+  const traceId = request.headers.get("x-feed-trace-id")?.trim();
+  return traceId && /^[A-Za-z0-9._:-]{1,100}$/.test(traceId) ? traceId : undefined;
 }
 
 async function requireDelegation(context: FeedHostContext, actorId: string): Promise<ActorState> {
@@ -1002,6 +1295,7 @@ async function readDelegationStatus(
   state: "missing" | "active" | "partial" | "expired" | "stale";
   complete: boolean;
   resources: Array<{ path: string; acceptedAt: string; expiresAt: string }>;
+  setup?: ActorPreparationStatus;
 }> {
   const actorKey = normalizeActorId(actorId);
   const liveActor = context.actors.get(actorKey);
@@ -1013,6 +1307,7 @@ async function readDelegationStatus(
       currentPolicyHash: context.policyHash,
       state: "active",
       complete: true,
+      setup: actorPreparationSnapshot(liveActor),
       resources: liveActor.resources.map((path) => ({
         path,
         acceptedAt: liveActor.acceptedAt,
@@ -1170,15 +1465,84 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
   return actor.storageAccess;
 }
 
+function isMissingSchemaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no such table|does not exist|undefined table/i.test(message);
+}
+
 async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, seedOnStart: boolean): Promise<void> {
   if (!actor.ready) {
+    const preparationStartedAt = performance.now();
+    const startedAt = new Date().toISOString();
+    actor.preparation = {
+      state: "preparing",
+      phase: "bootstrap",
+      attempt: (actor.preparation?.attempt ?? 0) + 1,
+      startedAt,
+      updatedAt: startedAt,
+    };
+    logEvent("info", "feed_preparation_started", {
+      actor: actor.actorId,
+      attempt: actor.preparation.attempt,
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+    });
     const ready = (async () => {
-      const access = actorStorage(actor);
-      await retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access));
-      if (seedOnStart && !(await retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)))) {
-        await retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access));
+      try {
+        const access = actorStorage(actor);
+        await runActorPreparationPhase(actor, "bootstrap", () =>
+          retryTinyCloudTransaction("bootstrap", actor.actorId, () => storage.bootstrapSchema(access)));
+        if (seedOnStart) {
+          const hasArtifacts = await runActorPreparationPhase(actor, "artifact_check", () =>
+            retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)));
+          if (!hasArtifacts) {
+            await runActorPreparationPhase(actor, "seed", () =>
+              retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access)));
+            // Full reconciliation, not just the compatibility pass: a freshly
+            // seeded space has artifacts but no projections yet, so without it
+            // the first feed shows a single item until something else triggers
+            // reconciliation. This runs inside background preparation, so the
+            // reader-path stays lightweight.
+            await runActorPreparationPhase(actor, "reconcile", () =>
+              retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access)));
+          }
+        }
+        const completedAt = new Date().toISOString();
+        actor.preparation = {
+          ...actorPreparationSnapshot(actor),
+          state: "ready",
+          phase: "ready",
+          updatedAt: completedAt,
+          completedAt,
+          error: undefined,
+        };
+        logEvent("info", "feed_preparation_completed", {
+          actor: actor.actorId,
+          attempt: actor.preparation.attempt,
+          ms: Math.round(performance.now() - preparationStartedAt),
+          ...(actor.traceId ? { traceId: actor.traceId } : {}),
+        });
+      } catch (error) {
+        const completedAt = new Date().toISOString();
+        actor.preparation = {
+          ...actorPreparationSnapshot(actor),
+          state: "failed",
+          phase: "failed",
+          updatedAt: completedAt,
+          completedAt,
+          error: {
+            code: "preparation_failed",
+            message: publicPreparationError(error),
+          },
+        };
+        logEvent("error", "feed_preparation_failed", {
+          actor: actor.actorId,
+          attempt: actor.preparation.attempt,
+          ms: Math.round(performance.now() - preparationStartedAt),
+          ...(actor.traceId ? { traceId: actor.traceId } : {}),
+          ...errorLogFields(error),
+        });
+        throw error;
       }
-      await retryTinyCloudTransaction("reconcile", actor.actorId, () => storage.reconcileFeedProjection(access));
     })();
     actor.ready = ready;
     ready.catch(() => {
@@ -1186,6 +1550,68 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
     });
   }
   await actor.ready;
+}
+
+async function runActorPreparationPhase<T>(
+  actor: ActorState,
+  phase: Exclude<ActorPreparationPhase, "idle" | "ready" | "failed">,
+  run: () => Promise<T>,
+): Promise<T> {
+  updateActorPreparation(actor, phase);
+  const startedAt = performance.now();
+  logEvent("info", "feed_preparation_phase_started", {
+    actor: actor.actorId,
+    attempt: actor.preparation?.attempt,
+    phase,
+    ...(actor.traceId ? { traceId: actor.traceId } : {}),
+  });
+  try {
+    const result = await run();
+    logEvent("info", "feed_preparation_phase_completed", {
+      actor: actor.actorId,
+      attempt: actor.preparation?.attempt,
+      phase,
+      ms: Math.round(performance.now() - startedAt),
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+    });
+    return result;
+  } catch (error) {
+    logEvent("error", "feed_preparation_phase_failed", {
+      actor: actor.actorId,
+      attempt: actor.preparation?.attempt,
+      phase,
+      ms: Math.round(performance.now() - startedAt),
+      ...(actor.traceId ? { traceId: actor.traceId } : {}),
+      ...errorLogFields(error),
+    });
+    throw error;
+  }
+}
+
+function updateActorPreparation(actor: ActorState, phase: ActorPreparationPhase): void {
+  actor.preparation = {
+    ...actorPreparationSnapshot(actor),
+    state: "preparing",
+    phase,
+    updatedAt: new Date().toISOString(),
+    completedAt: undefined,
+    error: undefined,
+  };
+}
+
+function actorPreparationSnapshot(actor: ActorState): ActorPreparationStatus {
+  return actor.preparation ?? {
+    state: "not_started",
+    phase: "idle",
+    attempt: 0,
+    startedAt: actor.acceptedAt,
+    updatedAt: actor.acceptedAt,
+  };
+}
+
+function publicPreparationError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, " ").trim().slice(0, 500) || "Feed preparation failed";
 }
 
 async function retryTinyCloudTransaction<T>(operation: string, actorId: string | undefined, run: () => Promise<T>): Promise<T> {
@@ -1356,6 +1782,28 @@ function normalizeGenerationRequestRecord(row: Record<string, unknown>): Record<
     packageId: stringField(row, "packageId") ?? stringField(row, "package_id") ?? null,
     dedupeKey: stringField(row, "dedupeKey") ?? stringField(row, "dedupe_key") ?? null,
     prompt: stringField(row, "prompt") ?? null,
+    runId: stringField(row, "runId") ?? stringField(row, "run_id") ?? null,
+    workflowId: stringField(row, "workflowId") ?? stringField(row, "workflow_id") ?? null,
+    maxAttempts: numberField(row, "maxAttempts") ?? numberField(row, "max_attempts") ?? 3,
+    claimOwner: stringField(row, "claimOwner") ?? stringField(row, "claim_owner") ?? null,
+    leaseExpiresAt: stringField(row, "leaseExpiresAt") ?? stringField(row, "lease_expires_at") ?? null,
+    fencingToken: numberField(row, "fencingToken") ?? numberField(row, "fencing_token") ?? 0,
+    attemptCount: numberField(row, "attemptCount") ?? numberField(row, "attempt_count") ?? 0,
+    nextRetryAt: stringField(row, "nextRetryAt") ?? stringField(row, "next_retry_at") ?? null,
+    cancellationRequested:
+      booleanField(row, "cancellationRequested") ?? numberField(row, "cancellation_requested") === 1,
+    phase: stringField(row, "phase") ?? "queued",
+    phaseStartedAt: stringField(row, "phaseStartedAt") ?? stringField(row, "phase_started_at") ?? null,
+    startedAt: stringField(row, "startedAt") ?? stringField(row, "started_at") ?? null,
+    completedAt: stringField(row, "completedAt") ?? stringField(row, "completed_at") ?? null,
+    lastAttemptAt: stringField(row, "lastAttemptAt") ?? stringField(row, "last_attempt_at") ?? null,
+    sourceCursorBefore: row.sourceCursorBefore ?? parseMaybeJson(stringField(row, "source_cursor_before")),
+    sourceCursorAfter: row.sourceCursorAfter ?? parseMaybeJson(stringField(row, "source_cursor_after")),
+    sourceRefs: row.sourceRefs ?? parseMaybeJson(stringField(row, "source_refs_json")) ?? [],
+    publicationKey: stringField(row, "publicationKey") ?? stringField(row, "publication_key") ?? null,
+    artifactIds: row.artifactIds ?? parseMaybeJson(stringField(row, "artifact_ids_json")) ?? [],
+    error: row.error ?? parseMaybeJson(stringField(row, "error_json")) ?? null,
+    timingEvents: row.timingEvents ?? parseMaybeJson(stringField(row, "timing_events_json")) ?? [],
     expiresAt: stringField(row, "expiresAt") ?? stringField(row, "expires_at"),
     createdAt: stringField(row, "createdAt") ?? stringField(row, "created_at"),
     updatedAt: stringField(row, "updatedAt") ?? stringField(row, "updated_at"),
@@ -1425,12 +1873,15 @@ function readGenerationRequestStatus(value: unknown): FeedGenerationRequestRecor
     value === "blocked" ||
     value === "rejected" ||
     value === "consumed" ||
-    value === "expired"
+    value === "expired" ||
+    value === "retry_wait" ||
+    value === "cancelled" ||
+    value === "dead_letter"
   ) {
     return value;
   }
   throw new FeedHostError(
-    "status must be one of accepted|pending|blocked|rejected|consumed|expired",
+    "status must be one of accepted|pending|retry_wait|blocked|rejected|consumed|expired|cancelled|dead_letter",
     400,
     "invalid_generation_status",
   );
@@ -1469,6 +1920,102 @@ function optionalString(value: unknown): string | undefined {
 
 function optionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function boundedInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < minimum || value > maximum) {
+    throw new FeedHostError(`value must be an integer from ${minimum} to ${maximum}`, 400, "invalid_worker_request");
+  }
+  return value;
+}
+
+function readWorkerPhase(value: unknown): "running" | "validating" {
+  if (value === "running" || value === "validating") {
+    return value;
+  }
+  throw new FeedHostError("phase is not allowed", 400, "invalid_worker_request");
+}
+
+function readWorkerMetadata(value: unknown): {
+  sourceCursorAfter?: unknown;
+  sourceRefs?: unknown[];
+  timingEvents?: Array<{ name: string; at: string; durationMs?: number }>;
+} {
+  if (value === undefined) return {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new FeedHostError("metadata must be an object", 400, "invalid_worker_request");
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["sourceCursorAfter", "sourceRefs", "timingEvents"].includes(key))) {
+    throw new FeedHostError("metadata contains unsupported fields", 400, "invalid_worker_request");
+  }
+  return {
+    ...(Object.hasOwn(record, "sourceCursorAfter") ? { sourceCursorAfter: record.sourceCursorAfter } : {}),
+    ...(record.sourceRefs === undefined ? {} : { sourceRefs: readObjectArray(record.sourceRefs, "sourceRefs", 500) }),
+    ...(record.timingEvents === undefined ? {} : { timingEvents: readWorkerTimingEvents(record.timingEvents) }),
+  };
+}
+
+function readWorkerTimingEvents(value: unknown): Array<{ name: string; at: string; durationMs?: number }> | undefined {
+  if (value === undefined) return undefined;
+  const events = readObjectArray(value, "timingEvents", 128);
+  return events.map((event) => {
+    const name = readString(event, "name", "invalid_worker_request", "timing event name is required");
+    const at = readString(event, "at", "invalid_worker_request", "timing event timestamp is required");
+    if (!/^[a-z][a-z0-9_.-]{0,63}$/i.test(name) || !Number.isFinite(Date.parse(at))) {
+      throw new FeedHostError("timing event is invalid", 400, "invalid_worker_request");
+    }
+    const durationMs = event.durationMs;
+    if (durationMs !== undefined && (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0)) {
+      throw new FeedHostError("timing event durationMs is invalid", 400, "invalid_worker_request");
+    }
+    return { name, at, ...(durationMs === undefined ? {} : { durationMs }) };
+  });
+}
+
+function readWorkerArtifacts(value: unknown): FeedArtifact[] {
+  return readObjectArray(value, "artifacts", 32) as FeedArtifact[];
+}
+
+function readObjectArray(value: unknown, field: string, maximum: number): Record<string, unknown>[] {
+  if (!Array.isArray(value) || value.length > maximum || value.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry))) {
+    throw new FeedHostError(`${field} must be an array of at most ${maximum} objects`, 400, "invalid_worker_request");
+  }
+  return value as Record<string, unknown>[];
+}
+
+function readStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > 32 || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new FeedHostError(`${field} must be an array of strings`, 400, "invalid_worker_request");
+  }
+  return value as string[];
+}
+
+function readWorkerOutcome(value: unknown): "published" | "zero_artifacts" {
+  if (value === "published" || value === "zero_artifacts") return value;
+  throw new FeedHostError("outcome must be published or zero_artifacts", 400, "invalid_worker_request");
+}
+
+function readWorkerErrorCode(value: unknown): string {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(value)) {
+    throw new FeedHostError("errorCode is required", 400, "invalid_worker_request");
+  }
+  return value;
+}
+
+function numberField(body: Record<string, unknown>, key: string): number | undefined {
+  const value = body[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function booleanField(body: Record<string, unknown>, key: string): boolean | undefined {
+  return typeof body[key] === "boolean" ? body[key] : undefined;
+}
+
+function objectField(body: Record<string, unknown>, key: string): Record<string, number> | undefined {
+  const value = body[key];
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, number> : undefined;
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -1575,6 +2122,7 @@ function optionsFromEnv(): FeedHostServerOptions {
     port: Number(process.env.FEED_HOST_PORT ?? "8787"),
     hostname: process.env.FEED_HOST_HOSTNAME ?? "127.0.0.1",
     token: process.env.FEED_HOST_TOKEN || undefined,
+    workerToken: process.env.FEED_HOST_WORKER_TOKEN || undefined,
     tinycloudHost: process.env.TINYCLOUD_HOST || process.env.VITE_TINYCLOUD_HOST || undefined,
     hostPrivateKey: process.env.FEED_HOST_PRIVATE_KEY || (stateDir ? ensureFeedHostPrivateKey(stateDir) : undefined),
     seedOnStart: process.env.FEED_HOST_SEED !== "0",

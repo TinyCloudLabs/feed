@@ -1,5 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { bodyPreview, hydrateFeedItems, sortedFeed, type FeedItem } from "./feedModel.ts";
+import {
+  bodyPreview,
+  createLazyArtifactCache,
+  feedItemAvailability,
+  feedItemsForView,
+  feedItemsFromProjections,
+  hydrateFeedItems,
+  projectedPost,
+  readableFeedTime,
+  readablePostKind,
+  readableProvenance,
+  sortedFeed,
+  type FeedItem,
+} from "./feedModel.ts";
 import { artifactExpansionSection, artifactSectionText } from "../../shared/feed-item.ts";
 
 function item(id: string, rankScore: number, publishedAt: string): FeedItem {
@@ -97,4 +110,180 @@ describe("Feed v1 model helpers", () => {
     expect(hydrated[0]?.artifact).toBe(artifact);
     expect(hydrated[1]?.artifact).toBe(artifact);
   });
+
+  test("builds an immediately renderable feed and filters for-you and saved views", () => {
+    const defaultItem = item("default", 0.9, "2026-06-28T10:00:00.000Z");
+    const savedItem = {
+      ...item("saved", 0.8, "2026-06-28T09:00:00.000Z"),
+      projection: { ...item("saved", 0.8, "2026-06-28T09:00:00.000Z").projection, disposition: "saved" as const },
+    };
+    const hiddenItem = {
+      ...item("hidden", 0.7, "2026-06-28T08:00:00.000Z"),
+      projection: { ...item("hidden", 0.7, "2026-06-28T08:00:00.000Z").projection, disposition: "hidden" as const },
+    };
+    const visibilityHiddenItem = {
+      ...item("visibility-hidden", 0.6, "2026-06-28T07:00:00.000Z"),
+      projection: { ...item("visibility-hidden", 0.6, "2026-06-28T07:00:00.000Z").projection, visibility: "hidden" as const },
+    };
+    const projected = feedItemsFromProjections([
+      defaultItem.projection,
+      savedItem.projection,
+      hiddenItem.projection,
+      visibilityHiddenItem.projection,
+    ]);
+
+    expect(projected.every((feedItem) => feedItem.artifact === null)).toBe(true);
+    expect(feedItemsForView(projected, "for_you").map((feedItem) => feedItem.projection.target.artifactId)).toEqual([
+      "default",
+      "saved",
+    ]);
+    expect(feedItemsForView(projected, "saved").map((feedItem) => feedItem.projection.target.artifactId)).toEqual(["saved"]);
+  });
+
+  test("matches a projected post and formats generic kind and time labels", () => {
+    const projection = {
+      ...item("artifact", 0.9, "2026-07-14T10:30:00.000Z").projection,
+      feedItemId: "artifact::post-1",
+      target: { kind: "post" as const, artifactId: "artifact", postId: "post-1" },
+    };
+    const feedItem = {
+      projection,
+      artifact: artifact({
+        posts: [{
+          postId: "post-1",
+          postFingerprint: "sha256:post-1",
+          kind: "decision_memo",
+          body: "Choose the reversible option.",
+          evidence: [],
+          expansionTarget: { artifactId: "artifact" },
+        }],
+      }),
+    };
+
+    expect(projectedPost(feedItem)?.body).toBe("Choose the reversible option.");
+    expect(readablePostKind(feedItem)).toBe("Decision memo");
+    expect(readableFeedTime(projection.publishedAt, new Date("2026-07-14T12:00:00.000Z"))).toBe("1h ago");
+    expect(readableFeedTime("not-a-date", new Date("2026-07-14T12:00:00.000Z"))).toBe("Recently");
+  });
+
+  test("reports explicit availability states with revoked authority taking precedence", () => {
+    const base = item("availability", 0.9, "2026-07-14T10:30:00.000Z");
+    expect(feedItemAvailability(base)).toBe("available");
+    expect(feedItemAvailability({ ...base, error: "424" })).toBe("artifact_unavailable");
+    expect(feedItemAvailability({
+      ...base,
+      projection: { ...base.projection, freshnessLabel: "source_unavailable" },
+      error: "424",
+    })).toBe("source_unavailable");
+    expect(feedItemAvailability({
+      ...base,
+      projection: { ...base.projection, reasonCodes: ["source_revoked", "broken_ref"] },
+      error: "424",
+    })).toBe("source_revoked");
+    expect(feedItemAvailability({
+      ...base,
+      projection: { ...base.projection, reasonCodes: ["source_unavailable", "broken_ref"] },
+    })).toBe("artifact_unavailable");
+  });
+
+  test("summarizes provenance without exposing raw identifiers", () => {
+    const base = item("private-artifact-id", 0.9, "2026-07-14T10:30:00.000Z");
+    const summary = readableProvenance({
+      ...base,
+      artifact: artifact({
+        sourceRefs: [sourceRef("one"), sourceRef("two")],
+      }),
+    });
+
+    expect(summary).toEqual({
+      madeBy: "Feed",
+      sourceSummary: "2 Listen conversations",
+      freshnessSummary: "Fresh",
+      workflowSummary: "Turns allowed conversations into a private brief.",
+    });
+    expect(JSON.stringify(summary)).not.toContain("private-artifact-id");
+    expect(JSON.stringify(summary)).not.toContain("sha256:");
+    expect(JSON.stringify(summary)).not.toContain("private-package");
+
+    const genericSummary = readableProvenance({
+      ...base,
+      artifact: artifact({
+        sourceRefs: [{ ...sourceRef("one"), sourceKind: "uploaded_document" }],
+      }),
+    });
+    expect(genericSummary.sourceSummary).toBe("1 Uploaded document");
+  });
+
+  test("lazy artifact cache shares concurrent loads, supports peek, and retries failures", async () => {
+    let calls = 0;
+    let fail = true;
+    const loaded = artifact();
+    const cache = createLazyArtifactCache(async () => {
+      calls += 1;
+      if (fail) throw new Error("temporarily unavailable");
+      return loaded;
+    });
+    const feedItem = item("artifact", 0.9, "2026-07-14T10:30:00.000Z");
+
+    expect(cache.peek("artifact")).toBeUndefined();
+    expect((await cache.hydrate(feedItem)).error).toBe("temporarily unavailable");
+    fail = false;
+    const [first, second] = await Promise.all([cache.load("artifact"), cache.load("artifact")]);
+
+    expect(calls).toBe(2);
+    expect(first).toBe(loaded);
+    expect(second).toBe(loaded);
+    expect(cache.peek("artifact")).toBe(loaded);
+    expect((await cache.hydrate(feedItem)).artifact).toBe(loaded);
+    expect(calls).toBe(2);
+  });
 });
+
+function artifact(overrides: Record<string, unknown> = {}) {
+  return {
+    schemaVersion: "feed.artifact.v1",
+    artifactId: "artifact",
+    artifactType: "daily_brief",
+    renderShape: "longform",
+    title: "Private brief",
+    body: { text: "Complete artifact" },
+    sourceRefs: [sourceRef("one")],
+    producedBy: {
+      packageId: "private-package",
+      packageVersion: "1.0.0",
+      packageDigest: "sha256:package",
+      runId: "private-run",
+      runtimeClass: "feed_hosted",
+      providerClass: "first_party",
+      credentialOwner: "feed_hosted",
+      egressClass: "model_provider",
+      disclosure: {
+        userCopy: "Turns allowed conversations into a private brief.",
+        credentialOwner: "feed_hosted",
+        providerClass: "first_party",
+        egressClass: "model_provider",
+      },
+    },
+    freshness: { label: "fresh", asOf: "2026-07-14T10:30:00.000Z" },
+    idempotency: {
+      sourceFingerprint: "sha256:source",
+      artifactFingerprint: "sha256:artifact",
+      dedupeKey: "sha256:dedupe",
+    },
+    storage: { docKey: "private/doc.json" },
+    createdAt: "2026-07-14T10:30:00.000Z",
+    updatedAt: "2026-07-14T10:30:00.000Z",
+    ...overrides,
+  } as never;
+}
+
+function sourceRef(id: string) {
+  return {
+    sourceRefId: `source-${id}`,
+    sourceKind: "listen_conversation",
+    sourceId: `conversation-${id}`,
+    observedPath: "sql_transcript_text",
+    observedHash: `sha256:${id}`,
+    observedAt: "2026-07-14T10:00:00.000Z",
+  };
+}

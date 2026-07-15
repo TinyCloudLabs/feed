@@ -39,7 +39,7 @@ describe("Feed-owned item and interaction contracts", () => {
       vectors: Array<{ expected: { postId: string } }>;
     };
 
-    expect(digest(fixture("rich-artifact.json"))).toBe("9d8c0397ec737819652e35566ba90cf66500788a3b282cbf0b51a5c02135cf7d");
+    expect(digest(fixture("rich-artifact.json"))).toBe("0d06420bb70e91c3a77ad9c71865c09cf0c4cde29b12b7691f67af47c15cb8b9");
     expect(digest(fixture("feed-post-identity-vectors.json"))).toBe("d2c169f3c65ff25448a784995c23d7ce934e4082504be2c3e46a393b5bd2a3e3");
     expect(vectors.contractVersion).toBe("feed.post.v1");
     expect(vectors.vectors[0]?.expected.postId).toBe("post:9088faedcc601db95f7945c289770623d36a25d7b1c5fbddf8b2723f3603665a");

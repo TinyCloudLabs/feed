@@ -4,6 +4,7 @@ import type {
   FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { artifactExpansionSection, type FeedItemProjection } from "../../shared/feed-item.ts";
+import { ArtifactBody } from "./ArtifactBody.tsx";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
   attachReceivedInputAuthority,
@@ -11,25 +12,47 @@ import {
   signIn,
   signOut,
   submitFeedHostDelegations,
+  type FeedLoginTrace,
   type FeedSession,
 } from "./auth.ts";
 import { isFeedReconnectRequiredError } from "./authPolicy.ts";
-import { errorDetail, reportClientEvent } from "./clientLog.ts";
+import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
+import type { FeedHostSetupStatus } from "./delegation.ts";
 import {
   FeedV1HostClient,
   FeedV1HostError,
   type FeedHostInputAuthority,
   type FeedHostSkillState,
 } from "./feedV1HostClient.ts";
-import { bodyPreview, hydrateFeedItems, projectionLabel, sortedFeed, type FeedItem } from "./feedModel.ts";
+import {
+  createLazyArtifactCache,
+  feedItemAvailability,
+  feedItemsForView,
+  feedItemsFromProjections,
+  projectedPost,
+  readableFeedTime,
+  readablePostKind,
+  readableProvenance,
+  sortedFeed,
+  type FeedItem,
+  type FeedView,
+} from "./feedModel.ts";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
 type SetupStage = "identity" | "context" | "preparing";
 
-const FEED_EVENTS_RETRY_MS = 5000;
+const FEED_EVENTS_RETRY_MS = 15_000;
+const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
+
+class FeedSetupFailedError extends Error {
+  constructor(readonly setup: FeedHostSetupStatus) {
+    super(setup.error?.message ?? "Feed Host preparation failed");
+    this.name = "FeedSetupFailedError";
+  }
+}
 
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
@@ -46,29 +69,67 @@ export function App() {
   const [signInError, setSignInError] = useState<string | null>(null);
   const [feedState, setFeedState] = useState<FeedState>("idle");
   const [setupStage, setSetupStage] = useState<SetupStage>("identity");
+  const [hostSetup, setHostSetup] = useState<FeedHostSetupStatus | null>(null);
   const [setupError, setSetupError] = useState<string | null>(null);
   const [items, setItems] = useState<FeedItem[]>([]);
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [eventsError, setEventsError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [activeView, setActiveView] = useState<FeedView>("for_you");
+  const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef(false);
+  const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastRecoveryAt = useRef(0);
+  const loginTrace = useRef<FeedLoginTrace | null>(null);
+  const firstContentReported = useRef<string | null>(null);
+  const restoredHostSession = useRef(false);
+  const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
 
   const client = useMemo(
-    () => new FeedV1HostClient({ baseUrl: FEED_HOST_URL, token: FEED_HOST_TOKEN || undefined, actorId: session?.readerDid }),
+    () => new FeedV1HostClient({
+      baseUrl: FEED_HOST_URL,
+      token: FEED_HOST_TOKEN || undefined,
+      actorId: session?.readerDid,
+      traceId: loginTrace.current?.traceId,
+    }),
     [session?.readerDid],
   );
+  const artifactCache = useMemo(() => createLazyArtifactCache((artifactId) => client.getArtifact(artifactId)), [client]);
 
   useEffect(() => {
     let cancelled = false;
     const bootstrap = async () => {
+      const startedAt = performance.now();
+      const trace: FeedLoginTrace = {
+        traceId: crypto.randomUUID(),
+        loginStartedAt: startedAt,
+        systemStartedAt: startedAt,
+      };
+      loginTrace.current = trace;
+      client.setTraceId(trace.traceId);
+      const policyStartedAt = performance.now();
       const nextPolicy = await client.getDelegationPolicy();
+      reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
       if (cancelled) return;
       setPolicy(nextPolicy);
+      const restoreStartedAt = performance.now();
       const restored = await restoreSession(nextPolicy);
-      if (!cancelled && restored) setSession(restored);
+      if (!cancelled && restored) {
+        restoredHostSession.current = true;
+        reportClientTiming("login_session_restored", {
+          ...trace,
+          phaseStartedAt: restoreStartedAt,
+          actorId: restored.readerDid,
+        });
+        setSession(restored);
+      } else if (!restored) {
+        loginTrace.current = null;
+        client.setTraceId(undefined);
+      }
     };
     bootstrap()
       .then(() => undefined)
@@ -91,6 +152,7 @@ export function App() {
     const now = Date.now();
     if (now - lastRecoveryAt.current < RECOVERY_COOLDOWN_MS) return false;
     lastRecoveryAt.current = now;
+    restoredHostSession.current = false;
     reportClientEvent("warn", "delegation_lost_recovering", undefined, session?.readerDid);
     try {
       const nextPolicy = await client.getDelegationPolicy();
@@ -104,54 +166,182 @@ export function App() {
     }
   }, [client, session]);
 
-  const loadFeed = useCallback(async () => {
-    if (!session || feedLoadInFlight.current) return;
+  const loadFeed = useCallback(async (options: {
+    recoverDelegation?: boolean;
+    surfaceError?: boolean;
+    reason?: string;
+  } = {}): Promise<boolean> => {
+    if (!session || feedLoadInFlight.current) return false;
+    const recoverLostDelegation = options.recoverDelegation !== false;
+    const surfaceError = options.surfaceError !== false;
     feedLoadInFlight.current = true;
-    setLoadState("loading");
+    if (surfaceError) setLoadState("loading");
+    const phaseStartedAt = performance.now();
     try {
       const page = await client.listFeed({ limit: 40 });
-      const hydrated = await hydrateFeedItems(page.items, (artifactId) => client.getArtifact(artifactId));
-      setItems(sortedFeed(hydrated));
+      setItems((current) => {
+        const previous = new Map(current.map((item) => [item.projection.feedItemId, item]));
+        return sortedFeed(feedItemsFromProjections(page.items).map((item) => ({
+          ...item,
+          artifact: artifactCache.peek(item.projection.target.artifactId) ?? previous.get(item.projection.feedItemId)?.artifact ?? null,
+        })));
+      });
       setLoadError(null);
       setLoadState("ready");
-    } catch (error) {
-      if (isDelegationLostError(error)) {
-        feedLoadInFlight.current = false;
-        if (await recoverDelegation()) return;
+      if (loginTrace.current) {
+        reportClientTiming("login_feed_projections_received", {
+          ...loginTrace.current,
+          phaseStartedAt,
+          actorId: session.readerDid,
+          detail: `items=${page.items.length} reason=${options.reason ?? "refresh"}`,
+        });
       }
-      reportClientEvent("error", "feed_load_failed", errorDetail(error), session.readerDid);
-      setLoadState("error");
-      setLoadError(formatHostError(error));
+      return true;
+    } catch (error) {
+      if (recoverLostDelegation && isDelegationLostError(error)) {
+        feedLoadInFlight.current = false;
+        if (await recoverDelegation()) return false;
+      }
+      reportClientEvent(
+        surfaceError ? "error" : "info",
+        surfaceError ? "feed_load_failed" : "feed_fast_path_missed",
+        errorDetail(error),
+        session.readerDid,
+        loginTrace.current ? { traceId: loginTrace.current.traceId } : {},
+      );
+      if (surfaceError) {
+        setLoadState("error");
+        setLoadError(formatHostError(error));
+      }
+      return false;
     } finally {
       feedLoadInFlight.current = false;
     }
-  }, [client, recoverDelegation, session]);
+  }, [artifactCache, client, recoverDelegation, session]);
 
   const resetFeedState = useCallback(() => {
     setFeedState("idle");
     setSetupStage("identity");
+    setHostSetup(null);
     setSetupError(null);
     setItems([]);
     setLoadState("idle");
     setLoadError(null);
+    setEventsError(null);
     setBusyAction(null);
-  }, []);
+    setCommandStatus(null);
+    setMenuOpen(false);
+    setSettingsOpen(false);
+    setActiveView("for_you");
+    artifactCache.clear();
+    feedbackAttempts.current.clear();
+    firstContentReported.current = null;
+  }, [artifactCache]);
+
+  const waitForHostSetup = useCallback(async (): Promise<void> => {
+    let previousPhase: FeedHostSetupStatus["phase"] | undefined;
+    let phaseStartedAt = performance.now();
+    for (;;) {
+      const status = await client.getDelegationStatus();
+      if (!status.complete) throw new Error(`Feed Host delegation is ${status.state}`);
+      if (status.setup) {
+        setHostSetup(status.setup);
+        if (status.setup.phase !== previousPhase) {
+          if (loginTrace.current) {
+            reportClientTiming("login_setup_phase", {
+              ...loginTrace.current,
+              phaseStartedAt,
+              actorId: session?.readerDid,
+              detail: `phase=${status.setup.phase}`,
+            });
+          }
+          previousPhase = status.setup.phase;
+          phaseStartedAt = performance.now();
+        }
+      }
+      if (status.setup?.state === "ready") {
+        if (loginTrace.current) {
+          reportClientTiming("login_setup_ready", {
+            ...loginTrace.current,
+            phaseStartedAt,
+            actorId: session?.readerDid,
+          });
+        }
+        return;
+      }
+      if (status.setup?.state === "failed") throw new FeedSetupFailedError(status.setup);
+      await new Promise((resolve) => window.setTimeout(resolve, SETUP_STATUS_POLL_MS));
+    }
+  }, [client, session?.readerDid]);
+
+  const recordSetupFailure = useCallback((error: unknown) => {
+    console.error("[Feed setup]", error);
+    if (error instanceof FeedSetupFailedError) setHostSetup(error.setup);
+    reportClientEvent("error", "feed_setup_failed", errorDetail(error), session?.readerDid);
+    setFeedState("error");
+    setSetupError("Feed’s backend could not finish preparing your Feed.");
+  }, [session?.readerDid]);
 
   const startFeed = useCallback(
     async () => {
       if (!session || !policy || setupInFlight.current) return;
       setupInFlight.current = true;
       setFeedState("starting");
-      setSetupStage("context");
+      setHostSetup(null);
       setSetupError(null);
       setLoadError(null);
       try {
-        await submitFeedHostDelegations({ client, policy, actorId: session.readerDid });
+        // A returning browser usually still has a valid Feed Host session.
+        // Read first so existing content never waits for delegation refresh or
+        // schema preparation.
+        if (restoredHostSession.current) {
+          const restoredFeed = await loadFeed({
+            recoverDelegation: false,
+            surfaceError: false,
+            reason: "restored_host_session",
+          });
+          if (restoredFeed) {
+            setFeedState("running");
+            return;
+          }
+          restoredHostSession.current = false;
+        }
+
+        setSetupStage("context");
+        const [receipt] = await submitFeedHostDelegations({
+          client,
+          policy,
+          actorId: session.readerDid,
+          trace: loginTrace.current ?? undefined,
+        });
+        if (receipt?.setup) setHostSetup(receipt.setup);
         setSetupStage("preparing");
-        await loadFeed();
+        const setup = waitForHostSetup().then(
+          () => ({ ok: true as const }),
+          (error: unknown) => ({ ok: false as const, error }),
+        );
+        const existingFeed = await loadFeed({
+          recoverDelegation: false,
+          surfaceError: false,
+          reason: "new_host_session",
+        });
+        if (existingFeed) {
+          setFeedState("running");
+          void setup.then((result) => {
+            if (result.ok) return;
+            reportClientEvent("warn", "feed_background_setup_failed", errorDetail(result.error), session.readerDid,
+              loginTrace.current ? { traceId: loginTrace.current.traceId } : {});
+            setEventsError("Feed is available, but background preparation needs attention.");
+          });
+          return;
+        }
+
+        const setupResult = await setup;
+        if (!setupResult.ok) throw setupResult.error;
+        const firstFeed = await loadFeed({ reason: "setup_complete" });
+        if (!firstFeed) throw new Error("Feed did not become readable after setup completed");
         setFeedState("running");
       } catch (error) {
-        console.error("[Feed setup]", error);
         if (isFeedReconnectRequiredError(error)) {
           reportClientEvent("warn", "feed_reconnect_required", errorDetail(error), session.readerDid);
           await signOut().catch(() => undefined);
@@ -160,21 +350,39 @@ export function App() {
           resetFeedState();
           return;
         }
-        reportClientEvent("error", "feed_setup_failed", errorDetail(error), session.readerDid);
-        setFeedState("error");
-        setSetupError(`Feed could not finish connecting (${errorDetail(error)}). Check your connection and try again.`);
+        recordSetupFailure(error);
       } finally {
         setupInFlight.current = false;
       }
     },
-    [client, loadFeed, policy, resetFeedState, session],
+    [client, loadFeed, policy, recordSetupFailure, resetFeedState, session, waitForHostSetup],
   );
+
+  const retryFeedSetup = useCallback(async () => {
+    if (!session || setupInFlight.current) return;
+    setupInFlight.current = true;
+    setFeedState("starting");
+    setSetupStage("preparing");
+    setSetupError(null);
+    try {
+      const response = await client.retrySetup();
+      setHostSetup(response.setup);
+      await waitForHostSetup();
+      await loadFeed();
+      setFeedState("running");
+    } catch (error) {
+      recordSetupFailure(error);
+    } finally {
+      setupInFlight.current = false;
+    }
+  }, [client, loadFeed, recordSetupFailure, session, waitForHostSetup]);
 
   useEffect(() => {
     if (!session || !policy) return;
     setSetupError(null);
     setLoadState("idle");
     setLoadError(null);
+    setEventsError(null);
     void startFeed();
   }, [policy, session, startFeed]);
 
@@ -182,15 +390,21 @@ export function App() {
     if (!session || feedState !== "running") return;
     let cancelled = false;
     let timer: number | undefined;
-    let lastSignature = "";
+    let lastSignature: string | undefined;
 
     const pollFeedEvents = async () => {
       if (cancelled) return;
       try {
         const snapshot = await client.getFeedEvents();
         if (cancelled) return;
+        setEventsError(null);
         const signature = snapshot.text.trim();
-        if (signature !== lastSignature) {
+        if (lastSignature === undefined) {
+          // The first snapshot establishes the cursor. It is the same state
+          // loadFeed just rendered, so fetching it again only adds queue and
+          // TinyCloud connection-pool pressure during initial hydration.
+          lastSignature = signature;
+        } else if (signature !== lastSignature) {
           lastSignature = signature;
           await loadFeed();
         }
@@ -200,8 +414,7 @@ export function App() {
             // Setup restarts; feedState leaves "running" and this loop unwinds.
             return;
           }
-          setLoadState("error");
-          setLoadError(formatHostError(error));
+          setEventsError(formatHostError(error));
         }
       } finally {
         if (!cancelled) timer = window.setTimeout(() => void pollFeedEvents(), FEED_EVENTS_RETRY_MS);
@@ -217,13 +430,35 @@ export function App() {
 
   const connect = async () => {
     setSignInError(null);
+    const loginStartedAt = performance.now();
+    const trace: FeedLoginTrace = {
+      traceId: crypto.randomUUID(),
+      loginStartedAt,
+      systemElapsedBeforeApprovalMs: 0,
+    };
+    loginTrace.current = trace;
+    restoredHostSession.current = false;
+    client.setTraceId(trace.traceId);
+    reportClientEvent("info", "login_clicked", undefined, undefined, { traceId: trace.traceId });
     try {
-      const nextPolicy = policy ?? (await client.getDelegationPolicy());
+      let nextPolicy = policy;
+      if (!nextPolicy) {
+        const policyStartedAt = performance.now();
+        nextPolicy = await client.getDelegationPolicy();
+        trace.systemElapsedBeforeApprovalMs = performance.now() - policyStartedAt;
+        reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
+      }
       setPolicy(nextPolicy);
       resetFeedState();
-      setSession(await signIn(nextPolicy));
+      const nextSession = await signIn(nextPolicy, trace);
+      trace.systemStartedAt = performance.now();
+      reportClientEvent("info", "login_permissions_complete", undefined, nextSession.readerDid, {
+        traceId: trace.traceId,
+        elapsedMs: Math.round(trace.systemStartedAt - trace.loginStartedAt),
+      });
+      setSession(nextSession);
     } catch (error) {
-      reportClientEvent("error", "sign_in_failed", errorDetail(error));
+      reportClientEvent("error", "sign_in_failed", errorDetail(error), undefined, { traceId: trace.traceId });
       setSignInError(error instanceof Error ? error.message : String(error));
     }
   };
@@ -236,24 +471,60 @@ export function App() {
     } finally {
       await signOut().catch(() => undefined);
       setSession(null);
+      restoredHostSession.current = false;
       resetFeedState();
     }
   };
 
-  const sendFeedback = async (projection: FeedItemProjection, signal: FeedbackEvent["signal"]) => {
-    if (!session || feedState !== "running") return;
+  const hydrateArtifact = useCallback(async (projection: FeedItemProjection): Promise<void> => {
+    const hydrate = artifactHydrationQueue.current.catch(() => undefined).then(async () => {
+      const hydrated = await artifactCache.hydrate({ projection, artifact: null });
+      setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+        ? { ...item, artifact: hydrated.artifact, error: hydrated.error ? "This artifact is temporarily unavailable." : undefined }
+        : item));
+    });
+    artifactHydrationQueue.current = hydrate.catch(() => undefined);
+    await hydrate;
+  }, [artifactCache]);
+
+  const sendFeedback = async (
+    projection: FeedItemProjection,
+    signal: FeedbackEvent["signal"],
+    payload?: unknown,
+    attemptKey = `${projection.feedItemId}:${signal}`,
+  ): Promise<boolean> => {
+    if (!session || feedState !== "running") return false;
     const actionId = `${projection.feedItemId}:${signal}`;
+    let attempt = feedbackAttempts.current.get(attemptKey);
+    if (!attempt) {
+      attempt = { eventId: crypto.randomUUID(), readerNonce: newNonce() };
+      feedbackAttempts.current.set(attemptKey, attempt);
+    }
     setBusyAction(actionId);
     try {
       await client.postFeedback({
-        eventId: crypto.randomUUID(),
+        eventId: attempt.eventId,
         target: { kind: "feed_item", feedItemId: projection.feedItemId },
         actorId: session.readerDid,
-        readerNonce: newNonce(),
+        readerNonce: attempt.readerNonce,
         signal,
+        ...(payload === undefined ? {} : { payload }),
         createdAt: new Date().toISOString(),
       });
-      await loadFeed();
+      feedbackAttempts.current.delete(attemptKey);
+      setItems((current) => {
+        if (signal === "hide") return current.filter((item) => item.projection.feedItemId !== projection.feedItemId);
+        if (signal !== "save" && signal !== "unsave") return current;
+        return current.map((item) => item.projection.feedItemId === projection.feedItemId
+          ? { ...item, projection: { ...item.projection, disposition: signal === "save" ? "saved" : "default" } }
+          : item);
+      });
+      void loadFeed();
+      return true;
+    } catch (error) {
+      const status = error instanceof FeedV1HostError ? error.status : "unknown";
+      reportClientEvent("error", "feed_interaction_failed", `signal=${signal} status=${status}`, session.readerDid);
+      return false;
     } finally {
       setBusyAction(null);
     }
@@ -268,16 +539,40 @@ export function App() {
       intentKind: "ask_feed",
       status: "accepted",
       targetRef: "feed",
-      payload: { prompt: "Generate something useful from my latest Listen context." },
+      payload: { prompt: "Generate something useful from my latest authorized context." },
       createdAt: new Date().toISOString(),
     };
     setBusyAction("ask_feed");
     try {
       await client.postControlIntent(event);
+      setCommandStatus("Feed is looking through your latest context.");
+    } catch (error) {
+      const status = error instanceof FeedV1HostError ? error.status : "unknown";
+      reportClientEvent("error", "ask_feed_failed", `status=${status}`, session.readerDid);
+      setCommandStatus("Feed could not start that request. Try again.");
     } finally {
       setBusyAction(null);
     }
   };
+
+  const visibleItems = feedItemsForView(items, activeView);
+  const visibleLoadError = loadError ?? eventsError;
+
+  useEffect(() => {
+    const trace = loginTrace.current;
+    if (!trace || firstContentReported.current === trace.traceId || items.length === 0) return;
+    if (!items.some((item) => item.projection.postBody || item.projection.postTitle || item.artifact)) return;
+    const frame = requestAnimationFrame(() => {
+      firstContentReported.current = trace.traceId;
+      reportClientTiming("login_first_content_visible", {
+        ...trace,
+        phaseStartedAt: trace.systemStartedAt ?? trace.loginStartedAt,
+        actorId: session?.readerDid,
+        detail: "budget_ms=5000 permission_time_excluded=true",
+      });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [items, session?.readerDid]);
 
   if (!restoreDone) {
     return <StatusScreen title="Opening Feed" detail="Checking your saved sign-in." />;
@@ -288,14 +583,15 @@ export function App() {
   }
 
   if (feedState === "idle" || feedState === "starting") {
-    return <SetupScreen stage={setupStage} />;
+    return <SetupScreen stage={setupStage} setup={hostSetup} />;
   }
 
   if (feedState === "error") {
     return (
       <SetupFailurePanel
         error={setupError ?? "Feed could not finish connecting."}
-        onRetry={() => void startFeed()}
+        setup={hostSetup}
+        onRetry={() => void (hostSetup?.state === "failed" ? retryFeedSetup() : startFeed())}
         onSignInAgain={() => void disconnect()}
       />
     );
@@ -304,31 +600,75 @@ export function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
+        <div className="topbar-brand">
           <h1>Feed</h1>
-          <p>For you</p>
+          <p>Private by default</p>
         </div>
+        <nav
+          className="feed-tabs"
+          aria-label="Feed views"
+          role="tablist"
+          onKeyDown={(event) => {
+            if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+            event.preventDefault();
+            const nextView = event.key === "ArrowLeft" || event.key === "Home" ? "for_you" : "saved";
+            setActiveView(nextView);
+            requestAnimationFrame(() => document.getElementById(`feed-tab-${nextView}`)?.focus());
+          }}
+        >
+          <button
+            id="feed-tab-for_you"
+            role="tab"
+            aria-controls="feed-view-panel"
+            aria-selected={activeView === "for_you"}
+            tabIndex={activeView === "for_you" ? 0 : -1}
+            onClick={() => setActiveView("for_you")}
+          >For you</button>
+          <button
+            id="feed-tab-saved"
+            role="tab"
+            aria-controls="feed-view-panel"
+            aria-selected={activeView === "saved"}
+            tabIndex={activeView === "saved" ? 0 : -1}
+            onClick={() => setActiveView("saved")}
+          >Saved</button>
+        </nav>
         <div className="topbar-actions">
-          <span className="identity">{shortAddress(session.address)}</span>
-          <button onClick={() => void loadFeed()}>
-            Refresh
-          </button>
           <button className="primary" onClick={() => void sendAskFeed()} disabled={busyAction === "ask_feed"}>
             Ask Feed
           </button>
-          <button onClick={() => setSettingsOpen((open) => !open)} aria-expanded={settingsOpen}>
-            {settingsOpen ? "Close" : "Access & automation"}
+          <button onClick={() => setMenuOpen((open) => !open)} aria-expanded={menuOpen} aria-haspopup="true" aria-controls="feed-menu">
+            Menu
           </button>
-          <button onClick={() => void disconnect()}>Sign out</button>
         </div>
       </header>
+
+      {menuOpen && (
+        <nav id="feed-menu" className="menu-panel" aria-label="Feed menu">
+          <span className="identity">Signed in as {shortAddress(session.address)}</span>
+          <button onClick={() => void loadFeed()}>Refresh</button>
+          <button onClick={() => {
+            setSettingsOpen((open) => !open);
+            setMenuOpen(false);
+          }} aria-expanded={settingsOpen}>
+            {settingsOpen ? "Close access settings" : "Access & automation"}
+          </button>
+          <button onClick={() => void disconnect()}>Sign out</button>
+        </nav>
+      )}
 
       {settingsOpen && (
         <SkillCredentialsPanel client={client} policy={policy!} onDisconnect={() => void disconnect()} />
       )}
 
-      <main className="content-shell">
-        {loadState === "loading" && loadError === null && (
+      <main
+        id="feed-view-panel"
+        className="content-shell"
+        role="tabpanel"
+        aria-labelledby={`feed-tab-${activeView}`}
+      >
+        {commandStatus && <p className="interaction-status" role="status" aria-live="polite">{commandStatus}</p>}
+        {loadState === "loading" && visibleLoadError === null && (
           <NoticePanel
             tone="info"
             title="Refreshing your Feed"
@@ -336,17 +676,26 @@ export function App() {
           />
         )}
 
-        {loadError !== null && (
-          <FeedFailurePanel error={loadError ?? "The feed could not be loaded."} onRetry={() => void loadFeed()} />
+        {visibleLoadError !== null && (
+          <FeedFailurePanel error={visibleLoadError} onRetry={() => void loadFeed()} />
         )}
 
-        {loadState === "ready" && loadError === null && items.length === 0 && (
-          <EmptyFeedPanel onRetry={() => void loadFeed()} />
+        {loadState === "ready" && visibleLoadError === null && visibleItems.length === 0 && (
+          activeView === "saved"
+            ? <EmptySavedPanel onShowFeed={() => setActiveView("for_you")} />
+            : <EmptyFeedPanel onRetry={() => void loadFeed()} />
         )}
 
         <div className="feed-list">
-          {items.map((item) => (
-            <FeedCard key={item.projection.feedItemId} item={item} busyAction={busyAction} onFeedback={sendFeedback} />
+          {visibleItems.map((item) => (
+            <FeedCard
+              key={item.projection.feedItemId}
+              item={item}
+              busyAction={busyAction}
+              onExpand={hydrateArtifact}
+              onFeedback={sendFeedback}
+              onResetAttempt={(attemptKey) => feedbackAttempts.current.delete(attemptKey)}
+            />
           ))}
         </div>
       </main>
@@ -380,8 +729,16 @@ function SignInScreen({ error, onSignIn }: { error: string | null; onSignIn: () 
   );
 }
 
-function SetupScreen({ stage }: { stage: SetupStage }) {
+function SetupScreen({ stage, setup }: { stage: SetupStage; setup: FeedHostSetupStatus | null }) {
   const contextReady = stage === "preparing";
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!contextReady || setup?.state !== "preparing") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [contextReady, setup?.state]);
+  const elapsedSeconds = setup ? Math.max(0, Math.floor((now - Date.parse(setup.startedAt)) / 1000)) : 0;
+  const activity = setupActivityLabel(setup?.phase);
   return (
     <main className="setup-screen" aria-labelledby="setup-title">
       <header className="setup-header"><strong>Feed</strong></header>
@@ -395,13 +752,26 @@ function SetupScreen({ stage }: { stage: SetupStage }) {
           </li>
           <li className={contextReady ? "complete" : "current"}>
             <span className="progress-mark" aria-hidden="true">{contextReady ? "✓" : ""}</span>
-            <span><strong>Context connected</strong><small>Allowed sources are readable.</small></span>
+            <span>
+              <strong>{contextReady ? "Context connected" : "Connecting context"}</strong>
+              <small>{contextReady ? "Allowed sources are readable." : "Activating secure access with Feed…"}</small>
+            </span>
           </li>
           <li className={contextReady ? "current" : "pending"}>
             <span className="progress-mark" aria-hidden="true" />
             <span><strong>Preparing your first Feed</strong><small>Making useful items now.</small></span>
           </li>
         </ol>
+        {contextReady && setup && (
+          <div className="setup-live" aria-label="Backend setup status">
+            <div className="setup-live-bar" aria-hidden="true"><span /></div>
+            <p>
+              <strong>{activity}</strong>
+              <span>{elapsedSeconds}s</span>
+            </p>
+            <small>Backend phase: {setup.phase.replaceAll("_", " ")} · attempt {setup.attempt}</small>
+          </div>
+        )}
         <p className="setup-help">If anything needs attention, Feed will say what to reconnect.</p>
       </section>
     </main>
@@ -410,10 +780,12 @@ function SetupScreen({ stage }: { stage: SetupStage }) {
 
 function SetupFailurePanel({
   error,
+  setup,
   onRetry,
   onSignInAgain,
 }: {
   error: string;
+  setup: FeedHostSetupStatus | null;
   onRetry: () => void;
   onSignInAgain: () => void;
 }) {
@@ -422,12 +794,31 @@ function SetupFailurePanel({
       <p className="status-label">Feed needs attention</p>
       <h1>We couldn’t finish setting up your Feed.</h1>
       <p>{error}</p>
+      {setup?.state === "failed" && (
+        <details className="setup-error-detail">
+          <summary>Backend details</summary>
+          <p>Phase: {setup.phase} · attempt {setup.attempt}</p>
+          {setup.error?.message && <p>{setup.error.message}</p>}
+        </details>
+      )}
       <div className="panel-actions">
-        <button className="primary" onClick={onRetry}>Try again</button>
+        <button className="primary" onClick={onRetry}>{setup?.state === "failed" ? "Retry backend setup" : "Try again"}</button>
         <button onClick={onSignInAgain}>Sign in again</button>
       </div>
     </main>
   );
+}
+
+function setupActivityLabel(phase: FeedHostSetupStatus["phase"] | undefined): string {
+  switch (phase) {
+    case "bootstrap": return "Preparing secure storage…";
+    case "artifact_check": return "Checking existing artifacts…";
+    case "seed": return "Creating starter items…";
+    case "reconcile": return "Building your Feed…";
+    case "ready": return "Feed is ready";
+    case "failed": return "Backend setup stopped";
+    default: return "Starting the Feed backend…";
+  }
 }
 
 function NoticePanel({
@@ -460,6 +851,18 @@ function EmptyFeedPanel({ onRetry }: { onRetry: () => void }) {
   );
 }
 
+function EmptySavedPanel({ onShowFeed }: { onShowFeed: () => void }) {
+  return (
+    <section className="panel empty-panel" aria-live="polite">
+      <h2>No saved posts yet.</h2>
+      <p>Save anything you want to return to. It will stay here without changing your main Feed.</p>
+      <div className="panel-actions">
+        <button onClick={onShowFeed}>Browse your Feed</button>
+      </div>
+    </section>
+  );
+}
+
 function FeedFailurePanel({ error, onRetry }: { error: string; onRetry: () => void }) {
   return (
     <section className="panel failure-panel" role="alert">
@@ -478,96 +881,204 @@ function FeedFailurePanel({ error, onRetry }: { error: string; onRetry: () => vo
 function FeedCard({
   item,
   busyAction,
+  onExpand,
   onFeedback,
+  onResetAttempt,
 }: {
   item: FeedItem;
   busyAction: string | null;
-  onFeedback: (projection: FeedItemProjection, signal: FeedbackEvent["signal"]) => Promise<void>;
+  onExpand: (projection: FeedItemProjection) => Promise<void>;
+  onFeedback: (
+    projection: FeedItemProjection,
+    signal: FeedbackEvent["signal"],
+    payload?: unknown,
+    attemptKey?: string,
+  ) => Promise<boolean>;
+  onResetAttempt: (attemptKey: string) => void;
 }) {
+  const [artifactLoading, setArtifactLoading] = useState(false);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [note, setNote] = useState("");
+  const [noteAttemptKey, setNoteAttemptKey] = useState(() => crypto.randomUUID());
+  const [interactionStatus, setInteractionStatus] = useState<string | null>(null);
+  const cardRef = useRef<HTMLElement>(null);
   const artifact = item.artifact;
-  const isPost = Boolean(item.projection.postBody);
+  const post = projectedPost(item);
+  const provenance = readableProvenance(item);
+  const availability = feedItemAvailability(item);
+  const isSaved = item.projection.disposition === "saved";
+  const isPost = item.projection.target.kind === "post" || Boolean(item.projection.postBody);
+  const title = item.projection.postTitle ?? post?.title ?? artifact?.title;
   const expansionSection = artifact ? artifactExpansionSection(artifact, item.projection.sectionRef) : undefined;
-  const expansionAnchorId = expansionSection
-    ? `artifact-section-${encodeURIComponent(item.projection.feedItemId)}-${encodeURIComponent(expansionSection.sectionId)}`
-    : undefined;
+  const loadArtifact = async () => {
+    if (artifact || artifactLoading) return;
+    setArtifactLoading(true);
+    await onExpand(item.projection);
+    setArtifactLoading(false);
+  };
+  useEffect(() => {
+    const element = cardRef.current;
+    if (!element || artifact || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting)) return;
+      observer.disconnect();
+      void loadArtifact();
+    }, { rootMargin: "300px 0px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [artifact, item.projection.feedItemId]);
+  const act = async (signal: FeedbackEvent["signal"]) => {
+    setInteractionStatus(null);
+    const ok = await onFeedback(item.projection, signal);
+    setInteractionStatus(ok ? feedbackSuccessLabel(signal) : "That change did not go through. Try again.");
+  };
   return (
-    <article className={item.projection.disposition === "hidden" ? "feed-card hidden-card" : "feed-card"}>
+    <article ref={cardRef} className="feed-card">
       <div className="card-meta">
-        <span>{artifact?.artifactType ?? "artifact"}</span>
-        <span>{projectionLabel(item.projection)}</span>
+        <span>{readablePostKind(item)}</span>
+        <span>{readableFeedTime(item.projection.publishedAt)}</span>
       </div>
-      <h2>{item.projection.postTitle ?? artifact?.title ?? item.projection.target.artifactId}</h2>
+      {title && <h2>{title}</h2>}
+      {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
       {isPost ? (
         <>
-          <p className="post-body">{item.projection.postBody}</p>
+          <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
+            ? "This post’s preview is temporarily unavailable."
+            : "Loading this post…")}</p>
           <details
             className="artifact-expansion"
-            onToggle={(event) => {
-              if (event.currentTarget.open && expansionAnchorId) {
-                requestAnimationFrame(() => document.getElementById(expansionAnchorId)?.focus());
-              }
-            }}
+            onToggle={(event) => event.currentTarget.open && void loadArtifact()}
           >
-            <summary>Open full artifact</summary>
+            <summary>Open complete artifact</summary>
             <div className="artifact-content">
-              <p className="artifact-label">From {artifact?.title ?? item.projection.target.artifactId}</p>
+              {artifactLoading && <p role="status" aria-live="polite">Loading the complete artifact…</p>}
+              {item.error && <p className="availability-message">{item.error} You can retry by closing and opening this section.</p>}
+              {artifact && <p className="artifact-label">From {artifact.title}</p>}
               {artifact?.summary && <p className="summary">{artifact.summary}</p>}
-              {expansionSection && (
-                <section id={expansionAnchorId} className="artifact-section" aria-label="Relevant section" tabIndex={-1}>
-                  <strong>{expansionSection.title ?? "Related section"}</strong>
-                  <p>{expansionSection.text}</p>
-                </section>
-              )}
-              <pre>{bodyPreview(artifact)}</pre>
+              {artifact && <ArtifactBody body={artifact.body} targetSection={expansionSection} />}
             </div>
           </details>
         </>
       ) : (
-        <>
-          {artifact?.summary && <p className="summary">{artifact.summary}</p>}
-          <pre>{bodyPreview(artifact)}</pre>
-        </>
+        <details className="artifact-expansion" onToggle={(event) => event.currentTarget.open && void loadArtifact()}>
+          <summary>Open artifact</summary>
+          <div className="artifact-content">
+            {artifactLoading && <p role="status" aria-live="polite">Loading the artifact…</p>}
+            {item.error && <p className="availability-message">{item.error}</p>}
+            {artifact?.summary && <p className="summary">{artifact.summary}</p>}
+            {artifact && <ArtifactBody body={artifact.body} targetSection={expansionSection} />}
+          </div>
+        </details>
       )}
-      {item.error && <p className="error">Hydration failed: {item.error}</p>}
-      <dl className="provenance">
-        <div>
-          <dt>Made by</dt>
-          <dd>Feed</dd>
-        </div>
-        <div>
-          <dt>Freshness</dt>
-          <dd>{artifact?.freshness.label ?? item.projection.freshnessLabel}</dd>
-        </div>
-        <div>
-          <dt>Source</dt>
-          <dd>{artifact?.sourceRefs.length ?? 1} Listen conversation{(artifact?.sourceRefs.length ?? 1) === 1 ? "" : "s"}</dd>
-        </div>
-      </dl>
+      <details className="why-this" onToggle={(event) => event.currentTarget.open && void loadArtifact()}>
+        <summary>Why this?</summary>
+        <dl className="provenance">
+          <div><dt>Made by</dt><dd>{provenance.madeBy}</dd></div>
+          <div><dt>Sources</dt><dd>{provenance.sourceSummary}</dd></div>
+          <div><dt>Freshness</dt><dd>{provenance.freshnessSummary}</dd></div>
+          {post && <div><dt>Evidence</dt><dd>{post.evidence.length} linked item{post.evidence.length === 1 ? "" : "s"}</dd></div>}
+        </dl>
+        {provenance.workflowSummary && <p>{provenance.workflowSummary}</p>}
+        <details className="advanced-details">
+          <summary>Advanced details for debugging</summary>
+          <code>Feed item: {item.projection.feedItemId}</code>
+          <code>Artifact: {item.projection.target.artifactId}</code>
+          <code>Source fingerprint: {item.projection.sourceFingerprint}</code>
+        </details>
+      </details>
       <div className="card-actions">
-        {(["save", "hide", "helpful", "unhelpful", "show_fewer"] as const).map((signal) => (
+        <div className="card-actions-primary">
           <button
-            key={signal}
-            disabled={busyAction === `${item.projection.feedItemId}:${signal}`}
-            onClick={() => void onFeedback(item.projection, signal)}
+            disabled={busyAction === `${item.projection.feedItemId}:${isSaved ? "unsave" : "save"}`}
+            onClick={() => void act(isSaved ? "unsave" : "save")}
           >
-            {feedbackLabel(signal)}
+            {isSaved ? "Saved" : "Save"}
           </button>
-        ))}
+          <button disabled={busyAction === `${item.projection.feedItemId}:helpful`} onClick={() => void act("helpful")}>Helpful</button>
+          <button onClick={() => setNoteOpen((open) => !open)} aria-expanded={noteOpen}>Add note</button>
+        </div>
+        <div className="card-actions-secondary">
+          <button disabled={busyAction === `${item.projection.feedItemId}:unhelpful`} onClick={() => void act("unhelpful")}>Not helpful</button>
+          <button disabled={busyAction === `${item.projection.feedItemId}:show_fewer`} onClick={() => void act("show_fewer")}>Show fewer like this</button>
+          <button disabled={busyAction === `${item.projection.feedItemId}:hide`} onClick={() => void act("hide")}>Hide</button>
+        </div>
       </div>
+      {noteOpen && (
+        <form className="note-form" onSubmit={(event) => {
+          event.preventDefault();
+          const trimmed = note.trim();
+          if (!trimmed) return;
+          setInteractionStatus(null);
+          void onFeedback(item.projection, "text_note", { note: trimmed }, noteAttemptKey).then((ok) => {
+            if (ok) {
+              setNote("");
+              setNoteOpen(false);
+              setNoteAttemptKey(crypto.randomUUID());
+              setInteractionStatus("Note saved.");
+            } else {
+              setInteractionStatus("Your note was not saved. Try again.");
+            }
+          });
+        }}>
+          <label htmlFor={`note-${item.projection.feedItemId}`}>Private note</label>
+          <textarea
+            id={`note-${item.projection.feedItemId}`}
+            value={note}
+            maxLength={1024}
+            onChange={(event) => {
+              setNote(event.target.value);
+              // Editing creates a new payload; an immediate retry keeps the
+              // current key so its event id and reader nonce stay stable.
+              onResetAttempt(noteAttemptKey);
+              setNoteAttemptKey(crypto.randomUUID());
+            }}
+          />
+          <div className="note-meta"><span>Only you can see this note.</span><span>{note.length}/1024</span></div>
+          <div className="panel-actions">
+            <button type="submit" className="primary" disabled={!note.trim() || busyAction === `${item.projection.feedItemId}:text_note`}>Save note</button>
+            <button type="button" onClick={() => {
+              onResetAttempt(noteAttemptKey);
+              setNoteAttemptKey(crypto.randomUUID());
+              setNoteOpen(false);
+              setNote("");
+            }}>Cancel</button>
+          </div>
+        </form>
+      )}
+      {interactionStatus && (
+        <p className={`interaction-status${interactionStatus.includes("not") || interactionStatus.includes("did not") ? " error" : ""}`} role="status" aria-live="polite">
+          {interactionStatus}
+        </p>
+      )}
     </article>
   );
 }
 
-function feedbackLabel(signal: FeedbackEvent["signal"]): string {
+function availabilityMessage(availability: ReturnType<typeof feedItemAvailability>, hasArtifact: boolean): string {
+  if (availability === "source_revoked") {
+    return hasArtifact
+      ? "This source is disconnected. You can still read this saved artifact, but Feed cannot refresh it."
+      : "This source is disconnected, so Feed cannot refresh this item.";
+  }
+  if (availability === "source_unavailable") {
+    return hasArtifact
+      ? "The source is temporarily unavailable. This previously made artifact is still readable."
+      : "The source is temporarily unavailable. Try opening this item again later.";
+  }
+  if (availability === "artifact_unavailable") return "The complete artifact is temporarily unavailable. This post remains readable.";
+  return "";
+}
+
+function feedbackSuccessLabel(signal: FeedbackEvent["signal"]): string {
   switch (signal) {
-    case "save": return "Save";
-    case "hide": return "Hide";
-    case "helpful": return "Helpful";
-    case "unhelpful": return "Not helpful";
-    case "show_fewer": return "Less like this";
-    case "unsave": return "Remove from saved";
-    case "unhide": return "Show again";
-    case "text_note": return "Add note";
+    case "save": return "Saved.";
+    case "unsave": return "Removed from saved.";
+    case "hide": return "Hidden from your Feed.";
+    case "helpful": return "Marked helpful.";
+    case "unhelpful": return "Thanks. Feed will use that feedback.";
+    case "show_fewer": return "Feed will show fewer posts like this.";
+    case "unhide": return "Returned to your Feed.";
+    case "text_note": return "Note saved.";
   }
 }
 
@@ -590,8 +1101,14 @@ function StatusScreen({
 }
 
 function formatHostError(error: unknown): string {
-  if (error instanceof FeedV1HostError) return `${error.status}: ${error.body || error.message}`;
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof FeedV1HostError) {
+    if (error.status === 401 || error.status === 403) return "Your Feed connection needs to be refreshed.";
+    if (error.status === 404) return "This item is no longer available.";
+    if (error.status === 409) return "This changed elsewhere. Refresh and try again.";
+    if (error.status === 424) return "The original source is currently unavailable.";
+    if (error.status >= 500) return "Feed is temporarily unavailable. Try again shortly.";
+  }
+  return "Feed could not complete that request. Check your connection and try again.";
 }
 
 // The host reports a missing/stale delegation as 403 insufficient_policy or
@@ -662,14 +1179,17 @@ function SkillCredentialsPanel({
   ) => {
     setBusySkillId(skillId);
     try {
-      await client.patchSkillCredentials(skillId, {
+      const result = await client.patchSkillCredentials(skillId, {
         expectedVersion,
         credentialMode: mode,
         providerId,
         secretRef,
       });
+      setSkills((current) => {
+        const next = current.filter((skill) => skill.skillId !== result.skill.skillId);
+        return [...next, result.skill].sort((left, right) => left.skillId.localeCompare(right.skillId));
+      });
       onSuccess?.();
-      await reload();
     } catch (error) {
       setLoadError(formatHostError(error));
     } finally {

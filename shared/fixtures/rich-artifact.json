@@ -6,7 +6,34 @@
   "title": "The onboarding experiment changed where users stall",
   "summary": "A rich brief with two independently rankable Feed posts.",
   "body": {
-    "markdown": "# Weekly product brief\n\nThe complete analysis remains type-specific and expands from either post."
+    "markdown": "# Weekly product brief\n\nThe complete analysis remains type-specific and expands from either post.",
+    "sections": [
+      {
+        "sectionId": "activation-shift",
+        "title": "Where activation now stalls",
+        "text": "Setup completion improved, moving the main drop-off to the first collaborative action."
+      },
+      {
+        "sectionId": "invite-preview",
+        "title": "A reversible next test",
+        "text": "Test an invite preview inside setup before adding another onboarding step."
+      }
+    ]
+  },
+  "renderHints": {
+    "sectionIds": ["activation-shift", "invite-preview"],
+    "sectionTargets": [
+      {
+        "sectionId": "activation-shift",
+        "title": "Where activation now stalls",
+        "bodyPath": "/sections/0"
+      },
+      {
+        "sectionId": "invite-preview",
+        "title": "A reversible next test",
+        "bodyPath": "/sections/1"
+      }
+    ]
   },
   "sourceRefs": [
     {
@@ -55,7 +82,8 @@
         }
       ],
       "expansionTarget": {
-        "artifactId": "artifact-weekly-product-brief"
+        "artifactId": "artifact-weekly-product-brief",
+        "sectionId": "activation-shift"
       }
     },
     {
@@ -79,7 +107,8 @@
         }
       ],
       "expansionTarget": {
-        "artifactId": "artifact-weekly-product-brief"
+        "artifactId": "artifact-weekly-product-brief",
+        "sectionId": "invite-preview"
       }
     }
   ],

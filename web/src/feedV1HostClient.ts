@@ -7,7 +7,9 @@ import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../../sha
 import type {
   FeedHostDelegationPolicy,
   FeedHostDelegationReceipt,
+  FeedHostDelegationStatus,
   FeedHostDelegationSubmission,
+  FeedHostSetupStatus,
 } from "./delegation.ts";
 import type { ChildInputAuthoritySubmission } from "./inputAuthority.ts";
 
@@ -87,6 +89,7 @@ export type FeedV1HostClientOptions = {
   baseUrl: string;
   token?: string;
   actorId?: string;
+  traceId?: string;
   fetchImpl?: typeof fetch;
 };
 
@@ -112,12 +115,18 @@ export class FeedV1HostClient {
   private readonly fetchImpl: typeof fetch;
   private readonly token?: string;
   private readonly actorId?: string;
+  private traceId?: string;
 
   constructor(options: FeedV1HostClientOptions) {
     this.baseUrl = normalizeBaseUrl(options.baseUrl);
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     this.token = options.token;
     this.actorId = options.actorId;
+    this.traceId = options.traceId;
+  }
+
+  setTraceId(traceId?: string): void {
+    this.traceId = traceId;
   }
 
   async getDelegationPolicy(): Promise<FeedHostDelegationPolicy> {
@@ -129,6 +138,14 @@ export class FeedV1HostClient {
       method: "POST",
       body: JSON.stringify(submission),
     });
+  }
+
+  async getDelegationStatus(): Promise<FeedHostDelegationStatus> {
+    return this.request<FeedHostDelegationStatus>("/api/delegations/status");
+  }
+
+  async retrySetup(): Promise<{ accepted: true; actorId: string; setup: FeedHostSetupStatus }> {
+    return this.request("/api/delegations/retry", { method: "POST" });
   }
 
   async disconnectFeed(): Promise<void> {
@@ -230,6 +247,7 @@ export class FeedV1HostClient {
     if (init.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json");
     if (this.token) headers.set("authorization", `Bearer ${this.token}`);
     if (this.actorId) headers.set("x-feed-actor-id", this.actorId);
+    if (this.traceId) headers.set("x-feed-trace-id", this.traceId);
     const res = await this.fetchImpl(`${this.baseUrl}${path}`, { ...init, headers, credentials: "include" });
     const text = await res.text();
     if (!res.ok) throw new FeedV1HostError(`Feed Host request failed: ${res.status}`, res.status, text);

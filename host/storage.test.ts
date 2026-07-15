@@ -12,6 +12,7 @@ import {
   FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL,
   FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL,
   FEED_POST_MIGRATION,
+  FEED_GENERATION_WORKER_MIGRATION,
   withFeedHostMigrations,
 } from "./feed-schema.ts";
 
@@ -99,13 +100,14 @@ test("bootstraps schema with per-migration batches when migrations.apply cannot 
   expect(artifactLog?.applies).toBe(1);
   expect(feedLog?.applies).toBe(1);
   expect(artifactLog?.batches.length).toBe(1);
-  expect(feedLog?.batches.length).toBe(2);
+  expect(feedLog?.batches.length).toBe(3);
   expect(artifactLog?.batches[0]?.length).toBe(7);
   expect(feedLog?.batches[0]?.length).toBe(6);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(feedLog?.batches[1]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
   expect(feedLog?.batches[1]?.some((statement) => statement.sql.includes("CREATE TABLE IF NOT EXISTS feed_targeted_interaction_event"))).toBe(true);
+  expect(feedLog?.batches[2]?.some((statement) => statement.sql.includes("ADD COLUMN fencing_token"))).toBe(true);
   expect(artifactLog?.executes.length).toBe(0);
   expect(feedLog?.executes.length).toBe(2);
   expect(feedLog?.executes[0]).toContain("ON CONFLICT(feed_item_id) DO UPDATE");
@@ -121,6 +123,7 @@ test("converges with the canonical post migration without duplicating it", () =>
   expect(merged.map((migration) => migration.id)).toEqual([
     "001_feed_index",
     "002_post_feed_items",
+    "003_generation_worker_control",
   ]);
   expect(merged.filter((migration) => migration.id === "002_post_feed_items")).toHaveLength(1);
   expect(merged.find((migration) => migration.id === "002_post_feed_items")?.description).toBe(
@@ -128,6 +131,9 @@ test("converges with the canonical post migration without duplicating it", () =>
   );
   expect(FEED_POST_MIGRATION.sql.join("\n")).toContain("'legacy:' || artifact_id");
   expect(FEED_POST_MIGRATION.sql.every((sql) => !sql.startsWith("ALTER TABLE"))).toBe(true);
+  expect(FEED_GENERATION_WORKER_MIGRATION.sql).toContain(
+    "ALTER TABLE generation_request ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+  );
 });
 
 test("reconciliation is monotonic, repairs both rollout directions, and closes the parity gate", () => {
@@ -235,6 +241,47 @@ test("hydrates corrupt artifact docs defensively and audits invalid fixtures", a
   }
 });
 
+test("lists feed projections without hydrating artifact documents", async () => {
+  const artifact = {
+    artifact_id: "temporarily-unavailable",
+    artifact_type: "insight_card",
+    package_id: "pkg-timeout",
+    source_fingerprint: "sha256:timeout",
+    doc_key: "listen-import/timeout.json",
+    published_at: "2026-07-14T12:00:00.000Z",
+    updated_at: "2026-07-14T12:00:00.000Z",
+  };
+  const actor = makeHydrationActor({
+    artifacts: [artifact],
+    docs: {},
+    projections: [{
+      feed_item_id: artifact.artifact_id,
+      target_kind: "artifact_preview",
+      artifact_id: artifact.artifact_id,
+      post_id: null,
+      rank_score: 1,
+      disposition: "default",
+      visibility: "visible",
+      freshness_label: "fresh",
+      reason_codes_json: "[]",
+      package_id: artifact.package_id,
+      source_fingerprint: artifact.source_fingerprint,
+      published_at: artifact.published_at,
+      updated_at: artifact.updated_at,
+    }],
+  });
+
+  const storage = new FeedHostStorage();
+  const page = await storage.listFeed(actor, { limit: 40 });
+  expect(page.items).toHaveLength(1);
+  expect(page.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+
+  const refreshedAccess = makeHydrationActor({ artifacts: [], docs: {}, projections: [] });
+  const cachedPage = await storage.listFeed(refreshedAccess, { limit: 40 });
+  expect(cachedPage.items).toHaveLength(1);
+  expect(cachedPage.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+});
+
 test("rejects feedback for a missing artifact before writing either interaction table", async () => {
   const storage = new FeedHostStorage();
   const actor = makeHydrationActor({ artifacts: [], docs: {} });
@@ -264,6 +311,7 @@ function makeHydrationActor(input: {
     updated_at: string;
   }>;
   docs: Record<string, unknown>;
+  projections?: Record<string, unknown>[];
 }): FeedHostActorStorage {
   const docs = new Map(Object.entries(input.docs));
 
@@ -301,6 +349,15 @@ function makeHydrationActor(input: {
             data: {
               columns: [],
               rows: [],
+            },
+          };
+        }
+        if (path === FEED_HOST_FEED_DB_PATH && sql.includes("FROM feed_item_projection")) {
+          return {
+            ok: true,
+            data: {
+              columns: [],
+              rows: input.projections ?? [],
             },
           };
         }
@@ -393,11 +450,11 @@ test("bootstraps legacy rows when the actor can read the old SQL resources", asy
   const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
   expect(artifactLog?.batches.length).toBe(2);
-  expect(feedLog?.batches.length).toBe(3);
+  expect(feedLog?.batches.length).toBe(4);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(artifactLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO artifact_index");
-  expect(feedLog?.batches[2]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
+  expect(feedLog?.batches[3]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
 });
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {
