@@ -51,6 +51,12 @@ type RoutineDraft = {
 };
 
 const FEED_EVENTS_RETRY_MS = 15_000;
+// The x-feed-trace-id request header is only understood by Feed Hosts that
+// allowlist it in CORS; a host running an older build rejects EVERY request
+// at preflight when the browser asks for it. Keep it opt-in until the
+// deployed host is known to accept it. Trace ids still flow via client-event
+// bodies either way.
+const TRACE_HEADER_ENABLED = import.meta.env.VITE_FEED_TRACE_HEADER === "1";
 const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
 const DEFAULT_ROUTINE_DRAFT: RoutineDraft = {
@@ -123,7 +129,7 @@ export function App() {
         systemStartedAt: startedAt,
       };
       loginTrace.current = trace;
-      client.setTraceId(trace.traceId);
+      if (TRACE_HEADER_ENABLED) client.setTraceId(trace.traceId);
       const policyStartedAt = performance.now();
       const nextPolicy = await client.getDelegationPolicy();
       reportClientTiming("login_policy_received", { ...trace, phaseStartedAt: policyStartedAt });
@@ -451,7 +457,7 @@ export function App() {
     };
     loginTrace.current = trace;
     restoredHostSession.current = false;
-    client.setTraceId(trace.traceId);
+    if (TRACE_HEADER_ENABLED) client.setTraceId(trace.traceId);
     reportClientEvent("info", "login_clicked", undefined, undefined, { traceId: trace.traceId });
     try {
       let nextPolicy = policy;
