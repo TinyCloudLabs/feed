@@ -1,8 +1,8 @@
 :root {
   color-scheme: light;
   font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  background: #f5f6f7;
-  color: #15171a;
+  background: var(--bg);
+  color: var(--ink);
   font-synthesis: none;
   line-height: 1.5;
   --ink: #15171a;
@@ -14,6 +14,57 @@
   --soft: #f0f2f4;
   --focus: #2854d7;
   --danger: #a32626;
+  --bg: #f5f6f7;
+  --hover: #f7f8f9;
+  --input-border: #bfc6cd;
+  --mid-border: #aeb6be;
+  --strong-border: #7d8791;
+  --primary: #2b2f34;
+  --on-primary: #ffffff;
+  --success: #246b46;
+  --text-1: #25292e;
+  --text-2: #3f4851;
+  --text-3: #343a41;
+  --danger-text: #7e2020;
+  --danger-border: #e4b8b8;
+  --danger-strong-border: #c98585;
+  --danger-soft: #fff7f7;
+  --warn-border: #e4c49f;
+  --warn-soft: #fffaf4;
+}
+
+/* Dark theme: warm near-black with cream ink, following the feed dark
+   design pass. Only tokens change; component rules stay identical. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --ink: #ece7dd;
+    --muted: #a8a294;
+    --quiet: #9c968a;
+    --line: #2e2e33;
+    --soft-line: #242428;
+    --surface: #161618;
+    --soft: #1e1e21;
+    --focus: #8fadff;
+    --danger: #e59a9a;
+    --bg: #0b0b0c;
+    --hover: #1b1b1e;
+    --input-border: #43434b;
+    --mid-border: #50505a;
+    --strong-border: #6e6e78;
+    --primary: #e8e2d5;
+    --on-primary: #16161a;
+    --success: #79c79c;
+    --text-1: #ded9cd;
+    --text-2: #c9c3b6;
+    --text-3: #d3cdc0;
+    --danger-text: #eda9a9;
+    --danger-border: #5c3434;
+    --danger-strong-border: #7a4646;
+    --danger-soft: #251617;
+    --warn-border: #6a5533;
+    --warn-soft: #211a0f;
+  }
 }
 
 * {
@@ -24,7 +75,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background: #f5f6f7;
+  background: var(--bg);
 }
 
 button,
@@ -35,7 +86,7 @@ textarea {
 
 button {
   min-height: 44px;
-  border: 1px solid #bfc6cd;
+  border: 1px solid var(--input-border);
   border-radius: 10px;
   background: var(--surface);
   color: var(--ink);
@@ -45,8 +96,8 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color: #7d8791;
-  background: #f7f8f9;
+  border-color: var(--strong-border);
+  background: var(--hover);
 }
 
 button:active:not(:disabled) {
@@ -69,13 +120,13 @@ button:disabled {
 .primary {
   border-color: var(--ink);
   background: var(--ink);
-  color: #fff;
+  color: var(--on-primary);
   font-weight: 650;
 }
 
 .primary:hover:not(:disabled) {
-  border-color: #2b2f34;
-  background: #2b2f34;
+  border-color: var(--primary);
+  background: var(--primary);
 }
 
 .signin-screen,
@@ -138,10 +189,10 @@ button:disabled {
 
 .reconnect-message {
   padding: 12px 14px;
-  border: 1px solid #e4b8b8;
+  border: 1px solid var(--danger-border);
   border-radius: 10px;
-  background: #fff7f7;
-  color: #7e2020 !important;
+  background: var(--danger-soft);
+  color: var(--danger-text) !important;
 }
 
 .signin-access {
@@ -171,7 +222,7 @@ button:disabled {
 
 .signin-access li::before {
   content: "✓";
-  color: #246b46;
+  color: var(--success);
   font-weight: 700;
 }
 
@@ -216,16 +267,16 @@ button:disabled {
   place-items: center;
   width: 32px;
   height: 32px;
-  border: 1px solid #aeb6be;
+  border: 1px solid var(--mid-border);
   border-radius: 50%;
   background: var(--surface);
-  color: #fff;
+  color: var(--on-primary);
   font-weight: 800;
 }
 
 .setup-progress .complete .progress-mark {
-  border-color: #246b46;
-  background: #246b46;
+  border-color: var(--success);
+  background: var(--success);
 }
 
 .setup-progress .current .progress-mark {
@@ -503,13 +554,13 @@ button:disabled {
 }
 
 .warning-panel {
-  border-color: #e4c49f;
-  background: #fffaf4;
+  border-color: var(--warn-border);
+  background: var(--warn-soft);
 }
 
 .failure-panel {
-  border-color: #e4b8b8;
-  background: #fff7f7;
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .failure-panel p,
@@ -557,13 +608,13 @@ button:disabled {
 
 .summary {
   max-width: 68ch;
-  color: #3f4851;
+  color: var(--text-2);
 }
 
 .post-body {
   max-width: 64ch;
   margin: 10px 0 16px;
-  color: #25292e;
+  color: var(--text-1);
   font-size: 1.04rem;
   line-height: 1.58;
   text-wrap: pretty;
@@ -613,7 +664,7 @@ button:disabled {
 
 .artifact-section p {
   margin: 5px 0 0;
-  color: #343a41;
+  color: var(--text-3);
 }
 
 .artifact-complete {
@@ -671,7 +722,7 @@ button:disabled {
 }
 
 .interaction-status.error {
-  background: #fff7f7;
+  background: var(--danger-soft);
 }
 
 .why-this {
@@ -739,7 +790,7 @@ button:disabled {
   width: 100%;
   min-height: 104px;
   resize: vertical;
-  border: 1px solid #9aa4ae;
+  border: 1px solid var(--mid-border);
   border-radius: 8px;
   background: var(--surface);
   color: var(--ink);
@@ -765,7 +816,7 @@ button:disabled {
 
 .provenance dd {
   margin: 2px 0 0;
-  color: #343a41;
+  color: var(--text-3);
   font-size: 14px;
 }
 
@@ -773,7 +824,7 @@ button:disabled {
   display: grid;
   gap: 18px;
   margin: 18px 22px 0;
-  background: #f8f9fa;
+  background: var(--hover);
 }
 
 .skill-list {
@@ -824,7 +875,7 @@ button:disabled {
 }
 
 .danger-button {
-  border-color: #c98585;
+  border-color: var(--danger-strong-border);
   color: var(--danger);
 }
 
@@ -866,7 +917,7 @@ button:disabled {
 .skill-actions select {
   min-height: 44px;
   min-width: 210px;
-  border: 1px solid #bfc6cd;
+  border: 1px solid var(--input-border);
   border-radius: 8px;
   background: var(--surface);
   color: var(--ink);
@@ -884,7 +935,7 @@ button:disabled {
 .routine-purpose {
   max-width: 62ch;
   margin: 0;
-  color: #3f4851;
+  color: var(--text-2);
 }
 
 .routine-example {
