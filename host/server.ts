@@ -734,12 +734,20 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     if (cursor !== undefined && cursor !== "" && !/^\d+$/.test(cursor)) {
       throw new FeedHostError("cursor must be a non-negative integer offset", 400, "bad_request");
     }
-    const page = await storage.listFeed(actorStorage(actor), { limit, cursor });
-    if (page.items.length === 0 && seedOnStart && actor.preparation?.state !== "ready") {
+    // A fresh space has no schema yet, so the lightweight read can fail with
+    // "no such table" before it can return an empty page — treat that the
+    // same as an empty first read and run preparation before retrying.
+    let page: Awaited<ReturnType<typeof storage.listFeed>> | undefined;
+    try {
+      page = await storage.listFeed(actorStorage(actor), { limit, cursor });
+    } catch (error) {
+      if (!isMissingSchemaError(error) || actor.preparation?.state === "ready") throw error;
+    }
+    if ((!page || page.items.length === 0) && seedOnStart && actor.preparation?.state !== "ready") {
       await ensureActorReady(storage, actor, seedOnStart);
       return json(await storage.listFeed(actorStorage(actor), { limit, cursor }));
     }
-    return json(page);
+    return json(page ?? (await storage.listFeed(actorStorage(actor), { limit, cursor })));
   }
 
   if (request.method === "GET" && url.pathname === "/feed/events") {
@@ -1455,6 +1463,11 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
     legacyInteractions: actor.accessByResource.get(LEGACY_INTERACTIONS_DB_PATH),
   };
   return actor.storageAccess;
+}
+
+function isMissingSchemaError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no such table|does not exist|undefined table/i.test(message);
 }
 
 async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, seedOnStart: boolean): Promise<void> {
