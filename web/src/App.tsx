@@ -3,7 +3,7 @@ import type {
   ControlIntentEvent,
   FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
-import { artifactExpansionSection, type FeedItemProjection } from "../../shared/feed-item.ts";
+import { artifactExpansionSection, type FeedItemProjection, type FeedPost } from "../../shared/feed-item.ts";
 import { ArtifactBody } from "./ArtifactBody.tsx";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
@@ -497,14 +497,32 @@ export function App() {
 
   const hydrateArtifact = useCallback(async (projection: FeedItemProjection): Promise<void> => {
     const hydrate = artifactHydrationQueue.current.catch(() => undefined).then(async () => {
-      const hydrated = await artifactCache.hydrate({ projection, artifact: null });
-      setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
-        ? { ...item, artifact: hydrated.artifact, error: hydrated.error ? "This artifact is temporarily unavailable." : undefined }
-        : item));
+      try {
+        const artifact = await artifactCache.load(projection.target.artifactId);
+        setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+          ? { ...item, artifact, error: undefined }
+          : item));
+      } catch (error) {
+        // Authority rejected mid-session: re-submit the delegation instead of
+        // letting every card decay into "unavailable" until a manual sign-in.
+        // The cooldown inside recoverDelegation keeps a burst of failing
+        // hydrations from re-triggering it.
+        if (isDelegationLostError(error) && (await recoverDelegation())) return;
+        const permanent = error instanceof FeedV1HostError && error.status === 424;
+        setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+          ? {
+              ...item,
+              artifact: null,
+              error: permanent
+                ? "This artifact is no longer available."
+                : "This artifact is temporarily unavailable.",
+            }
+          : item));
+      }
     });
     artifactHydrationQueue.current = hydrate.catch(() => undefined);
     await hydrate;
-  }, [artifactCache]);
+  }, [artifactCache, recoverDelegation]);
 
   const sendFeedback = async (
     projection: FeedItemProjection,
@@ -928,6 +946,11 @@ function FeedCard({
   const isSaved = item.projection.disposition === "saved";
   const isPost = item.projection.target.kind === "post" || Boolean(item.projection.postBody);
   const title = item.projection.postTitle ?? post?.title ?? artifact?.title;
+  // First verified quote reads as a distillery-style pull on the card face.
+  const pullQuote = post?.evidence.find(
+    (entry): entry is Extract<FeedPost["evidence"][number], { kind: "verified_quote" }> =>
+      entry.kind === "verified_quote",
+  );
   const expansionSection = artifact ? artifactExpansionSection(artifact, item.projection.sectionRef) : undefined;
   const loadArtifact = async () => {
     if (artifact || artifactLoading) return;
@@ -964,6 +987,15 @@ function FeedCard({
           <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
             ? "This post’s preview is temporarily unavailable."
             : "Loading this post…")}</p>
+          {pullQuote && (
+            <blockquote className="pull">
+              <p>&ldquo;{pullQuote.quote}&rdquo;</p>
+              <cite>
+                {pullQuote.sourceRefId}
+                {pullQuote.loc ? ` · ${pullQuote.loc}` : ""} · verified
+              </cite>
+            </blockquote>
+          )}
           <details
             className="artifact-expansion"
             onToggle={(event) => event.currentTarget.open && void loadArtifact()}

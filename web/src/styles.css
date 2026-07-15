@@ -1239,3 +1239,139 @@ summary:focus-visible {
   line-height: 1.6;
   color: var(--text-2);
 }
+
+/* ===== Editorial artifact rendering (distillery card anatomy) ===== */
+
+/* Pull quote: red left rule, serif italic, mono cite. */
+.pull {
+  margin: 14px 0 4px;
+  padding: 2px 0 2px 16px;
+  border-left: 2px solid var(--accent);
+}
+
+.pull p {
+  margin: 0;
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 17px;
+  line-height: 1.45;
+  color: var(--ink);
+  max-width: 56ch;
+}
+
+.pull cite {
+  display: block;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--quiet);
+}
+
+/* Markdown prose inside artifacts: serif headings, readable measure. */
+.artifact-prose {
+  max-width: 62ch;
+}
+
+.artifact-prose h1,
+.artifact-prose h2,
+.artifact-prose h3,
+.artifact-section h3 {
+  font-family: var(--serif);
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: -.01em;
+  margin: 18px 0 8px;
+}
+
+.artifact-prose h1 { font-size: 22px; }
+.artifact-prose h2 { font-size: 19px; }
+.artifact-prose h3,
+.artifact-section h3 { font-size: 17px; }
+
+.artifact-prose p,
+.artifact-prose li {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--text-2);
+}
+
+.artifact-prose blockquote {
+  margin: 14px 0;
+  padding: 2px 0 2px 16px;
+  border-left: 2px solid var(--accent);
+  font-family: var(--serif);
+  font-style: italic;
+  color: var(--ink);
+}
+
+.artifact-prose a {
+  color: var(--ink);
+  text-decoration-color: var(--accent);
+}
+
+.artifact-prose code {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.artifact-section {
+  margin: 4px 0 14px;
+}
+
+.artifact-section .artifact-text {
+  margin: 0;
+  max-width: 62ch;
+}
+
+.artifact-more summary {
+  min-height: 44px;
+  width: fit-content;
+  padding: 10px 2px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+/* Folio corrections from visual review: sections are flat passages divided
+   by hairlines (never boxes), and feedback actions read as one quiet row. */
+.artifact-section {
+  max-width: 62ch;
+  margin: 0;
+  padding: 12px 0;
+  border-radius: 0;
+  border-top: 1px solid var(--soft-line);
+  background: transparent;
+}
+
+.artifact-section:first-child {
+  padding-top: 2px;
+  border-top: none;
+}
+
+.artifact-section h3 {
+  margin: 0 0 6px;
+}
+
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0 6px;
+}
+
+.card-actions-primary,
+.card-actions-secondary {
+  display: contents;
+}
+
+.card-actions-primary button,
+.card-actions-secondary button {
+  flex: 0 0 auto;
+}
