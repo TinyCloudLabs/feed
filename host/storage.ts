@@ -486,7 +486,7 @@ export class FeedHostStorage {
 
   async listFeed(
     actor: FeedHostActorStorage,
-    input: { limit: number; cursor?: string },
+    input: { limit: number; cursor?: string; includeQuarantined?: boolean },
   ): Promise<{ items: FeedItemProjection[]; nextCursor?: string }> {
     const offset = input.cursor ? Number(input.cursor) : 0;
     if (!Number.isInteger(offset) || offset < 0) throw new Error("cursor must be a non-negative integer offset");
@@ -496,10 +496,18 @@ export class FeedHostStorage {
       this.readCachedFeedbackRows(actor),
       this.readCachedPreferenceProfiles(actor),
     ]);
+    // Quarantine is enforced before composition, ranking, and pagination so a
+    // broken row cannot consume a page slot or influence diversity scoring.
+    // The opt-in is deliberately storage-internal; GET /feed never exposes it.
+    const readableRows = input.includeQuarantined
+      ? projectionRows
+      : projectionRows.filter(
+          (row) => row.visibility !== "repair_only" && !row.reasonCodes.includes("broken_ref"),
+        );
     const postArtifactIds = new Set(
-      projectionRows.filter((row) => row.target.kind === "post").map((row) => row.target.artifactId),
+      readableRows.filter((row) => row.target.kind === "post").map((row) => row.target.artifactId),
     );
-    const composedRows = projectionRows.filter(
+    const composedRows = readableRows.filter(
       (row) => row.target.kind !== "artifact_preview" || !postArtifactIds.has(row.target.artifactId),
     );
     const ranked = rankFeedProjections({
@@ -2748,7 +2756,7 @@ function projectionStateFromRow(row: ProjectionRow): FeedProjectionState {
     visibility: row.visibility,
     reasonCodes,
     rankScore: Number(row.rank_score),
-    docMissing: row.visibility === "repair_only" || reasonCodes.includes("broken_ref") || reasonCodes.includes("source_unavailable"),
+    docMissing: row.visibility === "repair_only" || reasonCodes.includes("broken_ref"),
   };
 }
 

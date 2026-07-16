@@ -367,6 +367,50 @@ test("lists feed projections without hydrating artifact documents", async () => 
   expect(cachedPage.items[0]?.target.artifactId).toBe(artifact.artifact_id);
 });
 
+test("listFeed excludes quarantined SQLite rows before pagination and can include them internally", async () => {
+  const artifacts = realHandle("artifacts_index");
+  const feed = realHandle("feed_index");
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xquarantine",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    feed: { sql: { db: () => feed.handle } },
+  } as unknown as FeedHostActorStorage;
+  const insertArtifact = artifacts.db.prepare(`INSERT INTO artifact_index
+    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
+     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
+     created_at, updated_at, published_at)
+    VALUES (?, 'insight_card', 'pkg', '1.0.0', 'sha256:pkg', 'run', ?, 'sha256:artifact',
+      ?, ?, '[]', '2026-07-14T12:00:00.000Z', '2026-07-14T12:00:00.000Z', ?)`);
+  const insertProjection = feed.db.prepare(`INSERT INTO feed_item_projection
+    (feed_item_id, target_kind, artifact_id, post_id, rank_score, disposition, visibility,
+     freshness_label, reason_codes_json, package_id, source_fingerprint, published_at, updated_at)
+    VALUES (?, 'artifact_preview', ?, NULL, ?, 'default', ?, 'fresh', ?, 'pkg', ?, ?, ?)`);
+
+  for (const [id, rank, visibility, reasons, publishedAt] of [
+    ["repair-only", 0.99, "repair_only", '["broken_ref","source_unavailable"]', "2026-07-14T12:03:00.000Z"],
+    ["broken-reason", 0.98, "ranked", '["broken_ref"]', "2026-07-14T12:02:00.000Z"],
+    ["healthy", 0.5, "ranked", "[]", "2026-07-14T12:01:00.000Z"],
+  ] as const) {
+    insertArtifact.run(id, `sha256:${id}`, id, `${id}.json`, publishedAt);
+    insertProjection.run(`legacy:${id}`, id, rank, visibility, reasons, `sha256:${id}`, publishedAt, publishedAt);
+  }
+
+  const storage = new FeedHostStorage();
+  const normal = await storage.listFeed(actor, { limit: 1 });
+  expect(normal.items.map((item) => item.target.artifactId)).toEqual(["healthy"]);
+  expect(normal.nextCursor).toBeUndefined();
+
+  const diagnostic = await storage.listFeed(actor, { limit: 10, includeQuarantined: true });
+  expect(diagnostic.items.map((item) => item.target.artifactId).sort()).toEqual([
+    "broken-reason",
+    "healthy",
+    "repair-only",
+  ]);
+
+  artifacts.db.close();
+  feed.db.close();
+});
+
 test("reads a base64 hero through the artifacts-prefix delegation with the declared image type", async () => {
   const artifacts = realHandle("artifacts_index");
   const artifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;

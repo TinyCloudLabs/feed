@@ -394,10 +394,13 @@ export function reconcileFeedProjections(input: {
     feedItemIds.add(itemSeed.feedItemId);
     const current = currentById.get(itemSeed.feedItemId);
     // A stale artifact-index writer must not roll a newer projection backward.
-    // Keep the complete newer row, including its timestamp and post material.
-    if (current && artifact.updatedAt.localeCompare(current.updatedAt) < 0) return current;
+    // Keep its presentation fields and post material, but document existence
+    // is ground truth on every pass and is not governed by updated_at.
+    if (current && artifact.updatedAt.localeCompare(current.updatedAt) < 0) {
+      return withIntegrityPrecedence(current, artifact, now);
+    }
     const baseRow: FeedProjectionState = current
-      ? {
+      ? withIntegrityPrecedence({
           ...current,
           ...itemSeed,
           artifactType: artifact.artifactType,
@@ -406,12 +409,6 @@ export function reconcileFeedProjections(input: {
           publishedAt: artifact.publishedAt,
           updatedAt: artifact.updatedAt,
           freshnessLabel: artifact.freshnessLabel,
-          docMissing: artifact.docMissing,
-          visibility: artifact.docMissing
-            ? "repair_only"
-            : current.visibility === "repair_only"
-              ? "ranked"
-              : current.visibility,
           reasonCodes: canonicalReasonCodes({
             baseReasons: current.reasonCodes,
             artifact,
@@ -420,7 +417,7 @@ export function reconcileFeedProjections(input: {
             docMissing: artifact.docMissing,
           }),
           rankScore: current.rankScore,
-        }
+        }, artifact, now)
       : {
           ...itemSeed,
           artifactType: artifact.artifactType,
@@ -445,10 +442,12 @@ export function reconcileFeedProjections(input: {
     });
   });
 
-  const preservedFromStaleArtifacts = currentProjections.filter((projection) => {
-    if (feedItemIds.has(projection.feedItemId)) return false;
+  const preservedFromStaleArtifacts = currentProjections.flatMap((projection) => {
+    if (feedItemIds.has(projection.feedItemId)) return [];
     const artifact = artifactById.get(projection.target.artifactId);
-    return Boolean(artifact && artifact.updatedAt.localeCompare(projection.updatedAt) < 0);
+    return artifact && artifact.updatedAt.localeCompare(projection.updatedAt) < 0
+      ? [withIntegrityPrecedence(projection, artifact, now)]
+      : [];
   });
   for (const projection of preservedFromStaleArtifacts) feedItemIds.add(projection.feedItemId);
   const completeDesired = [...desired, ...preservedFromStaleArtifacts];
@@ -483,7 +482,9 @@ export function reconcileFeedProjections(input: {
 export function buildFeedEvents(input: {
   projections: readonly FeedProjectionState[];
 }): FeedSseEvent[] {
-  const projections = input.projections.map(withProjectionIdentity);
+  const projections = input.projections
+    .map(withProjectionIdentity)
+    .filter((projection) => projection.visibility !== "repair_only" && !projection.reasonCodes.includes("broken_ref"));
   const snapshotKey = hashJson(projections);
   return sortFeedEvents(
     projections.flatMap((projection) => [
@@ -1037,7 +1038,10 @@ function sourceFingerprintClusters<T extends { sourceFingerprint: string }>(
   return clusters;
 }
 
-function deriveBaseRankScore(artifact: FeedReconcileArtifact, now: Date): number {
+function deriveBaseRankScore(
+  artifact: Pick<FeedReconcileArtifact, "publishedAt" | "freshnessLabel">,
+  now: Date,
+): number {
   const ageHours = Math.max(0, (now.getTime() - Date.parse(artifact.publishedAt)) / 3_600_000);
   const recency = Math.max(0, 0.22 - ageHours / 1_680);
   const freshnessBias =
@@ -1077,6 +1081,72 @@ function canonicalReasonCodes(input: {
     if (earliest && earliest.artifactId !== input.artifact.artifactId) reasons.push("duplicate_cluster");
   }
   return uniqueReasons(reasons);
+}
+
+function withIntegrityPrecedence(
+  projection: FeedProjectionState,
+  artifact: FeedReconcileArtifact,
+  now: Date,
+): FeedProjectionState {
+  const wasQuarantined = projection.docMissing
+    || projection.visibility === "repair_only"
+    || projection.reasonCodes.includes("broken_ref");
+  const priorVisibility = preQuarantineVisibility(projection);
+  if (artifact.docMissing) {
+    return {
+      ...projection,
+      docMissing: true,
+      visibility: "repair_only",
+      reasonCodes: uniqueReasons([
+        ...projection.reasonCodes,
+        `pre_quarantine_visibility:${priorVisibility}`,
+        "broken_ref",
+        "source_unavailable",
+      ]),
+    };
+  }
+  return {
+    ...projection,
+    docMissing: false,
+    visibility: restoredVisibility(projection),
+    reasonCodes: projection.reasonCodes.filter(
+      (reason) => reason !== "broken_ref"
+        && reason !== "source_unavailable"
+        && !reason.startsWith("pre_quarantine_visibility:"),
+    ),
+    rankScore: wasQuarantined
+      ? deriveBaseRankScore({
+          publishedAt: projection.publishedAt,
+          freshnessLabel: projection.freshnessLabel,
+        }, now)
+      : projection.rankScore,
+  };
+}
+
+function preQuarantineVisibility(projection: FeedProjectionState): FeedArtifactProjection["visibility"] {
+  const stored = storedPreQuarantineVisibility(projection.reasonCodes);
+  if (stored) return stored;
+  if (projection.visibility !== "repair_only") return projection.visibility;
+  return projection.disposition === "hidden" ? "hidden" : "ranked";
+}
+
+function restoredVisibility(projection: FeedProjectionState): FeedArtifactProjection["visibility"] {
+  // Control intent disposition is live presentation truth while quarantined:
+  // hidden always stays hidden, and a later unhide overrides a stored hidden marker.
+  if (projection.disposition === "hidden") return "hidden";
+  const stored = storedPreQuarantineVisibility(projection.reasonCodes);
+  return stored && stored !== "hidden" ? stored : projection.visibility === "repair_only" ? "ranked" : projection.visibility;
+}
+
+function storedPreQuarantineVisibility(
+  reasons: readonly string[],
+): Exclude<FeedArtifactProjection["visibility"], "repair_only"> | undefined {
+  const value = reasons
+    .find((reason) => reason.startsWith("pre_quarantine_visibility:"))
+    ?.slice("pre_quarantine_visibility:".length);
+  return value === "ranked" || value === "deferred" || value === "capped" || value === "hidden"
+    ? value
+    : undefined;
 }
 
 function projectionFingerprint(value: FeedProjectionState): string {
