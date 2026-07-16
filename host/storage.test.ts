@@ -218,6 +218,80 @@ function realHandle(dbName: "artifacts_index" | "feed_index") {
   };
 }
 
+test("storage spans hash identifiers and classify ok, not-found, and unauthorized real-SQLite reads", async () => {
+  const previousLog = process.env.FEED_HOST_LOG;
+  process.env.FEED_HOST_LOG = "1";
+  const output: string[] = [];
+  const log = spyOn(console, "log").mockImplementation((line) => output.push(String(line)));
+  const artifacts = realHandle("artifacts_index");
+  const actorId = "did:pkh:eip155:1:0x0123456789abcdef0123456789abcdef01234567";
+  const okArtifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;
+  const deniedArtifactId = "private-artifact-denied";
+  const insert = artifacts.db.query(`INSERT INTO artifact_index
+    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
+     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
+     created_at, updated_at, published_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const insertArtifact = (artifactId: string, docKey: string) => insert.run(
+    artifactId,
+    okArtifact.artifactType,
+    okArtifact.producedBy.packageId,
+    okArtifact.producedBy.packageVersion,
+    okArtifact.producedBy.packageDigest,
+    okArtifact.producedBy.runId,
+    okArtifact.idempotency.sourceFingerprint,
+    okArtifact.idempotency.artifactFingerprint,
+    `${okArtifact.idempotency.dedupeKey}:${artifactId}`,
+    docKey,
+    "[]",
+    okArtifact.createdAt,
+    okArtifact.updatedAt,
+    okArtifact.createdAt,
+  );
+  insertArtifact(okArtifact.artifactId, okArtifact.storage.docKey);
+  insertArtifact(deniedArtifactId, "denied/document.json");
+  const actor = {
+    actorId,
+    traceId: "trace-storage-spans",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    documents: {
+      kv: {
+        get: async (key: string) => {
+          if (key.endsWith("denied/document.json")) {
+            return { ok: false, error: { code: "AUTH_UNAUTHORIZED", message: "Unauthorized Action" } };
+          }
+          return key.endsWith(okArtifact.storage.docKey)
+            ? { ok: true, data: { data: okArtifact } }
+            : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } };
+        },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+
+  try {
+    const storage = new FeedHostStorage();
+    expect((await storage.readArtifact(actor, okArtifact.artifactId)).kind).toBe("found");
+    expect((await storage.readArtifact(actor, "absent-artifact")).kind).toBe("not_found");
+    await expect(storage.readArtifact(actor, deniedArtifactId)).rejects.toThrow("Failed to read artifact document");
+
+    const serialized = output.filter((line) => line.includes('"event":"storage_span"')).join("\n");
+    const spans = output
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((event) => event.event === "storage_span");
+    expect(spans.some((event) => event.resultCode === "ok")).toBe(true);
+    expect(spans.some((event) => event.resultCode === "not_found")).toBe(true);
+    expect(spans.some((event) => event.resultCode === "unauthorized")).toBe(true);
+    expect(spans.every((event) => /^[0-9a-f]{12}$/.test(String(event.actorHash)))).toBe(true);
+    expect(serialized).not.toContain(actorId);
+    expect(serialized).not.toContain(okArtifact.artifactId);
+    expect(serialized).not.toContain(deniedArtifactId);
+  } finally {
+    artifacts.db.close();
+    log.mockRestore();
+    process.env.FEED_HOST_LOG = previousLog;
+  }
+});
+
 test("listWorkflows read model runs against the real schema and returns a recent example", async () => {
   const artifacts = realHandle("artifacts_index");
   const feed = realHandle("feed_index");
@@ -292,8 +366,11 @@ test("falls back to statement-by-statement execution when batches cannot mix act
   expect(feedLog?.executes[6]).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
 });
 
-test("hydrates corrupt artifact docs defensively and audits invalid fixtures", async () => {
-  const warn = spyOn(console, "warn").mockImplementation(() => {});
+test("hydrates corrupt artifact docs defensively and emits reconciliation counts", async () => {
+  const previousLog = process.env.FEED_HOST_LOG;
+  process.env.FEED_HOST_LOG = "1";
+  const output: string[] = [];
+  const log = spyOn(console, "log").mockImplementation((line) => output.push(String(line)));
   try {
     const storage = new FeedHostStorage();
     const malformed = {
@@ -331,9 +408,21 @@ test("hydrates corrupt artifact docs defensively and audits invalid fixtures", a
     const plan = await storage.reconcileFeedProjection(actor);
     expect(plan.upserts.map((row) => row.target.artifactId).sort()).toEqual(["malformed-artifact", "schema-mismatch-artifact"]);
     expect(plan.upserts.every((row) => row.visibility === "repair_only")).toBe(true);
-    expect(warn).toHaveBeenCalledTimes(2);
+    const summary = output.map((line) => JSON.parse(line) as Record<string, unknown>)
+      .find((event) => event.event === "reconcile_summary");
+    expect(summary).toMatchObject({
+      projections: 2,
+      healthy: 0,
+      docMissing: 2,
+      quarantined: 2,
+      restored: 0,
+      upserts: 2,
+      deletions: 0,
+    });
+    expect(summary?.actorHash).toMatch(/^[0-9a-f]{12}$/);
   } finally {
-    warn.mockRestore();
+    log.mockRestore();
+    process.env.FEED_HOST_LOG = previousLog;
   }
 });
 

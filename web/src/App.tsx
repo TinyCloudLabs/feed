@@ -222,6 +222,7 @@ export function App() {
         traceId: crypto.randomUUID(),
         loginStartedAt: startedAt,
         systemStartedAt: startedAt,
+        sessionMode: "restored",
       };
       loginTrace.current = trace;
       if (TRACE_HEADER_ENABLED) client.setTraceId(trace.traceId);
@@ -549,11 +550,15 @@ export function App() {
       traceId: crypto.randomUUID(),
       loginStartedAt,
       systemElapsedBeforeApprovalMs: 0,
+      sessionMode: "fresh",
     };
     loginTrace.current = trace;
     restoredHostSession.current = false;
     if (TRACE_HEADER_ENABLED) client.setTraceId(trace.traceId);
-    reportClientEvent("info", "login_clicked", undefined, undefined, { traceId: trace.traceId });
+    reportClientEvent("info", "login_clicked", undefined, undefined, {
+      traceId: trace.traceId,
+      session_mode: trace.sessionMode,
+    });
     try {
       let nextPolicy = policy;
       if (!nextPolicy) {
@@ -569,10 +574,14 @@ export function App() {
       reportClientEvent("info", "login_permissions_complete", undefined, nextSession.readerDid, {
         traceId: trace.traceId,
         elapsedMs: Math.round(trace.systemStartedAt - trace.loginStartedAt),
+        session_mode: trace.sessionMode,
       });
       setSession(nextSession);
     } catch (error) {
-      reportClientEvent("error", "sign_in_failed", errorDetail(error), undefined, { traceId: trace.traceId });
+      reportClientEvent("error", "sign_in_failed", errorDetail(error), undefined, {
+        traceId: trace.traceId,
+        session_mode: trace.sessionMode,
+      });
       setSignInError(error instanceof Error ? error.message : String(error));
     }
   };

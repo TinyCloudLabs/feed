@@ -59,6 +59,13 @@ import {
   type FeedHostSkillCredentialsPatch,
 } from "./storage.ts";
 import { ResourceKvKeyError } from "./resource-kv.ts";
+import feedPackage from "../package.json";
+import {
+  markCurrentStorageOperationHealed,
+  resultCodeForServiceResult,
+  telemetryIdHash,
+  withTelemetryTrace,
+} from "./observability.ts";
 
 type JsonBody = Record<string, unknown>;
 type FeedbackRequestBody = Omit<FeedbackEvent, "actorId"> & { actorId?: string };
@@ -140,6 +147,11 @@ type FeedHostContext = {
   actorSessions: Map<string, { actorKey: string; expiresAt: string; policyHash: string }>;
   actorRequestQueues: Map<string, Promise<void>>;
   actorSetupQueues: Map<string, Promise<void>>;
+  workerClaims: Map<string, { ts: string; result: string }>;
+  buildSha: string;
+  nodeTarget: string;
+  nodeVersion: string;
+  nodeInfo: Record<string, unknown>;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -207,6 +219,7 @@ export function createInputAuthorityInspector(hostNode: InputAuthorityVerificati
 }
 
 export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
+  const diagnosticsToken = process.env.FEED_HOST_DIAGNOSTICS_TOKEN;
   const storage = options.storage ?? new FeedHostStorage();
   const hostNode =
     options.hostNode ?? createFeedHostNode({ privateKey: options.hostPrivateKey, host: options.tinycloudHost });
@@ -235,6 +248,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const actorRequestQueues = new Map<string, Promise<void>>();
   const actorArtifactQueues = new Map<string, Promise<void>>();
   const actorSetupQueues = new Map<string, Promise<void>>();
+  const workerClaims = new Map<string, { ts: string; result: string }>();
   const inputAuthorities = new InputAuthorityRegistry();
   const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
   const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
@@ -254,9 +268,26 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     return result.ok;
   });
   let context: FeedHostContext | null = null;
+  const buildSha = process.env.FEED_HOST_BUILD_SHA || "dev";
+  void hostReady.then(() => {
+    const observed = observedNodeIdentity(hostNode, options.tinycloudHost);
+    if (context) {
+      context.nodeTarget = observed.nodeTarget;
+      context.nodeVersion = observed.nodeVersion;
+      context.nodeInfo = observed.nodeInfo;
+    }
+    logEvent("info", "host_boot", {
+      buildSha,
+      feedPackageVersion: feedPackage.version,
+      nodeTarget: observed.nodeTarget,
+      nodeVersion: observed.nodeVersion,
+      nodeInfo: observed.nodeInfo,
+    });
+  }).catch(() => undefined);
 
   const getContext = async (): Promise<FeedHostContext> => {
     await hostReady;
+    const nodeIdentity = observedNodeIdentity(hostNode, options.tinycloudHost);
     const policy = createFeedHostPolicy(hostNode.did);
     context ??= {
       storage,
@@ -277,6 +308,11 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       actorSessions: new Map(),
       actorRequestQueues,
       actorSetupQueues,
+      workerClaims,
+      buildSha,
+      nodeTarget: nodeIdentity.nodeTarget,
+      nodeVersion: nodeIdentity.nodeVersion,
+      nodeInfo: nodeIdentity.nodeInfo,
     };
     return context;
   };
@@ -341,6 +377,18 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         return finished;
       };
 
+      if (request.method === "GET" && url.pathname === "/admin/diagnostics") {
+        if (!diagnosticsToken) return logRequest(jsonError(404, "not_found", "GET /admin/diagnostics"), "not_found");
+        if (!bearerTokenMatches(request, diagnosticsToken)) {
+          return logRequest(jsonError(401, "unauthorized", "missing or invalid diagnostics bearer token"), "unauthorized");
+        }
+        try {
+          return logRequest(json(await buildDiagnostics(await getContext())));
+        } catch (error) {
+          return logRequest(mapError(error, url.pathname), "internal_error", error);
+        }
+      }
+
       const publicRoute = PUBLIC_PATHS.has(url.pathname);
       // <img> requests cannot carry an Authorization header, so the hero
       // route is exempt from the bearer gate on token-configured deployments.
@@ -367,11 +415,11 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         const runRoute = () => {
           routeStartedAt = performance.now();
           queueWaitMs = queuedAt === undefined ? 0 : routeStartedAt - queuedAt;
-          return workerRoute
+          return withTelemetryTrace(traceId, () => workerRoute
             ? routeWorker(request, currentContext, actorRequestQueues)
             : request.method === "GET" && authenticatedActor
             ? retryTinyCloudTransaction("route_read", authenticatedActor, () => route(routedRequest, currentContext))
-            : route(routedRequest, currentContext);
+            : route(routedRequest, currentContext));
         };
         if (authenticatedActor && !isActorControlRoute(request.method, url.pathname)) queuedAt = performance.now();
         const response = authenticatedActor && !isActorControlRoute(request.method, url.pathname)
@@ -466,7 +514,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
     const setup = actorPreparationSnapshot(actor);
     logEvent("info", "feed_preparation_retry_requested", {
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       attempt: setup.attempt,
       phase: setup.phase,
       ...(actor.traceId ? { traceId: actor.traceId } : {}),
@@ -508,7 +556,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       throw error;
     });
     logEvent("info", "feed_delegation_activated", {
-      actor: activated.actorId,
+      actorHash: telemetryIdHash(activated.actorId),
       ms: Math.round(performance.now() - activationStartedAt),
       resources: activated.resources.length,
       ...(requestTraceId(request) ? { traceId: requestTraceId(request) } : {}),
@@ -560,13 +608,13 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
           }),
         ).then(() => {
           logEvent("info", "feed_delegation_persisted", {
-            actor: activated.actorId,
+            actorHash: telemetryIdHash(activated.actorId),
             ms: Math.round(performance.now() - persistenceStartedAt),
             ...(actor.traceId ? { traceId: actor.traceId } : {}),
           });
         }).catch((error) => {
           logEvent("warn", "feed_delegation_persist_failed", {
-            actor: activated.actorId,
+            actorHash: telemetryIdHash(activated.actorId),
             ms: Math.round(performance.now() - persistenceStartedAt),
             ...(actor.traceId ? { traceId: actor.traceId } : {}),
             ...errorLogFields(error),
@@ -658,6 +706,12 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         ...(optionalNumber(record.durationMs) === undefined ? {} : { durationMs: optionalNumber(record.durationMs) }),
         ...(optionalNumber(record.elapsedMs) === undefined ? {} : { elapsedMs: optionalNumber(record.elapsedMs) }),
         ...(optionalNumber(record.activeElapsedMs) === undefined ? {} : { activeElapsedMs: optionalNumber(record.activeElapsedMs) }),
+        ...(record.session_mode === "fresh" || record.session_mode === "restored"
+          ? { session_mode: record.session_mode }
+          : {}),
+        ...(record.stage === "mint" || record.stage === "submit" || record.stage === "activate"
+          ? { stage: record.stage }
+          : {}),
         ...(optionalString(record.detail) ? { detail: optionalString(record.detail)!.slice(0, 500) } : {}),
       });
       accepted += 1;
@@ -689,11 +743,11 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     await storage.insertSeedRows(access, "artifacts_index", [artifactIndexRow(artifact)]);
     await storage.reconcileFeedProjection(access);
     logEvent("info", "artifact_published", {
-      artifactId: artifact.artifactId,
+      artifactHash: telemetryIdHash(artifact.artifactId),
       artifactType: artifact.artifactType,
       packageId: artifact.producedBy.packageId,
       runId: artifact.producedBy.runId,
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       via: "dev_publisher",
     });
     return json({
@@ -738,7 +792,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       requestId,
       status,
       expectedStatus,
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       note: optionalString(body.note),
     });
     return json({ updated: true, request: record });
@@ -875,7 +929,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       requestId,
       status: record.status,
       phase: record.phase,
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
     });
     return json({ cancellationRequested: record.cancellationRequested, request: record });
   }
@@ -914,7 +968,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       logEvent("info", "generation_request_accepted", {
         requestId: result.requestId,
         intentKind: event.intentKind,
-        actor: actorId,
+        actorHash: telemetryIdHash(actorId),
       });
     }
     return json(
@@ -1006,24 +1060,34 @@ async function routeWorker(
     const claimOwner = readString(body, "claimOwner", "invalid_worker_request", "claimOwner is required");
     const leaseSeconds = boundedInteger(body.leaseSeconds, DEFAULT_WORKER_LEASE_SECONDS, 15, 900);
     const maxAttempts = boundedInteger(body.maxAttempts, DEFAULT_WORKER_MAX_ATTEMPTS, 1, 10);
-    const requestRecord = await context.storage.claimGenerationRequest(access, {
-      workflowId,
-      claimOwner,
-      now,
-      leaseExpiresAt: new Date(Date.parse(now) + leaseSeconds * 1000).toISOString(),
-      maxAttempts,
-    });
-    if (requestRecord) {
-      logEvent("info", "generation_request_claimed", {
-        requestId: requestRecord.requestId,
-        runId: requestRecord.runId,
-        claimOwner: requestRecord.claimOwner,
-        fencingToken: requestRecord.fencingToken,
-        attemptCount: requestRecord.attemptCount,
-        actor: actor.actorId,
+    try {
+      const requestRecord = await context.storage.claimGenerationRequest(access, {
+        workflowId,
+        claimOwner,
+        now,
+        leaseExpiresAt: new Date(Date.parse(now) + leaseSeconds * 1000).toISOString(),
+        maxAttempts,
       });
+      const resultCode = requestRecord ? "claimed" : "empty";
+      context.workerClaims.set(normalizeActorId(actor.actorId), { ts: now, result: resultCode });
+      logEvent("info", "worker_claim", {
+        actorHash: telemetryIdHash(actor.actorId),
+        workflowId,
+        ...(requestRecord?.packageId ? { packageId: requestRecord.packageId } : {}),
+        resultCode,
+      });
+      return json({ request: requestRecord, committedCursor: requestRecord?.sourceCursorBefore ?? null });
+    } catch (error) {
+      const code = error instanceof FeedHostError ? error.code : "internal_error";
+      const resultCode = `error:${code}`;
+      context.workerClaims.set(normalizeActorId(actor.actorId), { ts: now, result: resultCode });
+      logEvent("warn", "worker_claim", {
+        actorHash: telemetryIdHash(actor.actorId),
+        workflowId,
+        resultCode,
+      });
+      throw error;
     }
-    return json({ request: requestRecord, committedCursor: requestRecord?.sourceCursorBefore ?? null });
   }
 
   const match = url.pathname.match(
@@ -1103,15 +1167,95 @@ async function routeWorker(
     attemptCount: record.attemptCount,
     status: record.status,
     errorCode,
-    actor: actor.actorId,
+    actorHash: telemetryIdHash(actor.actorId),
   });
     return json({ request: record });
   });
 }
 
+async function buildDiagnostics(context: FeedHostContext): Promise<Record<string, unknown>> {
+  const now = new Date();
+  const actorAggregates: Record<string, unknown> = {};
+  for (const [actorKey, actor] of context.actors) {
+    if (isDelegationExpired(actor) || !hasCompleteFeedHostDelegation(actor)) continue;
+    const access = actorStorage(actor);
+    const queue = await context.storage.queueSummary(access, now);
+    const latest = context.storage.latestIntegritySummary(access);
+    const integrity = {
+      healthy: latest?.healthy ?? 0,
+      missing: latest?.docMissing ?? 0,
+      quarantined: latest?.quarantined ?? 0,
+    };
+    const claim = context.workerClaims.get(actorKey) ?? null;
+    const queueNonEmpty = ["accepted", "pending", "retry_wait"]
+      .reduce((total, status) => total + (queue.counts[status] ?? 0), 0) > 0;
+    const claimAgeMs = claim ? now.getTime() - Date.parse(claim.ts) : Number.POSITIVE_INFINITY;
+    actorAggregates[telemetryIdHash(actor.actorId)] = {
+      queue,
+      integrity,
+      lastWorkerClaim: claim,
+      alerts: {
+        quarantined: integrity.quarantined > 0,
+        oldestAccepted: queue.oldestAcceptedAgeSec > 3600,
+        workerClaimStale: queueNonEmpty && claimAgeMs > 30 * 60 * 1000,
+      },
+    };
+  }
+  const delegationStats = context.delegationStore?.stats(now) ?? {
+    actors: 0,
+    resources: 0,
+    expiringSoon: 0,
+  };
+  return {
+    buildSha: context.buildSha,
+    feedPackageVersion: feedPackage.version,
+    nodeTarget: context.nodeTarget,
+    nodeVersion: context.nodeVersion,
+    nodeInfo: context.nodeInfo,
+    delegationStore: {
+      actors: delegationStats.actors,
+      resources: delegationStats.resources,
+      expiringSoonCount: delegationStats.expiringSoon,
+    },
+    actors: actorAggregates,
+  };
+}
+
+function observedNodeIdentity(hostNode: TinyCloudNode, configuredTarget?: string): {
+  nodeTarget: string;
+  nodeVersion: string;
+  nodeInfo: Record<string, unknown>;
+} {
+  const observed = hostNode as unknown as {
+    hosts?: string[];
+    nodeVersion?: unknown;
+    nodeInfo?: { version?: unknown };
+    nodeFeatures?: unknown;
+  };
+  const nodeVersion = typeof observed.nodeVersion === "string"
+    ? observed.nodeVersion
+    : typeof observed.nodeInfo?.version === "string"
+      ? observed.nodeInfo.version
+      : "unknown";
+  return {
+    nodeTarget: observed.hosts?.[0] ?? configuredTarget ?? "https://node.tinycloud.xyz",
+    nodeVersion,
+    nodeInfo: Array.isArray(observed.nodeFeatures) ? { features: observed.nodeFeatures } : {},
+  };
+}
+
 function authorized(request: Request, token: string | undefined): boolean {
   if (!token) return true;
   return request.headers.get("authorization") === `Bearer ${token}`;
+}
+
+function bearerTokenMatches(request: Request, configuredToken: string): boolean {
+  const header = request.headers.get("authorization");
+  if (!header?.startsWith("Bearer ")) return false;
+  const supplied = header.slice("Bearer ".length);
+  const expectedDigest = createHash("sha256").update(configuredToken).digest();
+  const suppliedDigest = createHash("sha256").update(supplied).digest();
+  return timingSafeEqual(expectedDigest, suppliedDigest);
 }
 
 function isWorkerRoute(pathname: string): boolean {
@@ -1565,7 +1709,7 @@ export async function reactivateActorAccess(deps: ReactivationDeps, actor: Actor
       for (const path of accepted.resources) actor.accessByResource.set(path, accepted.access);
     }
     logEvent("info", "delegation_reactivated", {
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       ms: Math.round(performance.now() - startedAt),
     });
   })().finally(() => {
@@ -1575,7 +1719,7 @@ export async function reactivateActorAccess(deps: ReactivationDeps, actor: Actor
     await actor.reactivation;
     return true;
   } catch (error) {
-    logEvent("warn", "delegation_reactivation_failed", { actor: actor.actorId, ...errorLogFields(error) });
+    logEvent("warn", "delegation_reactivation_failed", { actorHash: telemetryIdHash(actor.actorId), ...errorLogFields(error) });
     return false;
   }
 }
@@ -1595,7 +1739,19 @@ export function selfHealingAccess(actor: ActorState, path: string): DelegatedAcc
   const heal = async <T>(run: (access: DelegatedAccess) => Promise<T>): Promise<T> => {
     const first = await run(current());
     if (!isUnauthorizedAccessResult(first) || !actor.heal) return first;
-    if (!(await actor.heal())) return first;
+    const startedAt = performance.now();
+    const coalesced = actor.reactivation !== undefined;
+    const healed = await actor.heal();
+    logEvent(healed ? "info" : "warn", "access_heal", {
+      actorHash: telemetryIdHash(actor.actorId),
+      path,
+      trigger: resultCodeForServiceResult(first),
+      outcome: healed ? "healed" : "failed",
+      durationMs: Math.round(performance.now() - startedAt),
+      coalesced,
+    });
+    if (!healed) return first;
+    markCurrentStorageOperationHealed();
     return run(current());
   };
   type AnyDb = { query: Function; batch: Function; execute: Function; migrations?: { apply: (input: unknown) => Promise<unknown> } };
@@ -1696,7 +1852,7 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
       updatedAt: startedAt,
     };
     logEvent("info", "feed_preparation_started", {
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       attempt: actor.preparation.attempt,
       ...(actor.traceId ? { traceId: actor.traceId } : {}),
     });
@@ -1737,7 +1893,7 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
           error: undefined,
         };
         logEvent("info", "feed_preparation_completed", {
-          actor: actor.actorId,
+          actorHash: telemetryIdHash(actor.actorId),
           attempt: actor.preparation.attempt,
           ms: Math.round(performance.now() - preparationStartedAt),
           ...(actor.traceId ? { traceId: actor.traceId } : {}),
@@ -1756,7 +1912,7 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
           },
         };
         logEvent("error", "feed_preparation_failed", {
-          actor: actor.actorId,
+          actorHash: telemetryIdHash(actor.actorId),
           attempt: actor.preparation.attempt,
           ms: Math.round(performance.now() - preparationStartedAt),
           ...(actor.traceId ? { traceId: actor.traceId } : {}),
@@ -1782,7 +1938,7 @@ async function runActorPreparationPhase<T>(
   updateActorPreparation(actor, phase);
   const startedAt = performance.now();
   logEvent("info", "feed_preparation_phase_started", {
-    actor: actor.actorId,
+    actorHash: telemetryIdHash(actor.actorId),
     attempt: actor.preparation?.attempt,
     phase,
     ...(actor.traceId ? { traceId: actor.traceId } : {}),
@@ -1790,7 +1946,7 @@ async function runActorPreparationPhase<T>(
   try {
     const result = await run();
     logEvent("info", "feed_preparation_phase_completed", {
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       attempt: actor.preparation?.attempt,
       phase,
       ms: Math.round(performance.now() - startedAt),
@@ -1799,7 +1955,7 @@ async function runActorPreparationPhase<T>(
     return result;
   } catch (error) {
     logEvent("error", "feed_preparation_phase_failed", {
-      actor: actor.actorId,
+      actorHash: telemetryIdHash(actor.actorId),
       attempt: actor.preparation?.attempt,
       phase,
       ms: Math.round(performance.now() - startedAt),
@@ -1844,7 +2000,7 @@ async function retryTinyCloudTransaction<T>(operation: string, actorId: string |
       const delay = TINYCLOUD_TRANSACTION_RETRY_DELAYS_MS[attempt];
       if (delay === undefined || !isTinyCloudSerializationConflict(error)) throw error;
       logEvent("warn", "tinycloud_transaction_retry", {
-        ...(actorId ? { actor: actorId } : {}),
+        ...(actorId ? { actorHash: telemetryIdHash(actorId) } : {}),
         operation,
         attempt: attempt + 1,
         delayMs: delay,

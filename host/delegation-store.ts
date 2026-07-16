@@ -24,6 +24,7 @@ export type StoredFeedDelegationRecord = {
  */
 export class FeedHostDelegationStore {
   private session: Promise<unknown> | null = null;
+  private readonly observedRecords = new Map<string, StoredFeedDelegationRecord>();
 
   constructor(private readonly node: TinyCloudNode) {}
 
@@ -35,17 +36,26 @@ export class FeedHostDelegationStore {
     if (!result.ok) {
       throw new Error(`Failed to persist delegations for ${record.actorId}: ${kvError(result)}`);
     }
+    this.observedRecords.set(normalizeActorId(record.actorId), record);
   }
 
   async load(actorId: string): Promise<StoredFeedDelegationRecord | null> {
     await this.ensureSignedIn();
     const result = await this.node.kv.get<StoredFeedDelegationRecord | string>(keyFor(actorId));
     if (!result.ok) {
-      if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") return null;
+      if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") {
+        this.observedRecords.delete(normalizeActorId(actorId));
+        return null;
+      }
       throw new Error(`Failed to load delegations for ${actorId}: ${kvError(result)}`);
     }
     const raw = typeof result.data.data === "string" ? JSON.parse(result.data.data) : result.data.data;
-    return isStoredRecord(raw) ? raw : null;
+    if (!isStoredRecord(raw)) {
+      this.observedRecords.delete(normalizeActorId(actorId));
+      return null;
+    }
+    this.observedRecords.set(normalizeActorId(raw.actorId), raw);
+    return raw;
   }
 
   async remove(actorId: string): Promise<void> {
@@ -54,6 +64,24 @@ export class FeedHostDelegationStore {
     if (!result.ok && result.error.code !== "KV_NOT_FOUND" && result.error.code !== "NOT_FOUND") {
       throw new Error(`Failed to remove delegations for ${actorId}: ${kvError(result)}`);
     }
+    this.observedRecords.delete(normalizeActorId(actorId));
+  }
+
+  stats(now: Date = new Date(), expiringSoonMs = 24 * 60 * 60 * 1000): {
+    actors: number;
+    resources: number;
+    expiringSoon: number;
+  } {
+    const records = [...this.observedRecords.values()];
+    const expiresBefore = now.getTime() + expiringSoonMs;
+    return {
+      actors: records.length,
+      resources: records.reduce((total, record) => total + record.resources.length, 0),
+      expiringSoon: records.reduce((total, record) => total + record.resources.filter((resource) => {
+        const expiry = Date.parse(resource.expiresAt);
+        return Number.isFinite(expiry) && expiry > now.getTime() && expiry <= expiresBefore;
+      }).length, 0),
+    };
   }
 
   private async ensureSignedIn(): Promise<void> {

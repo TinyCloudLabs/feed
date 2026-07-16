@@ -83,6 +83,12 @@ import {
   resourceKv,
   validateRelativeKvKey,
 } from "./resource-kv.ts";
+import { logEvent } from "./log.ts";
+import {
+  resultCodeForServiceResult,
+  telemetryIdHash,
+  withStorageSpan,
+} from "./observability.ts";
 
 type ProjectionRow = {
   feed_item_id: string;
@@ -348,6 +354,7 @@ export type FeedGenerationMutationIdentity = {
 
 export type FeedHostActorStorage = {
   actorId: string;
+  traceId?: string;
   artifacts: DelegatedAccess;
   feed: DelegatedAccess;
   settings: DelegatedAccess;
@@ -369,6 +376,23 @@ export type FeedProjectionParity = {
   matchingRows: number;
   mismatchedRows: number;
   readyToRetireLegacyReads: boolean;
+};
+
+export type FeedQueueSummary = {
+  counts: Record<string, number>;
+  oldestAcceptedAgeSec: number;
+};
+
+export type FeedIntegritySummary = {
+  projections: number;
+  healthy: number;
+  docMissing: number;
+  quarantined: number;
+  restored: number;
+  upserts: number;
+  deletions: number;
+  durationMs: number;
+  reconciledAt: string;
 };
 
 export type ArtifactHero = {
@@ -406,11 +430,16 @@ function storageCacheKey(actor: FeedHostActorStorage): string {
   return normalizeActorId(actor.actorId);
 }
 
+function isQuarantinedProjection(row: FeedProjectionState): boolean {
+  return row.visibility === "repair_only" || row.reasonCodes.includes("broken_ref");
+}
+
 export class FeedHostStorage {
   private readonly bootstrapped = new WeakSet<object>();
   private readonly projectionCache = new Map<string, FeedProjectionState[]>();
   private readonly feedbackCache = new Map<string, FeedbackRow[]>();
   private readonly preferenceCache = new Map<string, FeedPreferenceProfileRecord[]>();
+  private readonly latestIntegrity = new Map<string, FeedIntegritySummary>();
   private readonly migrateLegacyDataHook: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
   private readonly maxPendingGenerationRequests: number;
 
@@ -486,11 +515,25 @@ export class FeedHostStorage {
   async writeArtifactDocument(actor: FeedHostActorStorage, artifact: FeedArtifact | MigratedFeedArtifact): Promise<void> {
     const docKey = validateRelativeKvKey(artifact.storage.docKey);
     const documents = resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX);
-    const result = await documents.put(docKey, artifact, {
-      contentType: "application/json",
+    const result = await withStorageSpan({
+      op: "seed_doc_write",
+      actorId: actor.actorId,
+      artifactId: artifact.artifactId,
+      resourcePath: documents.resourcePath,
+      traceId: actor.traceId,
+      run: () => documents.put(docKey, artifact, { contentType: "application/json" }),
+      resultCode: resultCodeForServiceResult,
     });
     if (!result.ok) throw new Error(`Failed to write artifact document: ${resultError(result)}`);
-    const verified = await documents.get<FeedArtifact | string>(docKey);
+    const verified = await withStorageSpan({
+      op: "artifact_document_get",
+      actorId: actor.actorId,
+      artifactId: artifact.artifactId,
+      resourcePath: documents.resourcePath,
+      traceId: actor.traceId,
+      run: () => documents.get<FeedArtifact | string>(docKey),
+      resultCode: resultCodeForServiceResult,
+    });
     if (!verified.ok) throw new Error(`Failed to verify artifact document write: ${resultError(verified)}`);
     const hydrated = hydrateArtifactDocument(verified.data.data);
     if (hydrated.kind !== "found" || hydrated.artifact.artifactId !== artifact.artifactId) {
@@ -558,15 +601,32 @@ export class FeedHostStorage {
     | { kind: "not_found" }
     | { kind: "hydration_failed"; artifactId: string; docKey: string }
   > {
-    const rows = await queryRows<ArtifactIndexRow>(
-      this.db(actor, "artifacts_index"),
-      "SELECT artifact_id, artifact_type, package_id, source_fingerprint, doc_key, published_at, updated_at FROM artifact_index WHERE artifact_id = ?",
-      [artifactId],
-    );
+    const rows = await withStorageSpan({
+      op: "artifact_index_lookup",
+      actorId: actor.actorId,
+      artifactId,
+      resourcePath: FEED_HOST_ARTIFACTS_DB_PATH,
+      traceId: actor.traceId,
+      run: () => queryRows<ArtifactIndexRow>(
+        this.db(actor, "artifacts_index"),
+        "SELECT artifact_id, artifact_type, package_id, source_fingerprint, doc_key, published_at, updated_at FROM artifact_index WHERE artifact_id = ?",
+        [artifactId],
+      ),
+      resultCode: (value) => value.length === 0 ? "not_found" : "ok",
+    });
     const row = rows[0];
     if (!row) return { kind: "not_found" };
     const docKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, row.doc_key);
-    const result = await resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX).get<FeedArtifact | string>(docKey);
+    const documents = resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX);
+    const result = await withStorageSpan({
+      op: "artifact_document_get",
+      actorId: actor.actorId,
+      artifactId,
+      resourcePath: documents.resourcePath,
+      traceId: actor.traceId,
+      run: () => documents.get<FeedArtifact | string>(docKey),
+      resultCode: resultCodeForServiceResult,
+    });
     if (!result.ok) {
       if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") {
         return { kind: "hydration_failed", artifactId: row.artifact_id, docKey: row.doc_key };
@@ -595,7 +655,15 @@ export class FeedHostStorage {
     // .b64 suffix. Try candidates in order until one resolves.
     const mediaKv = resourceKv(actor.media ?? actor.documents, FEED_HOST_ARTIFACT_MEDIA_PREFIX);
     for (const key of heroKeyCandidates(reference.key, result.artifact.artifactId)) {
-      const media = await mediaKv.get<string>(key);
+      const media = await withStorageSpan({
+        op: "artifact_media_get",
+        actorId: actor.actorId,
+        artifactId,
+        resourcePath: mediaKv.resourcePath,
+        traceId: actor.traceId,
+        run: () => mediaKv.get<string>(key),
+        resultCode: resultCodeForServiceResult,
+      });
       if (!media.ok) {
         if (media.error.code === "KV_NOT_FOUND" || media.error.code === "NOT_FOUND") continue;
         throw new Error(`Failed to read artifact hero: ${resultError(media)}`);
@@ -685,6 +753,7 @@ export class FeedHostStorage {
   }
 
   async reconcileFeedProjection(actor: FeedHostActorStorage): Promise<FeedReconcilePlan> {
+    const reconcileStartedAt = performance.now();
     // Rolling compatibility: old writers remain authoritative only when their
     // updated_at is newer. This also repairs partial old->new writes.
     await execute(this.db(actor, "feed_index"), FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
@@ -698,7 +767,7 @@ export class FeedHostStorage {
     const artifacts: FeedReconcileArtifact[] = [];
     for (const artifactRow of artifactRows) {
       const current = currentRows.find((row) => row.target.artifactId === artifactRow.artifact_id);
-      const artifactResult = await this.readArtifactDocument(actor, artifactRow.doc_key);
+      const artifactResult = await this.readArtifactDocument(actor, artifactRow.doc_key, artifactRow.artifact_id);
       const relativeDocKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, artifactRow.doc_key);
       if (artifactResult.kind === "found" && relativeDocKey !== artifactRow.doc_key) {
         await batch(this.db(actor, "artifacts_index"), [{
@@ -708,11 +777,10 @@ export class FeedHostStorage {
         artifactRow.doc_key = relativeDocKey;
       }
       if (artifactResult.kind === "malformed" || artifactResult.kind === "schema_mismatch") {
-        console.warn("Feed Host skipped invalid artifact doc during hydration", {
-          artifactId: artifactRow.artifact_id,
-          docKey: artifactRow.doc_key,
+        logEvent("warn", "artifact_hydration_invalid", {
+          actorHash: telemetryIdHash(actor.actorId),
+          artifactHash: telemetryIdHash(artifactRow.artifact_id),
           reason: artifactResult.kind,
-          ...(artifactResult.kind === "schema_mismatch" ? { errors: artifactResult.errors } : { error: artifactResult.error }),
         });
       }
       artifacts.push({
@@ -772,6 +840,26 @@ export class FeedHostStorage {
       console.warn("Feed Host projection parity gate remains closed", parity);
     }
     this.projectionCache.set(storageCacheKey(actor), plan.desired);
+    const currentById = new Map(currentRows.map((row) => [row.feedItemId, row] as const));
+    const summary: FeedIntegritySummary = {
+      projections: plan.desired.length,
+      healthy: artifacts.filter((artifact) => !artifact.docMissing).length,
+      docMissing: artifacts.filter((artifact) => artifact.docMissing).length,
+      quarantined: plan.desired.filter(isQuarantinedProjection).length,
+      restored: plan.desired.filter((row) => {
+        const prior = currentById.get(row.feedItemId);
+        return prior !== undefined && isQuarantinedProjection(prior) && !isQuarantinedProjection(row);
+      }).length,
+      upserts: plan.upserts.length,
+      deletions: plan.deletions.length,
+      durationMs: Math.round(performance.now() - reconcileStartedAt),
+      reconciledAt: new Date().toISOString(),
+    };
+    this.latestIntegrity.set(storageCacheKey(actor), summary);
+    logEvent("info", "reconcile_summary", {
+      ...summary,
+      actorHash: telemetryIdHash(actor.actorId),
+    });
     return plan;
   }
 
@@ -892,6 +980,7 @@ export class FeedHostStorage {
     await batch(this.db(actor, "feed_index"), statements);
 
     if (effect.error) throw effect.error;
+    if (effect.requestId) await this.emitQueueSummary(actor);
     return { eventId: event.eventId, duplicate: false, status: effect.status, requestId: effect.requestId };
   }
 
@@ -936,6 +1025,28 @@ export class FeedHostStorage {
     return rows;
   }
 
+  async queueSummary(actor: FeedHostActorStorage, now: Date = new Date()): Promise<FeedQueueSummary> {
+    const rows = await queryRows<{ status: string; total: number; oldest_accepted_at: string | null }>(
+      this.db(actor, "feed_index"),
+      `SELECT status, COUNT(*) AS total,
+              MIN(CASE WHEN status = 'accepted' THEN created_at END) AS oldest_accepted_at
+         FROM generation_request
+        WHERE actor_id = ?
+        GROUP BY status`,
+      [normalizeActorId(actor.actorId)],
+    );
+    const counts = Object.fromEntries(rows.map((row) => [row.status, Number(row.total)]));
+    const oldestAcceptedAt = rows.find((row) => row.oldest_accepted_at)?.oldest_accepted_at ?? null;
+    const oldestAcceptedAgeSec = oldestAcceptedAt
+      ? Math.max(0, Math.floor((now.getTime() - Date.parse(oldestAcceptedAt)) / 1000))
+      : 0;
+    return { counts, oldestAcceptedAgeSec };
+  }
+
+  latestIntegritySummary(actor: FeedHostActorStorage): FeedIntegritySummary | null {
+    return this.latestIntegrity.get(storageCacheKey(actor)) ?? null;
+  }
+
   async claimGenerationRequest(
     actor: FeedHostActorStorage,
     input: FeedGenerationClaimInput,
@@ -976,7 +1087,10 @@ export class FeedHostStorage {
         [actorId, input.now, input.workflowId, input.now, input.now, input.now, input.workflowId, input.now],
       );
       const row = rows[0];
-      if (!row) return null;
+      if (!row) {
+        await this.emitQueueSummary(actor, new Date(input.now));
+        return null;
+      }
       const changes = await execute(
         db,
         `UPDATE generation_request
@@ -1038,8 +1152,13 @@ export class FeedHostStorage {
           input.now,
         ],
       );
-      if (changes === 1) return this.readGenerationRequest(actor, row.request_id);
+      if (changes === 1) {
+        const claimed = await this.readGenerationRequest(actor, row.request_id);
+        await this.emitQueueSummary(actor, new Date(input.now));
+        return claimed;
+      }
     }
+    await this.emitQueueSummary(actor, new Date(input.now));
     return null;
   }
 
@@ -1258,7 +1377,9 @@ export class FeedHostStorage {
       ],
       "AND phase = 'reconciling'",
     );
-    return this.requireGenerationRequest(actor, input.requestId);
+    const completed = await this.requireGenerationRequest(actor, input.requestId);
+    await this.emitQueueSummary(actor, new Date(input.now));
+    return completed;
   }
 
   async retryGenerationRequest(
@@ -1713,12 +1834,19 @@ export class FeedHostStorage {
   }
 
   private async readArtifactIndexRows(actor: FeedHostActorStorage): Promise<ArtifactIndexRow[]> {
-    return queryRows<ArtifactIndexRow>(
-      this.db(actor, "artifacts_index"),
-      `SELECT artifact_id, artifact_type, package_id, source_fingerprint, doc_key, published_at, updated_at
-         FROM artifact_index
-        ORDER BY published_at ASC, artifact_id ASC`,
-    );
+    return withStorageSpan({
+      op: "artifact_index_lookup",
+      actorId: actor.actorId,
+      resourcePath: FEED_HOST_ARTIFACTS_DB_PATH,
+      traceId: actor.traceId,
+      run: () => queryRows<ArtifactIndexRow>(
+        this.db(actor, "artifacts_index"),
+        `SELECT artifact_id, artifact_type, package_id, source_fingerprint, doc_key, published_at, updated_at
+           FROM artifact_index
+          ORDER BY published_at ASC, artifact_id ASC`,
+      ),
+      resultCode: () => "ok",
+    });
   }
 
   private async readFeedbackRows(actor: FeedHostActorStorage): Promise<FeedbackRow[]> {
@@ -1765,6 +1893,7 @@ export class FeedHostStorage {
   private async readArtifactDocument(
     actor: FeedHostActorStorage,
     docKey: string,
+    artifactId?: string,
   ): Promise<
     | { kind: "found"; artifact: FeedArtifact }
     | { kind: "not_found" }
@@ -1772,7 +1901,16 @@ export class FeedHostStorage {
     | { kind: "schema_mismatch"; docKey: string; errors: string[] }
   > {
     const relativeDocKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, docKey);
-    const result = await resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX).get<FeedArtifact | string>(relativeDocKey);
+    const documents = resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX);
+    const result = await withStorageSpan({
+      op: "artifact_document_get",
+      actorId: actor.actorId,
+      artifactId,
+      resourcePath: documents.resourcePath,
+      traceId: actor.traceId,
+      run: () => documents.get<FeedArtifact | string>(relativeDocKey),
+      resultCode: resultCodeForServiceResult,
+    });
     if (!result.ok) {
       if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") return { kind: "not_found" };
       throw new Error(`Failed to read artifact document: ${resultError(result)}`);
@@ -1812,11 +1950,18 @@ export class FeedHostStorage {
     actorId: string,
     scope: string,
   ): Promise<FeedPreferenceProfileRecord | null> {
-    const rows = await queryRows<PreferenceRow>(
-      this.db(actor, "feed_index"),
-      "SELECT profile_id, actor_id, scope, value_json, version, updated_at FROM preference_profile WHERE actor_id = ? AND scope = ?",
-      [normalizeActorId(actorId), scope],
-    );
+    const rows = await withStorageSpan({
+      op: "preference_get",
+      actorId: actor.actorId,
+      resourcePath: FEED_HOST_FEED_DB_PATH,
+      traceId: actor.traceId,
+      run: () => queryRows<PreferenceRow>(
+        this.db(actor, "feed_index"),
+        "SELECT profile_id, actor_id, scope, value_json, version, updated_at FROM preference_profile WHERE actor_id = ? AND scope = ?",
+        [normalizeActorId(actorId), scope],
+      ),
+      resultCode: (value) => value.length === 0 ? "not_found" : "ok",
+    });
     const row = rows[0];
     return row ? preferenceRecordFromRow(row) : null;
   }
@@ -1831,13 +1976,17 @@ export class FeedHostStorage {
       },
     ]);
     this.preferenceCache.delete(storageCacheKey(actor));
-    const result = await resourceKv(actor.settings, FEED_HOST_FEED_SETTINGS_PREFIX).put(
-      preferenceKey(record.actorId, record.scope),
-      record,
-      {
+    const settings = resourceKv(actor.settings, FEED_HOST_FEED_SETTINGS_PREFIX);
+    const result = await withStorageSpan({
+      op: "preference_put",
+      actorId: actor.actorId,
+      resourcePath: settings.resourcePath,
+      traceId: actor.traceId,
+      run: () => settings.put(preferenceKey(record.actorId, record.scope), record, {
         contentType: "application/json",
-      },
-    );
+      }),
+      resultCode: resultCodeForServiceResult,
+    });
     if (!result.ok) throw new Error(`Failed to persist preference profile: ${resultError(result)}`);
   }
 
@@ -1855,6 +2004,14 @@ export class FeedHostStorage {
       value: next,
       version: (current?.version ?? 0) + 1,
       updatedAt,
+    });
+  }
+
+  private async emitQueueSummary(actor: FeedHostActorStorage, now: Date = new Date()): Promise<void> {
+    const summary = await this.queueSummary(actor, now);
+    logEvent("info", "queue_summary", {
+      ...summary,
+      actorHash: telemetryIdHash(actor.actorId),
     });
   }
 

@@ -45,6 +45,7 @@ import {
   type FeedHostServerOptions,
 } from "./server.ts";
 import type { FeedItemProjection, FeedTargetedInteractionEvent } from "../shared/feed-item.ts";
+import { telemetryIdHash } from "./observability.ts";
 
 process.env.FEED_HOST_LOG = "0";
 
@@ -63,6 +64,18 @@ const FAKE_NOW = "2026-07-20T00:00:00.000Z";
 // requireActorSession: true and exercise the production default.
 function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   return startSecureFeedHost({ requireActorSession: false, ...options });
+}
+
+function startDiagnosticsHost(token: string | undefined, options: FeedHostServerOptions): FeedHostRuntime {
+  const previous = process.env.FEED_HOST_DIAGNOSTICS_TOKEN;
+  if (token === undefined) delete process.env.FEED_HOST_DIAGNOSTICS_TOKEN;
+  else process.env.FEED_HOST_DIAGNOSTICS_TOKEN = token;
+  try {
+    return startFeedHost(options);
+  } finally {
+    if (previous === undefined) delete process.env.FEED_HOST_DIAGNOSTICS_TOKEN;
+    else process.env.FEED_HOST_DIAGNOSTICS_TOKEN = previous;
+  }
 }
 
 const SOURCE_REF = {
@@ -90,6 +103,74 @@ afterEach(() => {
 });
 
 describe("Feed Host server", () => {
+  test("diagnostics are indistinguishable from an unknown route when disabled", async () => {
+    runtime = startDiagnosticsHost(undefined, {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics`);
+    expect(response.status).toBe(404);
+  });
+
+  test("diagnostics reject the wrong dedicated bearer token", async () => {
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics`, {
+      headers: { authorization: "Bearer wrong-token" },
+    });
+    expect(response.status).toBe(401);
+  });
+
+  test("diagnostics return privacy-safe queue, integrity, delegation, and alert aggregates", async () => {
+    const delegationStore = fakeDelegationStore();
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new DiagnosticsFeedHostStorage() as unknown as FeedHostStorage,
+      delegationStore,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics`, {
+      headers: { authorization: "Bearer diagnostics-test-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      buildSha: string;
+      nodeVersion: string;
+      delegationStore: { actors: number; resources: number; expiringSoonCount: number };
+      actors: Record<string, {
+        queue: { counts: Record<string, number>; oldestAcceptedAgeSec: number };
+        integrity: { healthy: number; missing: number; quarantined: number };
+        lastWorkerClaim: null;
+        alerts: { quarantined: boolean; oldestAccepted: boolean; workerClaimStale: boolean };
+      }>;
+    };
+    const actorHash = telemetryIdHash(ACTOR_ID);
+    expect(Object.keys(body.actors)).toEqual([actorHash]);
+    expect(body.actors[actorHash]).toMatchObject({
+      queue: { counts: { accepted: 2, consumed: 1 }, oldestAcceptedAgeSec: 7201 },
+      integrity: { healthy: 4, missing: 1, quarantined: 1 },
+      lastWorkerClaim: null,
+      alerts: { quarantined: true, oldestAccepted: true, workerClaimStale: true },
+    });
+    expect(body.delegationStore.actors).toBe(1);
+    expect(body.delegationStore.resources).toBeGreaterThan(0);
+    expect(body.delegationStore.expiringSoonCount).toBeGreaterThan(0);
+    expect(body.buildSha).toBe("dev");
+    expect(typeof body.nodeVersion).toBe("string");
+    expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
+  });
+
   test("serves public metadata and an OpenAPI document that matches the host routes", async () => {
     runtime = startFeedHost({
       port: 0,
@@ -2826,6 +2907,36 @@ class FakeFeedHostStorage {
     return this.generationRequests.find(
       (row) => row.actor_id === actorId && row.reader_nonce === readerNonce,
     )?.request_id;
+  }
+}
+
+class DiagnosticsFeedHostStorage extends FakeFeedHostStorage {
+  async queueSummary(): Promise<{ counts: Record<string, number>; oldestAcceptedAgeSec: number }> {
+    return { counts: { accepted: 2, consumed: 1 }, oldestAcceptedAgeSec: 7201 };
+  }
+
+  latestIntegritySummary(): {
+    projections: number;
+    healthy: number;
+    docMissing: number;
+    quarantined: number;
+    restored: number;
+    upserts: number;
+    deletions: number;
+    durationMs: number;
+    reconciledAt: string;
+  } {
+    return {
+      projections: 6,
+      healthy: 4,
+      docMissing: 1,
+      quarantined: 1,
+      restored: 0,
+      upserts: 1,
+      deletions: 0,
+      durationMs: 12,
+      reconciledAt: FAKE_NOW,
+    };
   }
 }
 
