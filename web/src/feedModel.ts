@@ -102,6 +102,11 @@ export function feedItemAvailability(item: FeedItem): FeedItemAvailability {
   return "available";
 }
 
+export function projectionCanHydrate(projection: FeedItemProjection): boolean {
+  return projection.visibility !== "repair_only"
+    && !projection.reasonCodes.includes("broken_ref");
+}
+
 export function readableProvenance(item: FeedItem): ReadableProvenance {
   const artifact = item.artifact;
   return {
@@ -150,6 +155,7 @@ export function createLazyArtifactCache(
     peek: (artifactId) => resolved.get(artifactId),
     load,
     async hydrate(item) {
+      if (!projectionCanHydrate(item.projection)) return item;
       try {
         return { projection: item.projection, artifact: await load(item.projection.target.artifactId) };
       } catch (error) {

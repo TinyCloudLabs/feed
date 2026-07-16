@@ -222,6 +222,7 @@ describe("Feed ranking and reconciliation logic", () => {
     expect(plan.upserts[0].visibility).toBe("ranked");
     expect(plan.upserts[0].reasonCodes).not.toContain("broken_ref");
     expect(plan.upserts[0].reasonCodes).not.toContain("source_unavailable");
+    expect(plan.upserts[0].rankScore).toBeGreaterThan(0.12);
   });
 
   test("reconciliation never replaces a newer projection with stale artifact state", () => {
@@ -248,6 +249,163 @@ describe("Feed ranking and reconciliation logic", () => {
     expect(plan.upserts).toHaveLength(0);
     expect(plan.desired[0]?.updatedAt).toBe("2026-06-29T12:05:00.000Z");
     expect(plan.desired[0]?.sourceFingerprint).toBe("sha256:new-source");
+  });
+
+  test("a newer projection is quarantined when ground-truth document lookup is missing", () => {
+    const current = projection({
+      artifactId: "alpha",
+      packageId: "new-package",
+      sourceFingerprint: "sha256:new-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:05:00.000Z",
+      rankScore: 0.91,
+      disposition: "saved",
+      freshnessLabel: "fresh",
+    });
+    const staleIndex = reconcileArtifact({
+      artifactId: "alpha",
+      packageId: "stale-package",
+      sourceFingerprint: "sha256:stale-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:04:00.000Z",
+      docMissing: true,
+      freshnessLabel: "source_unavailable",
+    });
+
+    const plan = reconcileFeedProjections({ artifacts: [staleIndex], projections: [current], now: NOW });
+
+    expect(plan.upserts).toHaveLength(1);
+    expect(plan.desired[0]).toMatchObject({
+      updatedAt: current.updatedAt,
+      rankScore: 0.91,
+      disposition: "saved",
+      freshnessLabel: "fresh",
+      packageId: "new-package",
+      sourceFingerprint: "sha256:new-source",
+      visibility: "repair_only",
+      docMissing: true,
+    });
+    expect(plan.desired[0]?.reasonCodes).toEqual(expect.arrayContaining(["broken_ref", "source_unavailable"]));
+  });
+
+  test("a restored document clears newer quarantine while preserving presentation fields", () => {
+    const current = projection({
+      artifactId: "alpha",
+      packageId: "new-package",
+      sourceFingerprint: "sha256:new-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:05:00.000Z",
+      rankScore: 0.83,
+      disposition: "saved",
+      freshnessLabel: "stale",
+      visibility: "repair_only",
+      reasonCodes: ["fixture", "broken_ref", "source_unavailable"],
+      docMissing: true,
+    });
+    const staleIndex = reconcileArtifact({
+      artifactId: "alpha",
+      packageId: "stale-package",
+      sourceFingerprint: "sha256:stale-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:04:00.000Z",
+      docMissing: false,
+      freshnessLabel: "fresh",
+    });
+
+    const plan = reconcileFeedProjections({ artifacts: [staleIndex], projections: [current], now: NOW });
+
+    expect(plan.upserts).toHaveLength(1);
+    expect(plan.desired[0]).toMatchObject({
+      updatedAt: current.updatedAt,
+      disposition: "saved",
+      freshnessLabel: "stale",
+      packageId: "new-package",
+      sourceFingerprint: "sha256:new-source",
+      visibility: "ranked",
+      reasonCodes: ["fixture"],
+      docMissing: false,
+    });
+    expect(plan.desired[0]?.rankScore).toBeGreaterThan(0.05);
+    expect(plan.desired[0]?.rankScore).not.toBe(0.83);
+  });
+
+  test("document restoration respects hidden control intent disposition", () => {
+    const current = projection({
+      artifactId: "hidden",
+      packageId: "package",
+      sourceFingerprint: "sha256:hidden",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:05:00.000Z",
+      rankScore: 0.05,
+      disposition: "hidden",
+      visibility: "repair_only",
+      reasonCodes: ["broken_ref", "source_unavailable"],
+      docMissing: true,
+    });
+    const artifact = reconcileArtifact({
+      artifactId: "hidden",
+      packageId: "package",
+      sourceFingerprint: "sha256:hidden",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:04:00.000Z",
+      docMissing: false,
+    });
+
+    const plan = reconcileFeedProjections({ artifacts: [artifact], projections: [current], now: NOW });
+
+    expect(plan.desired[0]?.visibility).toBe("hidden");
+    expect(plan.desired[0]?.disposition).toBe("hidden");
+  });
+
+  test("quarantine round-trip preserves deferred visibility without a schema change", () => {
+    const current = projection({
+      artifactId: "deferred",
+      packageId: "package",
+      sourceFingerprint: "sha256:deferred",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:00:00.000Z",
+      rankScore: 0.4,
+      visibility: "deferred",
+    });
+    const missing = reconcileArtifact({
+      artifactId: "deferred",
+      packageId: "package",
+      sourceFingerprint: "sha256:deferred",
+      publishedAt: current.publishedAt,
+      updatedAt: "2026-06-29T12:01:00.000Z",
+      docMissing: true,
+    });
+    const quarantined = reconcileFeedProjections({ artifacts: [missing], projections: [current], now: NOW }).desired[0]!;
+    expect(quarantined.visibility).toBe("repair_only");
+    expect(quarantined.reasonCodes).toContain("pre_quarantine_visibility:deferred");
+
+    const restored = reconcileFeedProjections({
+      artifacts: [{ ...missing, updatedAt: "2026-06-29T12:02:00.000Z", docMissing: false }],
+      projections: [quarantined],
+      now: NOW,
+    }).desired[0]!;
+    expect(restored.visibility).toBe("deferred");
+    expect(restored.reasonCodes.some((reason) => reason.startsWith("pre_quarantine_visibility:"))).toBe(false);
+  });
+
+  test("a row born quarantined receives a base rank when its document appears", () => {
+    const missing = reconcileArtifact({
+      artifactId: "newly-repaired",
+      packageId: "package",
+      sourceFingerprint: "sha256:newly-repaired",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:00:00.000Z",
+      docMissing: true,
+    });
+    const quarantined = reconcileFeedProjections({ artifacts: [missing], projections: [], now: NOW }).desired[0]!;
+    expect(quarantined.rankScore).toBe(0.05);
+
+    const restored = reconcileFeedProjections({
+      artifacts: [{ ...missing, updatedAt: "2026-06-29T12:01:00.000Z", docMissing: false }],
+      projections: [quarantined],
+      now: NOW,
+    }).desired[0]!;
+    expect(restored.rankScore).toBeGreaterThan(0.05);
   });
 
   test("a stale artifact with fewer posts cannot delete a newer unmatched post", () => {
@@ -391,6 +549,30 @@ describe("Feed ranking and reconciliation logic", () => {
     expect(resumed.map((event) => event.id)).not.toContain(cursor);
     expect(resumed.some((event) => event.id.includes("projection:legacy:beta:"))).toBe(true);
     expect(resumed).toHaveLength(current.length);
+  });
+
+  test("SSE events exclude quarantined projections but retain readable source-unavailable artifacts", () => {
+    const healthy = projection({
+      artifactId: "healthy", packageId: "package", sourceFingerprint: "sha256:healthy",
+      publishedAt: "2026-06-29T12:00:00.000Z", updatedAt: "2026-06-29T12:00:00.000Z", rankScore: 0.5,
+    });
+    const repairOnly = { ...healthy, feedItemId: "legacy:repair", target: { kind: "artifact_preview" as const, artifactId: "repair" }, visibility: "repair_only" as const };
+    const brokenRef = { ...healthy, feedItemId: "legacy:broken", target: { kind: "artifact_preview" as const, artifactId: "broken" }, reasonCodes: ["broken_ref"] };
+    const sourceUnavailable = {
+      ...healthy,
+      feedItemId: "legacy:source-unavailable",
+      target: { kind: "artifact_preview" as const, artifactId: "source-unavailable" },
+      freshnessLabel: "source_unavailable" as const,
+      reasonCodes: ["source_unavailable"],
+    };
+
+    const events = buildFeedEvents({ projections: [healthy, repairOnly, brokenRef, sourceUnavailable] });
+    const serialized = JSON.stringify(events);
+    expect(events).toHaveLength(4);
+    expect(serialized).toContain("healthy");
+    expect(serialized).toContain("source-unavailable");
+    expect(serialized).not.toContain("legacy:repair");
+    expect(serialized).not.toContain("legacy:broken");
   });
 });
 

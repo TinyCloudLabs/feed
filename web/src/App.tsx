@@ -33,6 +33,7 @@ import {
   feedItemsForView,
   feedItemsFromProjections,
   projectedPost,
+  projectionCanHydrate,
   readableFeedTime,
   readablePostKind,
   readableProvenance,
@@ -590,6 +591,7 @@ export function App() {
   };
 
   const hydrateArtifact = useCallback(async (projection: FeedItemProjection): Promise<void> => {
+    if (!projectionCanHydrate(projection)) return;
     const hydrate = artifactHydrationQueue.current.catch(() => undefined).then(async () => {
       try {
         const artifact = await artifactCache.load(projection.target.artifactId);
@@ -1135,6 +1137,7 @@ function FeedCard({
   const post = projectedPost(item);
   const provenance = readableProvenance(item);
   const availability = feedItemAvailability(item);
+  const canHydrate = projectionCanHydrate(item.projection);
   const isSaved = item.projection.disposition === "saved";
   const title = item.projection.postTitle ?? post?.title ?? artifact?.title;
   // First verified quote reads as a distillery-style pull on the card face.
@@ -1143,14 +1146,14 @@ function FeedCard({
       entry.kind === "verified_quote",
   );
   const loadArtifact = async () => {
-    if (artifact || artifactLoading) return;
+    if (artifact || artifactLoading || !canHydrate) return;
     setArtifactLoading(true);
     await onExpand(item.projection);
     setArtifactLoading(false);
   };
   useEffect(() => {
     const element = cardRef.current;
-    if (!element || artifact || typeof IntersectionObserver === "undefined") return;
+    if (!element || artifact || !canHydrate || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver((entries) => {
       if (!entries.some((entry) => entry.isIntersecting)) return;
       observer.disconnect();
@@ -1158,7 +1161,7 @@ function FeedCard({
     }, { rootMargin: "300px 0px" });
     observer.observe(element);
     return () => observer.disconnect();
-  }, [artifact, item.projection.feedItemId]);
+  }, [artifact, canHydrate, item.projection.feedItemId]);
   const act = async (signal: FeedbackEvent["signal"]) => {
     setInteractionStatus(null);
     const ok = await onFeedback(item.projection, signal);

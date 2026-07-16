@@ -6,6 +6,7 @@ import {
   feedItemsForView,
   feedItemsFromProjections,
   hydrateFeedItems,
+  projectionCanHydrate,
   projectedPost,
   readableFeedTime,
   readablePostKind,
@@ -109,6 +110,48 @@ describe("Feed v1 model helpers", () => {
     expect(hydrated[0]?.projection.feedItemId).not.toBe(hydrated[1]?.projection.feedItemId);
     expect(hydrated[0]?.artifact).toBe(artifact);
     expect(hydrated[1]?.artifact).toBe(artifact);
+  });
+
+  test("only repair-only and broken-ref projections are excluded from hydration", async () => {
+    const repairOnly = {
+      ...item("repair-only", 0.9, "2026-06-28T10:00:00.000Z").projection,
+      visibility: "repair_only" as const,
+    };
+    const brokenRef = {
+      ...item("broken-ref", 0.85, "2026-06-28T09:30:00.000Z").projection,
+      reasonCodes: ["broken_ref", "source_unavailable"],
+    };
+    const readableUnavailableSource = {
+      ...item("unavailable", 0.8, "2026-06-28T09:00:00.000Z").projection,
+      freshnessLabel: "source_unavailable" as const,
+      reasonCodes: ["source_unavailable"],
+    };
+    let calls = 0;
+
+    const hydrated = await hydrateFeedItems([repairOnly, brokenRef, readableUnavailableSource], async () => {
+      calls += 1;
+      return artifact();
+    });
+
+    expect(projectionCanHydrate(repairOnly)).toBe(false);
+    expect(projectionCanHydrate(brokenRef)).toBe(false);
+    expect(projectionCanHydrate(readableUnavailableSource)).toBe(true);
+    expect(calls).toBe(1);
+    expect(hydrated.slice(0, 2).every((entry) => entry.artifact === null)).toBe(true);
+    expect(hydrated[2]?.artifact).not.toBeNull();
+  });
+
+  test("a cleaned projection with the same feed item identity becomes hydratable", () => {
+    const quarantined = {
+      ...item("repaired-in-place", 0.8, "2026-06-28T09:00:00.000Z").projection,
+      visibility: "repair_only" as const,
+      reasonCodes: ["broken_ref"],
+    };
+    const cleaned = { ...quarantined, visibility: "ranked" as const, reasonCodes: [] };
+
+    expect(cleaned.feedItemId).toBe(quarantined.feedItemId);
+    expect(projectionCanHydrate(quarantined)).toBe(false);
+    expect(projectionCanHydrate(cleaned)).toBe(true);
   });
 
   test("builds an immediately renderable feed and filters for-you and saved views", () => {
