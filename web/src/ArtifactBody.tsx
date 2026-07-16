@@ -15,15 +15,62 @@ type ArtifactBodyProps = {
 
 type EditorialSection = { sectionId?: string; title?: string; text: string };
 
+type EditorialQuality = { criticPass?: boolean; quotesVerified?: boolean };
+
+// One normalized editorial view over the two body shapes in the wild:
+// the Feed v1 contract ({ markdown, sections }) and migrated distillery
+// artifacts, whose body nests the whole legacy object ({ headline,
+// body: markdown, quote, attribution, tags, quality, ... }).
+type Editorial = {
+  markdown?: string;
+  sections: EditorialSection[];
+  quote?: { text: string; attribution?: string };
+  tags: string[];
+  quality?: EditorialQuality;
+};
+
 const MAX_RENDER_DEPTH = 8;
 
-function editorialMarkdown(body: unknown): string | undefined {
-  if (typeof body === "string" && body.trim()) return body;
-  if (body && typeof body === "object" && !Array.isArray(body)) {
-    const markdown = (body as Record<string, unknown>).markdown;
-    if (typeof markdown === "string" && markdown.trim()) return markdown;
+// Keys the editorial view consumes from a legacy body; whatever remains
+// shows under "More detail" instead of being silently dropped.
+const LEGACY_CONSUMED_KEYS = new Set([
+  "type", "headline", "body", "quote", "attribution", "tags", "quality",
+  "id", "generated_at", "producer", "approval_status", "hero_image",
+  "source_transcripts", "source_quotes",
+]);
+
+function editorialView(body: unknown): Editorial {
+  if (typeof body === "string" && body.trim()) {
+    return { markdown: body, sections: [], tags: [] };
   }
-  return undefined;
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { sections: [], tags: [] };
+  }
+  const record = body as Record<string, unknown>;
+  const markdown = typeof record.markdown === "string" && record.markdown.trim() ? record.markdown : undefined;
+  const sections = editorialSections(body);
+  if (markdown || sections.length > 0) {
+    return { markdown, sections, tags: [] };
+  }
+  // Legacy/distillery shape: headline plus a markdown string under `body`.
+  if (typeof record.headline === "string" && typeof record.body === "string" && record.body.trim()) {
+    const rawQuality = record.quality as Record<string, unknown> | undefined;
+    return {
+      markdown: record.body,
+      sections: [],
+      quote: typeof record.quote === "string" && record.quote.trim()
+        ? { text: record.quote, attribution: typeof record.attribution === "string" ? record.attribution : undefined }
+        : undefined,
+      tags: Array.isArray(record.tags) ? record.tags.filter((tag): tag is string => typeof tag === "string") : [],
+      quality: rawQuality && typeof rawQuality === "object"
+        ? {
+            criticPass: typeof rawQuality.critic_pass === "boolean" ? rawQuality.critic_pass : undefined,
+            quotesVerified: typeof rawQuality.quotes_verified === "boolean" ? rawQuality.quotes_verified : undefined,
+          }
+        : undefined,
+    };
+  }
+  return { sections: [], tags: [] };
 }
 
 function editorialSections(body: unknown): EditorialSection[] {
@@ -36,9 +83,13 @@ function editorialSections(body: unknown): EditorialSection[] {
 
 // Everything the editorial view renders, so the structured fallback only
 // shows what would otherwise be lost.
-function residualBody(body: unknown): unknown {
+function residualBody(body: unknown, legacy: boolean): unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
-  const { markdown: _markdown, sections: _sections, ...rest } = body as Record<string, unknown>;
+  const record = body as Record<string, unknown>;
+  const rest = Object.fromEntries(
+    Object.entries(record).filter(([key]) =>
+      legacy ? !LEGACY_CONSUMED_KEYS.has(key) : key !== "markdown" && key !== "sections"),
+  );
   return Object.keys(rest).length > 0 ? rest : undefined;
 }
 
@@ -62,19 +113,37 @@ function Section({ section, headingId, labelled = false }: { section: EditorialS
 }
 
 export function ArtifactBody({ body, targetSection }: ArtifactBodyProps) {
-  const markdown = editorialMarkdown(body);
-  const sections = editorialSections(body);
-  const residual = residualBody(body);
-  const isEditorial = Boolean(markdown || sections.length > 0);
+  const view = editorialView(body);
+  const isEditorial = Boolean(view.markdown || view.sections.length > 0);
+  const isLegacyShape = isEditorial && Boolean(view.quote || view.tags.length > 0 || view.quality);
+  const residual = residualBody(body, isLegacyShape);
   const targetHeadingId = targetSection ? `section-${encodeURIComponent(targetSection.sectionId)}` : undefined;
-  const otherSections = sections.filter((section) => section.sectionId !== targetSection?.sectionId);
+  const otherSections = view.sections.filter((section) => section.sectionId !== targetSection?.sectionId);
 
   const complete = isEditorial ? (
     <>
-      {markdown && <Markdown text={markdown} />}
+      {view.quote && (
+        <blockquote className="pull">
+          <p>&ldquo;{view.quote.text}&rdquo;</p>
+          {view.quote.attribution && <cite>{view.quote.attribution}</cite>}
+        </blockquote>
+      )}
+      {view.markdown && <Markdown text={view.markdown} />}
       {otherSections.map((section, index) => (
         <Section key={section.sectionId ?? index} section={section} />
       ))}
+      {view.tags.length > 0 && (
+        <div className="artifact-tags">
+          {view.tags.map((tag) => <span key={tag}>{tag}</span>)}
+        </div>
+      )}
+      {view.quality && (view.quality.criticPass !== undefined || view.quality.quotesVerified !== undefined) && (
+        <p className="artifact-foot">
+          {view.quality.criticPass !== undefined && `${view.quality.criticPass ? "✓" : "✗"} critic`}
+          {view.quality.criticPass !== undefined && view.quality.quotesVerified !== undefined && " · "}
+          {view.quality.quotesVerified !== undefined && `${view.quality.quotesVerified ? "✓" : "✗"} quotes`}
+        </p>
+      )}
       {residual !== undefined && (
         <details className="artifact-more">
           <summary>More detail</summary>

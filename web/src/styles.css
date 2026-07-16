@@ -1375,3 +1375,28 @@ summary:focus-visible {
 .card-actions-secondary button {
   flex: 0 0 auto;
 }
+
+/* Legacy/distillery artifact chrome: quiet mono tag row + provenance foot. */
+.artifact-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 14px 0 2px;
+}
+
+.artifact-tags span {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--quiet);
+}
+
+.artifact-foot {
+  margin: 12px 0 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--quiet);
+}
