@@ -6,6 +6,8 @@
 import { FEED_HOST_URL } from "./config.ts";
 
 export type ClientLogLevel = "info" | "warn" | "error";
+export type ClientSessionMode = "fresh" | "restored";
+export type DelegationFailureStage = "mint" | "submit" | "activate";
 
 export type ClientLogFields = {
   traceId?: string;
@@ -13,7 +15,18 @@ export type ClientLogFields = {
   durationMs?: number;
   elapsedMs?: number;
   activeElapsedMs?: number;
+  session_mode?: ClientSessionMode;
+  stage?: DelegationFailureStage;
 };
+
+export function buildClientEventPayload(
+  level: ClientLogLevel,
+  event: string,
+  detail?: string,
+  fields: ClientLogFields = {},
+): Record<string, unknown> {
+  return { level, event, detail: detail?.slice(0, 500), ...fields };
+}
 
 export function reportClientEvent(
   level: ClientLogLevel,
@@ -29,7 +42,7 @@ export function reportClientEvent(
         "content-type": "application/json",
         ...(actorId ? { "x-feed-actor-id": actorId } : {}),
       },
-      body: JSON.stringify({ level, event, detail: detail?.slice(0, 500), ...fields }),
+      body: JSON.stringify(buildClientEventPayload(level, event, detail, fields)),
       keepalive: true,
     }).catch(() => undefined);
   } catch {
@@ -47,6 +60,7 @@ export function reportClientTiming(
     systemElapsedBeforeApprovalMs?: number;
     actorId?: string;
     detail?: string;
+    sessionMode: ClientSessionMode;
   },
 ): void {
   const now = performance.now();
@@ -61,6 +75,7 @@ export function reportClientTiming(
             (input.systemElapsedBeforeApprovalMs ?? 0) + now - input.systemStartedAt,
           ),
         }),
+    session_mode: input.sessionMode,
   });
 }
 

@@ -113,4 +113,20 @@ describe("FeedHostDelegationStore", () => {
       "live",
     ]);
   });
+
+  test("reports count-only diagnostics for observed delegation records", async () => {
+    const { node } = fakeStoreNode();
+    const store = new FeedHostDelegationStore(node);
+    await store.save(record({
+      resources: [
+        { path: "one", serializedDelegation: "secret-one", acceptedAt: "2026-07-01T00:00:00.000Z", expiresAt: "2026-07-02T12:00:00.000Z" },
+        { path: "two", serializedDelegation: "secret-two", acceptedAt: "2026-07-01T00:00:00.000Z", expiresAt: "2026-07-10T00:00:00.000Z" },
+      ],
+    }));
+
+    const stats = store.stats(new Date("2026-07-02T00:00:00.000Z"));
+    expect(stats).toEqual({ actors: 1, resources: 2, expiringSoon: 1 });
+    expect(JSON.stringify(stats)).not.toContain("secret");
+    expect(JSON.stringify(stats)).not.toContain(ACTOR_ID);
+  });
 });

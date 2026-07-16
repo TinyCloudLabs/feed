@@ -11,7 +11,7 @@ import {
 import type { providers } from "ethers";
 import { TINYCLOUD_HOST } from "./config.ts";
 import type { FeedHostDelegationPolicy, FeedHostDelegationReceipt } from "./delegation.ts";
-import { FeedV1HostClient } from "./feedV1HostClient.ts";
+import { FeedV1HostClient, FeedV1HostError } from "./feedV1HostClient.ts";
 import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import { delegateInputAuthorityLocally } from "./inputAuthority.ts";
 import { connectWallet } from "./openkey.ts";
@@ -38,6 +38,7 @@ export type FeedLoginTrace = {
   loginStartedAt: number;
   systemStartedAt?: number;
   systemElapsedBeforeApprovalMs?: number;
+  sessionMode: "fresh" | "restored";
 };
 
 function delegationManifest(policy: FeedHostDelegationPolicy): Manifest {
@@ -85,15 +86,17 @@ function savedAddress(): string | null {
 }
 
 export async function signIn(policy: FeedHostDelegationPolicy, trace?: FeedLoginTrace): Promise<FeedSession> {
+  const sessionMode = savedAddress() ? "restored" : "fresh";
   const walletStartedAt = performance.now();
   const { address, web3Provider } = await connectWallet();
-  if (trace) reportClientTiming("login_wallet_connected", { ...trace, phaseStartedAt: walletStartedAt });
+  if (trace) reportClientTiming("login_wallet_connected", { ...trace, sessionMode, phaseStartedAt: walletStartedAt });
   const tc = new TinyCloudWeb(buildConfig(web3Provider, policy));
   const tinyCloudStartedAt = performance.now();
   await signInWithSpaceCreationRetry(tc);
   if (trace) {
     reportClientTiming("login_tinycloud_signed_in", {
       ...trace,
+      sessionMode,
       phaseStartedAt: tinyCloudStartedAt,
       actorId: tc.did,
     });
@@ -161,12 +164,24 @@ export async function submitFeedHostDelegations(input: {
     }
     serializedDelegation = serializeDelegation(result.delegation);
   } catch (error) {
-    reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId);
+    reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
+      stage: "mint",
+      ...(input.trace ? { session_mode: input.trace.sessionMode } : {}),
+    });
     if (isSessionScopeError(error)) throw reconnectRequiredError(error);
     throw error;
   }
   const submitStartedAt = performance.now();
-  const receipt = await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation });
+  let receipt: FeedHostDelegationReceipt;
+  try {
+    receipt = await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation });
+  } catch (error) {
+    reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
+      stage: delegationSubmissionFailureStage(error),
+      ...(input.trace ? { session_mode: input.trace.sessionMode } : {}),
+    });
+    throw error;
+  }
   if (input.trace) {
     reportClientTiming("login_delegation_accepted", {
       ...input.trace,
@@ -176,6 +191,19 @@ export async function submitFeedHostDelegations(input: {
     });
   }
   return [receipt];
+}
+
+export function delegationSubmissionFailureStage(error: unknown): "submit" | "activate" {
+  if (!(error instanceof FeedV1HostError)) return "submit";
+  try {
+    const body = JSON.parse(error.body) as { error?: { code?: unknown } };
+    const code = body.error?.code;
+    return code === "invalid_delegation" || code === "delegation_stale" || code === "denied" || code === "actor_mismatch"
+      ? "activate"
+      : "submit";
+  } catch {
+    return "submit";
+  }
 }
 
 async function materializeFeedHostDelegation(
