@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   ControlIntentEvent,
+  FeedArtifact,
   FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
-import { artifactExpansionSection, type FeedItemProjection, type FeedPost } from "../../shared/feed-item.ts";
-import { ArtifactBody } from "./ArtifactBody.tsx";
+import { type FeedItemProjection, type FeedPost } from "../../shared/feed-item.ts";
+import { ArtifactPage, type ArtifactPageState } from "./ArtifactPage.tsx";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
   attachReceivedInputAuthority,
@@ -59,12 +60,51 @@ const FEED_EVENTS_RETRY_MS = 15_000;
 const TRACE_HEADER_ENABLED = import.meta.env.VITE_FEED_TRACE_HEADER === "1";
 const SETUP_STATUS_POLL_MS = 1000;
 const RECOVERY_COOLDOWN_MS = 30_000;
+// Time budget for restoring the feed scroll position after returning from an
+// artifact page. The list can render below viewport height for a few hundred
+// milliseconds while cards refill; a frame-count cap gave up during exactly
+// that window (observed via scroll instrumentation), so the budget is
+// wall-clock and generous. Route changes cancel the loop via effect cleanup.
+const SCROLL_RESTORE_BUDGET_MS = 4000;
 const DEFAULT_ROUTINE_DRAFT: RoutineDraft = {
   cadence: "normal",
   sourceSelection: "recent_authorized",
   audience: "private",
   outputVolume: "standard",
 };
+
+type ArtifactRoute = {
+  feedItemId: string;
+  artifactId: string;
+  postId?: string;
+};
+
+export function currentRoute(hash = typeof location === "undefined" ? "" : location.hash): ArtifactRoute | null {
+  const match = hash.match(/^#\/a\/(.+)$/);
+  if (!match) return null;
+  let feedItemId: string;
+  try {
+    feedItemId = decodeURIComponent(match[1]!);
+  } catch {
+    return null;
+  }
+  if (!feedItemId) return null;
+  const separator = feedItemId.indexOf("::");
+  const legacy = feedItemId.startsWith("legacy:");
+  const artifactId = legacy
+    ? feedItemId.slice("legacy:".length)
+    : separator >= 0
+      ? feedItemId.slice(0, separator)
+      : feedItemId;
+  if (!artifactId) return null;
+  if (separator < 0) return { feedItemId, artifactId };
+  const encodedPostId = feedItemId.slice(separator + 2);
+  try {
+    return { feedItemId, artifactId, postId: decodeURIComponent(encodedPostId) };
+  } catch {
+    return { feedItemId, artifactId };
+  }
+}
 
 class FeedSetupFailedError extends Error {
   constructor(readonly setup: FeedHostSetupStatus) {
@@ -99,6 +139,12 @@ export function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [activeView, setActiveView] = useState<FeedView>("for_you");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
+  const [route, setRoute] = useState<ArtifactRoute | null>(() => currentRoute());
+  const [pageArtifact, setPageArtifact] = useState<FeedArtifact | null>(null);
+  const [pageLoadState, setPageLoadState] = useState<ArtifactPageState>("loading");
+  const [pageLoadError, setPageLoadError] = useState<string | undefined>();
+  const [pageRequestArtifactId, setPageRequestArtifactId] = useState<string | null>(null);
+  const [pageRetry, setPageRetry] = useState(0);
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef(false);
   const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
@@ -107,6 +153,10 @@ export function App() {
   const firstContentReported = useRef<string | null>(null);
   const restoredHostSession = useRef(false);
   const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
+  const routeRef = useRef(route);
+  const enteredFromFeed = useRef(false);
+  const savedFeedScrollY = useRef(0);
+  const pendingFeedScrollY = useRef<number | null>(null);
 
   const client = useMemo(
     () => new FeedV1HostClient({
@@ -118,6 +168,50 @@ export function App() {
     [session?.readerDid],
   );
   const artifactCache = useMemo(() => createLazyArtifactCache((artifactId) => client.getArtifact(artifactId)), [client]);
+
+  useEffect(() => {
+    const previousScrollRestoration = history.scrollRestoration;
+    history.scrollRestoration = "manual";
+    // Capture the feed's scroll position at the moment a hash link is
+    // clicked. Anything later is too late: the browser scrolls to top for the
+    // unmatched fragment (firing its own scroll event) BEFORE hashchange, so
+    // both capture-on-hashchange and a continuous scroll tracker record 0
+    // (verified with scroll instrumentation).
+    const onCaptureClick = (event: MouseEvent) => {
+      if (routeRef.current) return;
+      const anchor = (event.target as Element | null)?.closest?.("a[href^='#/']");
+      if (anchor) savedFeedScrollY.current = window.scrollY;
+    };
+    const onHashChange = () => {
+      const previous = routeRef.current;
+      const next = currentRoute();
+      if (!previous && next) {
+        pendingFeedScrollY.current = null;
+        enteredFromFeed.current = true;
+      } else if (previous && !next) {
+        pendingFeedScrollY.current = savedFeedScrollY.current;
+      }
+      routeRef.current = next;
+      setRoute(next);
+      setMenuOpen(false);
+    };
+    window.addEventListener("click", onCaptureClick, { capture: true });
+    window.addEventListener("hashchange", onHashChange);
+    return () => {
+      window.removeEventListener("click", onCaptureClick, { capture: true });
+      window.removeEventListener("hashchange", onHashChange);
+      history.scrollRestoration = previousScrollRestoration;
+    };
+  }, []);
+
+  const returnToFeed = useCallback(() => {
+    if (enteredFromFeed.current) {
+      enteredFromFeed.current = false;
+      history.back();
+      return;
+    }
+    location.hash = "";
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -524,8 +618,53 @@ export function App() {
     await hydrate;
   }, [artifactCache, recoverDelegation]);
 
+  const routedItem = route
+    ? items.find((item) => item.projection.feedItemId === route.feedItemId)
+    : undefined;
+  const routedArtifactId = routedItem?.projection.target.artifactId ?? route?.artifactId;
+  const routedPostId = routedItem?.projection.target.kind === "post"
+    ? routedItem.projection.target.postId
+    : route?.postId;
+  const cachedPageArtifact = routedArtifactId ? artifactCache.peek(routedArtifactId) : undefined;
+  const resolvedPageArtifact = routedItem?.artifact ?? cachedPageArtifact ?? (
+    pageArtifact?.artifactId === routedArtifactId ? pageArtifact : null
+  );
+
+  useEffect(() => {
+    if (!route || !routedArtifactId || feedState !== "running") return;
+    if (resolvedPageArtifact) {
+      setPageRequestArtifactId(routedArtifactId);
+      setPageArtifact(resolvedPageArtifact);
+      setPageLoadError(undefined);
+      setPageLoadState("ready");
+      return;
+    }
+    let cancelled = false;
+    setPageRequestArtifactId(routedArtifactId);
+    setPageArtifact(null);
+    setPageLoadError(undefined);
+    setPageLoadState("loading");
+    artifactCache.load(routedArtifactId)
+      .then((artifact) => {
+        if (cancelled) return;
+        setPageArtifact(artifact);
+        setItems((current) => current.map((item) => item.projection.target.artifactId === routedArtifactId
+          ? { ...item, artifact, error: undefined }
+          : item));
+        setPageLoadState("ready");
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        setPageLoadError(formatHostError(error));
+        setPageLoadState(error instanceof FeedV1HostError && (error.status === 404 || error.status === 424) ? "gone" : "error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifactCache, feedState, pageRetry, resolvedPageArtifact, route?.feedItemId, routedArtifactId]);
+
   const sendFeedback = async (
-    projection: FeedItemProjection,
+    projection: Pick<FeedItemProjection, "feedItemId">,
     signal: FeedbackEvent["signal"],
     payload?: unknown,
     attemptKey = `${projection.feedItemId}:${signal}`,
@@ -594,6 +733,34 @@ export function App() {
 
   const visibleItems = feedItemsForView(items, activeView);
   const visibleLoadError = loadError ?? eventsError;
+
+  useLayoutEffect(() => {
+    if (route || pendingFeedScrollY.current === null) return;
+    const target = pendingFeedScrollY.current;
+    let frame: number | undefined;
+    const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
+    const restore = () => {
+      const scrollHeight = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+      const maximumScrollY = Math.max(0, scrollHeight - window.innerHeight);
+      if (maximumScrollY >= target) {
+        window.scrollTo(0, target);
+        pendingFeedScrollY.current = null;
+        return;
+      }
+      if (performance.now() > deadline) {
+        // The content never regained enough height; land as close as
+        // possible and stop cleanly.
+        window.scrollTo(0, maximumScrollY);
+        pendingFeedScrollY.current = null;
+        return;
+      }
+      frame = requestAnimationFrame(restore);
+    };
+    restore();
+    return () => {
+      if (frame !== undefined) cancelAnimationFrame(frame);
+    };
+  }, [loadState, route, visibleItems.length]);
 
   useEffect(() => {
     const trace = loginTrace.current;
@@ -698,12 +865,37 @@ export function App() {
         <SkillCredentialsPanel client={client} policy={policy!} actorId={session.readerDid} onDisconnect={() => void disconnect()} />
       )}
 
-      <main
-        id="feed-view-panel"
-        className="content-shell"
-        role="tabpanel"
-        aria-labelledby={`feed-tab-${activeView}`}
-      >
+      {route && routedArtifactId ? (
+        <ArtifactPage
+          feedItemId={route.feedItemId}
+          artifactId={routedArtifactId}
+          artifact={resolvedPageArtifact}
+          projection={routedItem?.projection}
+          postId={routedPostId}
+          state={resolvedPageArtifact
+            ? "ready"
+            : pageRequestArtifactId === routedArtifactId
+              ? pageLoadState
+              : "loading"}
+          error={pageLoadError}
+          heroUrl={client.heroUrl(routedArtifactId)}
+          busyAction={busyAction}
+          onBack={returnToFeed}
+          onRetry={() => setPageRetry((value) => value + 1)}
+          onFeedback={(signal, payload, attemptKey) => sendFeedback(
+            { feedItemId: route.feedItemId },
+            signal,
+            payload,
+            attemptKey,
+          )}
+          onResetAttempt={(attemptKey) => feedbackAttempts.current.delete(attemptKey)}
+        />
+      ) : <main
+          id="feed-view-panel"
+          className="content-shell"
+          role="tabpanel"
+          aria-labelledby={`feed-tab-${activeView}`}
+        >
         {commandStatus && <p className="interaction-status" role="status" aria-live="polite">{commandStatus}</p>}
         {loadState === "loading" && visibleLoadError === null && (
           <NoticePanel
@@ -735,7 +927,7 @@ export function App() {
             />
           ))}
         </div>
-      </main>
+        </main>}
     </div>
   );
 }
@@ -944,14 +1136,12 @@ function FeedCard({
   const provenance = readableProvenance(item);
   const availability = feedItemAvailability(item);
   const isSaved = item.projection.disposition === "saved";
-  const isPost = item.projection.target.kind === "post" || Boolean(item.projection.postBody);
   const title = item.projection.postTitle ?? post?.title ?? artifact?.title;
   // First verified quote reads as a distillery-style pull on the card face.
   const pullQuote = post?.evidence.find(
     (entry): entry is Extract<FeedPost["evidence"][number], { kind: "verified_quote" }> =>
       entry.kind === "verified_quote",
   );
-  const expansionSection = artifact ? artifactExpansionSection(artifact, item.projection.sectionRef) : undefined;
   const loadArtifact = async () => {
     if (artifact || artifactLoading) return;
     setArtifactLoading(true);
@@ -980,9 +1170,9 @@ function FeedCard({
         <span>{readablePostKind(item)}</span>
         <span>{readableFeedTime(item.projection.publishedAt)}</span>
       </div>
-      {title && <h2>{title}</h2>}
+      {title && <h2><a href={`#/a/${encodeURIComponent(item.projection.feedItemId)}`}>{title}</a></h2>}
       {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
-      {isPost ? (
+      {(item.projection.target.kind === "post" || item.projection.postBody) && (
         <>
           <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
             ? "This post’s preview is temporarily unavailable."
@@ -996,30 +1186,7 @@ function FeedCard({
               </cite>
             </blockquote>
           )}
-          <details
-            className="artifact-expansion"
-            onToggle={(event) => event.currentTarget.open && void loadArtifact()}
-          >
-            <summary>Open complete artifact</summary>
-            <div className="artifact-content">
-              {artifactLoading && <p role="status" aria-live="polite">Loading the complete artifact…</p>}
-              {item.error && <p className="availability-message">{item.error} You can retry by closing and opening this section.</p>}
-              {artifact && <p className="artifact-label">From {artifact.title}</p>}
-              {artifact?.summary && <p className="summary">{artifact.summary}</p>}
-              {artifact && <ArtifactBody body={artifact.body} targetSection={expansionSection} />}
-            </div>
-          </details>
         </>
-      ) : (
-        <details className="artifact-expansion" onToggle={(event) => event.currentTarget.open && void loadArtifact()}>
-          <summary>Open artifact</summary>
-          <div className="artifact-content">
-            {artifactLoading && <p role="status" aria-live="polite">Loading the artifact…</p>}
-            {item.error && <p className="availability-message">{item.error}</p>}
-            {artifact?.summary && <p className="summary">{artifact.summary}</p>}
-            {artifact && <ArtifactBody body={artifact.body} targetSection={expansionSection} />}
-          </div>
-        </details>
       )}
       <details className="why-this" onToggle={(event) => event.currentTarget.open && void loadArtifact()}>
         <summary>Why this?</summary>

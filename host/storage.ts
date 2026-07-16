@@ -346,6 +346,7 @@ export type FeedHostActorStorage = {
   feed: DelegatedAccess;
   settings: DelegatedAccess;
   documents: DelegatedAccess;
+  media?: DelegatedAccess;
   legacyArtifacts?: DelegatedAccess;
   legacyInteractions?: DelegatedAccess;
 };
@@ -362,6 +363,11 @@ export type FeedProjectionParity = {
   matchingRows: number;
   mismatchedRows: number;
   readyToRetireLegacyReads: boolean;
+};
+
+export type ArtifactHero = {
+  bytes: Uint8Array;
+  contentType: string;
 };
 
 export const DEFAULT_MAX_PENDING_GENERATION_REQUESTS = 8;
@@ -554,6 +560,33 @@ export class FeedHostStorage {
   async getArtifact(actor: FeedHostActorStorage, artifactId: string): Promise<FeedArtifact | null> {
     const result = await this.readArtifact(actor, artifactId);
     return result.kind === "found" ? result.artifact : null;
+  }
+
+  async readArtifactHero(actor: FeedHostActorStorage, artifactId: string): Promise<ArtifactHero | null> {
+    const result = await this.readArtifact(actor, artifactId);
+    if (result.kind !== "found") return null;
+    const reference = artifactHeroReference(result.artifact.body);
+    if (!reference) return null;
+    // Migrated distillery docs store a bare filename ("hero.png") whose blob
+    // lives under the artifact's media directory, usually as base64 with a
+    // .b64 suffix. Try candidates in order until one resolves.
+    for (const candidate of heroKeyCandidates(reference.key, result.artifact.artifactId)) {
+      const key = artifactMediaKey(candidate);
+      if (!key) continue;
+      const media = await (actor.media ?? actor.documents).kv.get<string>(key);
+      if (!media.ok) {
+        if (media.error.code === "KV_NOT_FOUND" || media.error.code === "NOT_FOUND") continue;
+        throw new Error(`Failed to read artifact hero: ${resultError(media)}`);
+      }
+      if (typeof media.data.data !== "string") continue;
+      const decoded = decodeBase64Media(media.data.data);
+      if (!decoded) continue;
+      return {
+        bytes: decoded.bytes,
+        contentType: reference.contentType ?? decoded.contentType ?? imageContentType(key),
+      };
+    }
+    return null;
   }
 
   async getProvenance(
@@ -2416,6 +2449,83 @@ function artifactDocKey(docKey: string): string {
   return trimmed.startsWith(`${FEED_HOST_ARTIFACT_DOC_PREFIX}/`)
     ? trimmed
     : `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${trimmed}`;
+}
+
+function artifactHeroReference(body: unknown): { key: string; contentType?: string } | null {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const record = body as Record<string, unknown>;
+  const hero = record.hero_image;
+  const bodyMime = imageMime(record.hero_image_mime);
+  if (typeof hero === "string" && hero.trim()) return { key: hero.trim(), ...(bodyMime ? { contentType: bodyMime } : {}) };
+  if (!hero || typeof hero !== "object" || Array.isArray(hero)) return null;
+  const heroRecord = hero as Record<string, unknown>;
+  const key = ["key", "path", "mediaKey", "storageKey", "src"]
+    .map((field) => heroRecord[field])
+    .find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  if (!key) return null;
+  const contentType = bodyMime ?? ["mime", "mimeType", "contentType"]
+    .map((field) => imageMime(heroRecord[field]))
+    .find((value): value is string => Boolean(value));
+  return { key: key.trim(), ...(contentType ? { contentType } : {}) };
+}
+
+// A hero reference may be a full media key, a media-relative path, or just a
+// filename from a migrated distillery doc. Expand to concrete candidates;
+// bare filenames resolve inside the artifact's media directory, preferring
+// the .b64 variant the legacy pipeline wrote.
+function heroKeyCandidates(reference: string, artifactId: string): string[] {
+  const trimmed = reference.trim();
+  if (trimmed.includes("/")) return [trimmed];
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(trimmed) || !/^[A-Za-z0-9._:-]+$/.test(artifactId)) return [];
+  const dir = `xyz.tinycloud.artifacts/media/${artifactId}`;
+  return trimmed.endsWith(".b64")
+    ? [`${dir}/${trimmed}`]
+    : [`${dir}/${trimmed}.b64`, `${dir}/${trimmed}`];
+}
+
+function artifactMediaKey(value: string): string | null {
+  const trimmed = value.replace(/^\/+/, "");
+  if (!trimmed || trimmed.includes("..") || /^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return null;
+  const mediaPrefix = "xyz.tinycloud.artifacts/media/";
+  const key = trimmed.startsWith(mediaPrefix)
+    ? trimmed
+    : trimmed.startsWith("media/")
+      ? `xyz.tinycloud.artifacts/${trimmed}`
+      : "";
+  return key.startsWith(mediaPrefix) ? key : null;
+}
+
+// Raster whitelist only — image/svg+xml is script-capable markup and serving
+// it from the authenticated host origin would be an XSS vector.
+const SAFE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"]);
+
+function imageMime(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return SAFE_IMAGE_MIMES.has(normalized) ? normalized : undefined;
+}
+
+function decodeBase64Media(value: string): { bytes: Uint8Array; contentType?: string } | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const dataUri = trimmed.match(/^data:(image\/[a-z0-9.+-]+);base64,(.+)$/is);
+  const encoded = (dataUri?.[2] ?? trimmed).replaceAll(/\s+/g, "");
+  if (!encoded || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) return null;
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.length === 0) return null;
+  const declaredMime = dataUri ? imageMime(dataUri[1]) : undefined;
+  return { bytes: new Uint8Array(bytes), ...(declaredMime ? { contentType: declaredMime } : {}) };
+}
+
+function imageContentType(key: string): string {
+  const fileName = key.toLowerCase().replace(/\.b64$/, "");
+  if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg")) return "image/jpeg";
+  if (fileName.endsWith(".webp")) return "image/webp";
+  if (fileName.endsWith(".gif")) return "image/gif";
+  if (fileName.endsWith(".avif")) return "image/avif";
+  // SVG is deliberately absent: script-capable markup served from the
+  // authenticated host origin is an XSS vector. Raster formats only.
+  return "image/png";
 }
 
 function hydrateArtifactDocument(

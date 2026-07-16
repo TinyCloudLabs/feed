@@ -63,16 +63,26 @@ test("interaction audit — every control, measured", async ({ page }) => {
   await probe("tabs", "Saved tab", page.getByRole("tab", { name: "Saved", exact: true }));
   await probe("tabs", "For you tab", page.getByRole("tab", { name: "For you", exact: true }));
 
-  // ---- First card: expansions + non-destructive actions ----
+  // ---- First card: provenance + headline tap-through ----
   const card = page.locator(".feed-card").first();
-  await probe("card", "Open complete artifact", card.getByText(/open (complete )?artifact/i));
   await probe("card", "Why this?", card.getByText("Why this?", { exact: true }));
   await probe("card", "Advanced details", card.getByText(/advanced details/i));
-  await probe("card", "Save", card.getByRole("button", { name: /^Save$/ }));
-  await probe("card", "Helpful", card.getByRole("button", { name: "Helpful", exact: true }));
-  await probe("card", "Add note (open)", card.getByRole("button", { name: "Add note", exact: true }));
-  await probe("card", "Not helpful", card.getByRole("button", { name: "Not helpful", exact: true }));
-  await probe("card", "Show fewer like this", card.getByRole("button", { name: /show fewer/i }));
+  await probe("card", "Headline → artifact page", card.getByRole("link").first());
+
+  // ---- Artifact page: sources + the full feedback row ----
+  const artifactPage = page.locator(".artifact-page");
+  // The page hydrates its artifact after navigation; wait for the provenance
+  // section before probing so timing doesn't read as missing controls.
+  const pageSettled = await artifactPage.getByRole("heading", { name: "Why you're seeing this" })
+    .waitFor({ timeout: 20000 }).then(() => true).catch(() => false);
+  rows.push({ surface: "artifact page", control: "page hydrated", ok: pageSettled, ms: 0, note: pageSettled ? "" : "provenance section never appeared" });
+  await probe("artifact page", "View sources and quoted moments", artifactPage.getByText("View sources and quoted moments", { exact: true }));
+  await probe("artifact page", "Save", artifactPage.getByRole("button", { name: /^(Save|Saved)$/ }));
+  await probe("artifact page", "Helpful", artifactPage.getByRole("button", { name: "Helpful", exact: true }));
+  await probe("artifact page", "Add note (open)", artifactPage.getByRole("button", { name: "Add note", exact: true }));
+  await probe("artifact page", "Not helpful", artifactPage.getByRole("button", { name: "Not helpful", exact: true }));
+  await probe("artifact page", "Show fewer like this", artifactPage.getByRole("button", { name: /show fewer/i }));
+  await probe("artifact page", "Hide", artifactPage.getByRole("button", { name: "Hide", exact: true }));
 
   // ---- Ask Feed (top bar) ----
   await probe("topbar", "Ask Feed", page.getByRole("button", { name: "Ask Feed", exact: true }));

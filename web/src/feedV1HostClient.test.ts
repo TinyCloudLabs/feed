@@ -14,6 +14,11 @@ function jsonResponse(body: unknown, init: ResponseInit = {}): Response {
 }
 
 describe("FeedV1HostClient", () => {
+  test("builds the credentialed same-origin hero endpoint URL", () => {
+    const client = new FeedV1HostClient({ baseUrl: "https://feed.example.test/" });
+    expect(client.heroUrl("artifact/one")).toBe("https://feed.example.test/artifacts/artifact%2Fone/hero");
+  });
+
   test("lists Feed projections through the separate host API", async () => {
     const calls: string[] = [];
     const client = new FeedV1HostClient({

@@ -161,6 +161,7 @@ describe("Feed Host server", () => {
         "/feed",
         "/feed/events",
         "/artifacts/{artifactId}",
+        "/artifacts/{artifactId}/hero",
         "/artifacts/{artifactId}/provenance",
         "/feedback",
         "/control-intents",
@@ -1942,6 +1943,31 @@ describe("Feed Host workflow routines", () => {
     expect(body.error.code).toBe("denied");
   });
 
+  test("serves decoded artifact heroes with a private one-hour cache and returns 404 when absent", async () => {
+    const storage = new HeroFeedHostStorage();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const response = await fetch(`${runtime.url}/artifacts/with-hero/hero`, {
+      headers: { "x-feed-actor-id": ACTOR_ID },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("cache-control")).toBe("private, max-age=3600");
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe("served hero bytes");
+
+    const missing = await fetch(`${runtime.url}/artifacts/without-hero/hero`, {
+      headers: { "x-feed-actor-id": ACTOR_ID },
+    });
+    expect(missing.status).toBe(404);
+  });
+
   test("pausing a routine through control intents is reflected in /workflows", async () => {
     const storage = new FakeFeedHostStorage();
     runtime = startFeedHost({
@@ -2266,6 +2292,13 @@ class FakeFeedHostStorage {
   async getArtifact(actor: FeedHostActorStorage, artifactId: string): Promise<FeedArtifact | null> {
     const result = await this.readArtifact(actor, artifactId);
     return result.kind === "found" ? result.artifact : null;
+  }
+
+  async readArtifactHero(
+    _actor: FeedHostActorStorage,
+    _artifactId: string,
+  ): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+    return null;
   }
 
   async getProvenance(
@@ -2828,6 +2861,17 @@ class UnauthorizedReadStorage extends FakeFeedHostStorage {
     throw new Error(
       "TinyCloud SQL query failed: SQL query failed: 401 - Unauthorized Action: tinycloud:pkh:eip155:1:0xabc:applications/sql/xyz.tinycloud.artifacts/index / tinycloud.sql/read",
     );
+  }
+}
+
+class HeroFeedHostStorage extends FakeFeedHostStorage {
+  override async readArtifactHero(
+    _actor: FeedHostActorStorage,
+    artifactId: string,
+  ): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+    return artifactId === "with-hero"
+      ? { bytes: new TextEncoder().encode("served hero bytes"), contentType: "image/png" }
+      : null;
   }
 }
 

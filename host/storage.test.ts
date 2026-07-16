@@ -7,6 +7,7 @@ import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/li
 import type { FeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { feedV1MigrationApplyPlans } from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
 import { seedDefaultFeed } from "./seed.ts";
+import RICH_ARTIFACT_FIXTURE from "../shared/fixtures/rich-artifact.json";
 import {
   FEED_V1_LEGACY_PROJECTION_PARITY_SQL,
   FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL,
@@ -364,6 +365,60 @@ test("lists feed projections without hydrating artifact documents", async () => 
   const cachedPage = await storage.listFeed(refreshedAccess, { limit: 40 });
   expect(cachedPage.items).toHaveLength(1);
   expect(cachedPage.items[0]?.target.artifactId).toBe(artifact.artifact_id);
+});
+
+test("reads a base64 hero through the artifacts-prefix delegation with the declared image type", async () => {
+  const artifacts = realHandle("artifacts_index");
+  const artifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;
+  const heroKey = `xyz.tinycloud.artifacts/media/${artifact.artifactId}/hero.png.b64`;
+  (artifact.body as Record<string, unknown>).hero_image = { key: heroKey };
+  (artifact.body as Record<string, unknown>).hero_image_mime = "image/png";
+  artifacts.db.query(`INSERT INTO artifact_index
+    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
+     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
+     created_at, updated_at, published_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      artifact.artifactId,
+      artifact.artifactType,
+      artifact.producedBy.packageId,
+      artifact.producedBy.packageVersion,
+      artifact.producedBy.packageDigest,
+      artifact.producedBy.runId,
+      artifact.idempotency.sourceFingerprint,
+      artifact.idempotency.artifactFingerprint,
+      artifact.idempotency.dedupeKey,
+      artifact.storage.docKey,
+      JSON.stringify(artifact.storage.mediaKeys ?? []),
+      artifact.createdAt,
+      artifact.updatedAt,
+      artifact.createdAt,
+    );
+  const docs = new Map<string, unknown>([
+    [artifactDocKey(artifact.storage.docKey), artifact],
+    [heroKey, Buffer.from("tiny hero bytes").toString("base64")],
+  ]);
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xhero",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    documents: {
+      kv: {
+        get: async (key: string) => docs.has(key)
+          ? { ok: true, data: { data: docs.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+  const storage = new FeedHostStorage();
+
+  expect((await storage.readArtifact(actor, artifact.artifactId)).kind).toBe("found");
+  const hero = await storage.readArtifactHero(actor, artifact.artifactId);
+  expect(hero?.contentType).toBe("image/png");
+  expect(Buffer.from(hero?.bytes ?? []).toString()).toBe("tiny hero bytes");
+
+  docs.delete(heroKey);
+  expect(await storage.readArtifactHero(actor, artifact.artifactId)).toBeNull();
+  artifacts.db.close();
 });
 
 test("rejects feedback for a missing artifact before writing either interaction table", async () => {

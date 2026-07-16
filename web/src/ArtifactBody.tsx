@@ -36,6 +36,7 @@ const MAX_RENDER_DEPTH = 8;
 const LEGACY_CONSUMED_KEYS = new Set([
   "type", "headline", "body", "quote", "attribution", "tags", "quality",
   "id", "generated_at", "producer", "approval_status", "hero_image",
+  "hero_image_mime",
   "source_transcripts", "source_quotes",
 ]);
 
@@ -88,7 +89,9 @@ function residualBody(body: unknown, legacy: boolean): unknown {
   const record = body as Record<string, unknown>;
   const rest = Object.fromEntries(
     Object.entries(record).filter(([key]) =>
-      legacy ? !LEGACY_CONSUMED_KEYS.has(key) : key !== "markdown" && key !== "sections"),
+      legacy
+        ? !LEGACY_CONSUMED_KEYS.has(key)
+        : !["markdown", "sections", "hero_image", "hero_image_mime"].includes(key)),
   );
   return Object.keys(rest).length > 0 ? rest : undefined;
 }

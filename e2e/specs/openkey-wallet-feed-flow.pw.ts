@@ -462,20 +462,40 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect(page.getByText(/approve the default bundle/i)).toHaveCount(0);
   await expect(page.getByText(/first-run-approval/i)).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
-  // The phrase also appears inside the lazily hydrated inline artifact body
-  // (which may be collapsed), so scope to the visible post card.
   await expect(page.locator("p.post-body", { hasText: /test an invite preview inside setup/i })).toBeVisible();
   await expect(page.getByText(/first collaborative action is now the dominant stall point/i).locator("visible=true").first()).toBeVisible();
   await expectMobileLayout(page);
-  await page.getByText("Open complete artifact").first().click();
-  await expect(page.getByText("From The onboarding experiment changed where users stall").first()).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Where activation now stalls" })).toBeVisible();
-  await expect(
-    page.getByLabel("Where activation now stalls").getByText(/moving the main drop-off to the first collaborative action/i),
-  ).toBeVisible();
-  await page.getByText("Show all sections").first().click();
+  // Scroll down and open a card that is IN VIEW at that position — Playwright
+  // auto-scrolls click targets into view, so clicking an above-the-fold card
+  // would silently move the page back to the top before navigation and the
+  // restore assertion would test a position the user never left from.
+  const scrollBeforeArtifact = await page.evaluate(() => {
+    window.scrollTo(0, Math.min(220, document.documentElement.scrollHeight - window.innerHeight));
+    return window.scrollY;
+  });
+  expect(scrollBeforeArtifact).toBeGreaterThan(0);
+  const targetLink = page.locator(".feed-card").last().getByRole("link").first();
+  const linkBox = await targetLink.boundingBox();
+  const viewport = page.viewportSize()!;
+  expect(linkBox).not.toBeNull();
+  expect(linkBox!.y).toBeGreaterThanOrEqual(0);
+  expect(linkBox!.y + linkBox!.height).toBeLessThanOrEqual(viewport.height);
+  await targetLink.click();
+  await expect(page).toHaveURL(/#\/a\//);
+  await expect(page.getByRole("heading", { name: "The onboarding experiment changed where users stall" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Why you're seeing this" })).toBeVisible();
+  await page.getByText("View sources and quoted moments", { exact: true }).click();
   await expect(page.getByText(/complete analysis remains type-specific/i).first()).toBeVisible();
-  await expect(page.getByRole("button", { name: "Hide" }).first()).toBeVisible();
+  // Body sections render on the page (parity with the pre-page inline suite).
+  await expect(page.getByRole("heading", { name: "Where activation now stalls" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Hide" })).toBeVisible();
+  await expectMobileLayout(page);
+  await page.getByRole("link", { name: "← Feed" }).click();
+  await expect(page).not.toHaveURL(/#\/a\//);
+  await expect(page.locator(".feed-list")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();
+  // Restore returns to where the user actually was when they clicked.
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(scrollBeforeArtifact);
   await page.getByRole("button", { name: "Save", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Saved", exact: true }).first()).toBeVisible();
   await page.getByRole("tab", { name: "Saved" }).click();

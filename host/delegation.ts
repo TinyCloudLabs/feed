@@ -36,6 +36,9 @@ export const FEED_HOST_ARTIFACTS_DB_PATH = FEED_V1_ARTIFACTS_INDEX_DB_PATH;
 export const FEED_HOST_FEED_DB_PATH = FEED_V1_FEED_INDEX_DB_PATH;
 export const FEED_HOST_FEED_SETTINGS_PREFIX = "xyz.tinycloud.feed/settings";
 export const FEED_HOST_ARTIFACT_DOC_PREFIX = FEED_V1_ARTIFACT_DOC_PREFIX;
+// Artifact media (hero images now; audio/video later) lives under its own
+// prefix, sibling to the artifact docs. Read-only from the host.
+export const FEED_HOST_ARTIFACT_MEDIA_PREFIX = "xyz.tinycloud.artifacts/media/";
 
 export const FEED_HOST_DELEGATION_RESOURCES = [
   {
@@ -61,6 +64,12 @@ export const FEED_HOST_DELEGATION_RESOURCES = [
     serviceShort: "kv",
     path: FEED_HOST_ARTIFACT_DOC_PREFIX,
     actions: [...FEED_HOST_KV_ACTIONS],
+  },
+  {
+    service: "tinycloud.kv",
+    serviceShort: "kv",
+    path: FEED_HOST_ARTIFACT_MEDIA_PREFIX,
+    actions: ["tinycloud.kv/get"],
   },
   {
     service: "tinycloud.sql",
