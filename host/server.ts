@@ -26,6 +26,7 @@ import {
   createFeedHostPolicy,
   FeedDelegationError,
   FEED_HOST_ARTIFACT_DOC_PREFIX,
+  FEED_HOST_ARTIFACT_MEDIA_PREFIX,
   FEED_HOST_ARTIFACTS_DB_PATH,
   FEED_HOST_FEED_DB_PATH,
   FEED_HOST_FEED_SETTINGS_PREFIX,
@@ -289,7 +290,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       const url = new URL(request.url);
       const workerRoute = isWorkerRoute(url.pathname);
       const privateRoute = requiresActorSession(request, url);
-      const noStoreRoute = workerRoute || privateRoute || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
+      const cacheableHeroRoute = isArtifactHeroRoute(request.method, url.pathname);
+      const noStoreRoute = workerRoute || (privateRoute && !cacheableHeroRoute) || url.pathname === "/delegation-policy" || url.pathname === "/api/delegations";
       const finish = (response: Response) => {
         const finished = applyResponsePolicy(
           response,
@@ -339,10 +341,14 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       };
 
       const publicRoute = PUBLIC_PATHS.has(url.pathname);
+      // <img> requests cannot carry an Authorization header, so the hero
+      // route is exempt from the bearer gate on token-configured deployments.
+      // It still requires the actor session cookie + a delegated actor.
+      const imageRoute = request.method === "GET" && /^\/artifacts\/[^/]+\/hero$/.test(url.pathname);
       if (workerRoute && !workerAuthorized(request, options.workerToken)) {
         return logRequest(jsonError(401, "unauthorized", "missing or invalid worker bearer token"), "unauthorized");
       }
-      if (!workerRoute && !publicRoute && !authorized(request, options.token)) {
+      if (!workerRoute && !publicRoute && !imageRoute && !authorized(request, options.token)) {
         return logRequest(jsonError(401, "unauthorized", "missing or invalid bearer token"), "unauthorized");
       }
 
@@ -766,6 +772,33 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     return new Response(body, { status: 200, headers: SSE_HEADERS });
   }
 
+  const artifactHeroMatch = url.pathname.match(/^\/artifacts\/([^/]+)\/hero$/);
+  if (request.method === "GET" && artifactHeroMatch) {
+    const actor = await requireDelegatedActor(request, context);
+    const artifactId = decodeURIComponent(artifactHeroMatch[1]);
+    const hero = await storage.readArtifactHero(actorStorage(actor), artifactId);
+    if (!hero) {
+      const missing = json({ error: { code: "not_found", message: `artifact hero not found: ${artifactId}` } }, 404);
+      // The hero path is exempt from the global no-store so 200s can cache;
+      // error responses must not be.
+      missing.headers.set("cache-control", "private, no-store");
+      return missing;
+    }
+    const bytes = hero.bytes.buffer.slice(hero.bytes.byteOffset, hero.bytes.byteOffset + hero.bytes.byteLength) as ArrayBuffer;
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        "content-type": hero.contentType,
+        "cache-control": "private, max-age=3600",
+        // Image bytes come from user-space media; never let the browser sniff
+        // them into something executable, and sandbox direct navigation.
+        "x-content-type-options": "nosniff",
+        "content-security-policy": "sandbox",
+      },
+    });
+  }
+
   const artifactMatch = url.pathname.match(/^\/artifacts\/([^/]+)(\/provenance)?$/);
   if (request.method === "GET" && artifactMatch) {
     const actor = await requireDelegatedActor(request, context);
@@ -1141,6 +1174,10 @@ function isActorControlRoute(method: string, pathname: string): boolean {
 
 function isArtifactReadRoute(method: string, pathname: string): boolean {
   return method === "GET" && pathname.startsWith("/artifacts/");
+}
+
+function isArtifactHeroRoute(method: string, pathname: string): boolean {
+  return method === "GET" && /^\/artifacts\/[^/]+\/hero$/.test(pathname);
 }
 
 function authenticatedSessionActor(request: Request, context: FeedHostContext): string | undefined {
@@ -1601,6 +1638,9 @@ export function actorStorage(actor: ActorState): FeedHostActorStorage {
     feed: selfHealingAccess(actor, FEED_HOST_FEED_DB_PATH),
     settings: selfHealingAccess(actor, FEED_HOST_FEED_SETTINGS_PREFIX),
     documents: selfHealingAccess(actor, FEED_HOST_ARTIFACT_DOC_PREFIX),
+    media: actor.accessByResource.get(FEED_HOST_ARTIFACT_MEDIA_PREFIX)
+      ? selfHealingAccess(actor, FEED_HOST_ARTIFACT_MEDIA_PREFIX)
+      : undefined,
     legacyArtifacts: actor.accessByResource.get(LEGACY_FEED_DB_PATH)
       ? selfHealingAccess(actor, LEGACY_FEED_DB_PATH)
       : undefined,

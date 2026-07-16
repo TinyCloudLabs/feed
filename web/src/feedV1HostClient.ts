@@ -245,6 +245,10 @@ export class FeedV1HostClient {
     return this.request<FeedArtifact>(`/artifacts/${encodeURIComponent(artifactId)}`);
   }
 
+  heroUrl(artifactId: string): string {
+    return `${this.baseUrl}/artifacts/${encodeURIComponent(artifactId)}/hero`;
+  }
+
   async getProvenance(artifactId: string): Promise<ArtifactProvenance> {
     return this.request<ArtifactProvenance>(`/artifacts/${encodeURIComponent(artifactId)}/provenance`);
   }

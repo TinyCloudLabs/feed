@@ -689,6 +689,17 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
       "/artifacts/{artifactId}": {
         get: { responses: { 200: { description: "artifact", content: jsonResponse } } },
       },
+      "/artifacts/{artifactId}/hero": {
+        get: {
+          responses: {
+            200: {
+              description: "artifact hero image",
+              content: { "image/*": { schema: { type: "string", contentEncoding: "binary" } } },
+            },
+            404: { description: "hero image absent", content: jsonResponse },
+          },
+        },
+      },
       "/artifacts/{artifactId}/provenance": {
         get: { responses: { 200: { description: "provenance", content: jsonResponse } } },
       },
