@@ -112,6 +112,20 @@ test("kv operations heal through the same path", async () => {
   expect(result.data?.data).toContain("kv-2");
 });
 
+test("kv operations default to the resource path requested from a shared access", async () => {
+  const world = makeWorld();
+  let receivedPrefix: unknown;
+  const shared = world.actor.accessByResource.get(PATH)!;
+  (shared.kv as unknown as { get: Function }).get = async (_key: string, options?: { prefix?: unknown }) => {
+    receivedPrefix = options?.prefix;
+    return { ok: true, data: { data: "scoped" } };
+  };
+
+  const access = selfHealingAccess(world.actor, PATH);
+  await (access.kv as { get: (key: string) => Promise<unknown> }).get("some/key");
+  expect(receivedPrefix).toBe(PATH);
+});
+
 test("when no stored delegation exists the original result surfaces", async () => {
   const world = makeWorld();
   const emptyStore = { load: async () => null } as unknown as FeedHostDelegationStore;

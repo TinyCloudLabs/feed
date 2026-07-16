@@ -8,15 +8,25 @@ import { buildGreenfieldSeed } from "../../artifactory/skills/_shared/lib/feed-v
 import type { FeedHostActorStorage, FeedHostStorage } from "./storage.ts";
 import type { FeedPost } from "../shared/feed-item.ts";
 import RICH_ARTIFACT_FIXTURE from "../shared/fixtures/rich-artifact.json";
+import { validateRelativeKvKey } from "./resource-kv.ts";
 
 const FIXTURE = RICH_ARTIFACT_FIXTURE as unknown as FeedArtifact & { posts: FeedPost[] };
 
 export const SEEDED_ARTIFACT_ID = FIXTURE.artifactId;
 
+export async function defaultSeedNeedsPublication(
+  storage: FeedHostStorage,
+  actor: FeedHostActorStorage,
+): Promise<boolean> {
+  if (!(await storage.hasArtifacts(actor))) return true;
+  return (await storage.readArtifact(actor, SEEDED_ARTIFACT_ID)).kind === "hydration_failed";
+}
+
 export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostActorStorage): Promise<void> {
   // Keep this byte-for-byte fixture vendored from Artifactory. The digest pin
   // in feed-contract.test.ts catches cross-repository drift.
   const artifact = structuredClone(FIXTURE);
+  artifact.storage.docKey = validateRelativeKvKey(artifact.storage.docKey);
   const pkg: FeedWorkflowPackage = {
     schemaVersion: "feed.workflow_package.v1",
     packageId: artifact.producedBy.packageId,
@@ -56,7 +66,9 @@ export async function seedDefaultFeed(storage: FeedHostStorage, actor: FeedHostA
   };
 
   const seed = buildGreenfieldSeed({ pkg, run, artifact, projection });
+  // Publication is restart-safe: the document (including write verification)
+  // becomes durable before either index can advertise it.
+  await storage.writeArtifactDocument(actor, artifact);
   await storage.insertSeedRows(actor, "artifacts_index", seed.artifacts);
   await storage.insertSeedRows(actor, "feed_index", seed.feed);
-  await storage.writeArtifactDocument(actor, artifact);
 }

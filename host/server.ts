@@ -51,13 +51,14 @@ import {
   type InputAuthorityTruthCheck,
 } from "./input-authority.ts";
 import { REVIEWED_STARTER_PACKAGES, starterPackageById } from "../../artifactory/skills/_shared/lib/starter-packages.ts";
-import { seedDefaultFeed } from "./seed.ts";
+import { defaultSeedNeedsPublication, seedDefaultFeed } from "./seed.ts";
 import {
   FeedHostError,
   FeedHostStorage,
   type FeedHostActorStorage,
   type FeedHostSkillCredentialsPatch,
 } from "./storage.ts";
+import { ResourceKvKeyError } from "./resource-kv.ts";
 
 type JsonBody = Record<string, unknown>;
 type FeedbackRequestBody = Omit<FeedbackEvent, "actorId"> & { actorId?: string };
@@ -1598,6 +1599,10 @@ export function selfHealingAccess(actor: ActorState, path: string): DelegatedAcc
     return run(current());
   };
   type AnyDb = { query: Function; batch: Function; execute: Function; migrations?: { apply: (input: unknown) => Promise<unknown> } };
+  const scopedKvOptions = (options?: unknown): Record<string, unknown> => ({
+    prefix: path.replace(/\/+$/, ""),
+    ...(options && typeof options === "object" ? options as Record<string, unknown> : {}),
+  });
   const db = (dbPath: string) => {
     const handle: AnyDb = {
       query: (sql: string, params?: unknown[]) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).query(sql, params) as Promise<unknown>),
@@ -1613,12 +1618,17 @@ export function selfHealingAccess(actor: ActorState, path: string): DelegatedAcc
     return handle;
   };
   return {
+    path,
     sql: { db },
     kv: {
-      get: (key: string) => heal((access) => access.kv.get(key)),
+      get: (key: string, options?: unknown) =>
+        heal((access) => (access.kv as unknown as { get: Function }).get(key, scopedKvOptions(options)) as Promise<unknown>),
       put: (key: string, value: unknown, options?: unknown) =>
-        heal((access) => (access.kv as unknown as { put: Function }).put(key, value, options) as Promise<unknown>),
-      delete: (key: string) => heal((access) => access.kv.delete(key)),
+        heal((access) => (access.kv as unknown as { put: Function }).put(key, value, scopedKvOptions(options)) as Promise<unknown>),
+      delete: (key: string, options?: unknown) =>
+        heal((access) => (access.kv as unknown as { delete: Function }).delete(key, scopedKvOptions(options)) as Promise<unknown>),
+      list: (options?: unknown) =>
+        heal((access) => (access.kv as unknown as { list: Function }).list(scopedKvOptions(options)) as Promise<unknown>),
     },
   } as unknown as DelegatedAccess;
 }
@@ -1703,9 +1713,9 @@ async function ensureActorReady(storage: FeedHostStorage, actor: ActorState, see
           retryTinyCloudTransaction("starter_packages", actor.actorId, () =>
             storage.ensureWorkflowPackages(access, REVIEWED_STARTER_PACKAGES, new Date().toISOString())));
         if (seedOnStart) {
-          const hasArtifacts = await runActorPreparationPhase(actor, "artifact_check", () =>
-            retryTinyCloudTransaction("artifact_check", actor.actorId, () => storage.hasArtifacts(access)));
-          if (!hasArtifacts) {
+          const needsSeed = await runActorPreparationPhase(actor, "artifact_check", () =>
+            retryTinyCloudTransaction("artifact_check", actor.actorId, () => defaultSeedNeedsPublication(storage, access)));
+          if (needsSeed) {
             await runActorPreparationPhase(actor, "seed", () =>
               retryTinyCloudTransaction("seed", actor.actorId, () => seedDefaultFeed(storage, access)));
             // Full reconciliation, not just the compatibility pass: a freshly
@@ -2263,13 +2273,13 @@ function mapError(error: unknown, pathname: string): Response {
   if (error instanceof Error && /Unauthorized Action/i.test(error.message)) {
     return json({ error: { code: "denied", message: "the Feed Host's delegated access was denied by the storage node" } }, 403);
   }
-  if (error instanceof FeedHostError) {
+  if (error instanceof FeedHostError || error instanceof ResourceKvKeyError) {
     return json(
       {
         error: {
           code: error.code,
           message: error.message,
-          ...(error.details ? { details: error.details } : {}),
+          ...(error instanceof FeedHostError && error.details ? { details: error.details } : {}),
         },
       },
       error.status,

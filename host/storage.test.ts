@@ -6,7 +6,7 @@ import { FeedHostStorage, generationRequestSql } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import type { FeedArtifact } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { feedV1MigrationApplyPlans } from "../../artifactory/skills/_shared/lib/feed-v1-schema.ts";
-import { seedDefaultFeed } from "./seed.ts";
+import { defaultSeedNeedsPublication, seedDefaultFeed } from "./seed.ts";
 import RICH_ARTIFACT_FIXTURE from "../shared/fixtures/rich-artifact.json";
 import {
   FEED_V1_LEGACY_PROJECTION_PARITY_SQL,
@@ -37,6 +37,7 @@ function makeActor(options: { batchFails?: boolean; legacyRows?: LegacyFixture }
   logs: Map<string, DbLog>;
 } {
   const logs = new Map<string, DbLog>();
+  const documents = new Map<string, unknown>();
 
   function makeDb(path: string) {
     const log: DbLog = { applies: 0, batches: [], executes: [] };
@@ -78,7 +79,17 @@ function makeActor(options: { batchFails?: boolean; legacyRows?: LegacyFixture }
   const actor = {
     artifacts: { sql: { db: (path: string) => (path === FEED_HOST_ARTIFACTS_DB_PATH ? artifactDb : feedDb) } },
     feed: { sql: { db: (path: string) => (path === FEED_HOST_FEED_DB_PATH ? feedDb : artifactDb) } },
-    documents: { kv: { put: async () => ({ ok: true }) } },
+    documents: {
+      kv: {
+        put: async (key: string, value: unknown) => {
+          documents.set(key, value);
+          return { ok: true };
+        },
+        get: async (key: string) => documents.has(key)
+          ? { ok: true, data: { data: documents.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+      },
+    },
     ...(options.legacyRows
       ? {
           legacyArtifacts: { sql: { db: () => makeLegacyDb("artifact", options.legacyRows?.artifacts ?? []) } },
@@ -465,6 +476,56 @@ test("reads a base64 hero through the artifacts-prefix delegation with the decla
   artifacts.db.close();
 });
 
+test("reads a legacy absolute doc_key and normalizes it during reconciliation", async () => {
+  const artifacts = realHandle("artifacts_index");
+  const feed = realHandle("feed_index");
+  const artifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;
+  const absoluteDocKey = `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${artifact.storage.docKey}`;
+  artifacts.db.query(`INSERT INTO artifact_index
+    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
+     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
+     created_at, updated_at, published_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      artifact.artifactId,
+      artifact.artifactType,
+      artifact.producedBy.packageId,
+      artifact.producedBy.packageVersion,
+      artifact.producedBy.packageDigest,
+      artifact.producedBy.runId,
+      artifact.idempotency.sourceFingerprint,
+      artifact.idempotency.artifactFingerprint,
+      artifact.idempotency.dedupeKey,
+      absoluteDocKey,
+      "[]",
+      artifact.createdAt,
+      artifact.updatedAt,
+      artifact.createdAt,
+    );
+  const documents = new Map([[absoluteDocKey, artifact]]);
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xlegacyabsolute",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    feed: { sql: { db: () => feed.handle } },
+    documents: {
+      kv: {
+        get: async (key: string) => documents.has(key)
+          ? { ok: true, data: { data: documents.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+  const storage = new FeedHostStorage();
+
+  expect((await storage.readArtifact(actor, artifact.artifactId)).kind).toBe("found");
+  await storage.reconcileFeedProjection(actor);
+  expect(artifacts.db.query<{ doc_key: string }, []>(
+    "SELECT doc_key FROM artifact_index WHERE artifact_id = ?",
+  ).get(artifact.artifactId)?.doc_key).toBe(artifact.storage.docKey);
+
+  artifacts.db.close();
+  feed.db.close();
+});
+
 test("rejects feedback for a missing artifact before writing either interaction table", async () => {
   const storage = new FeedHostStorage();
   const actor = makeHydrationActor({ artifacts: [], docs: {} });
@@ -658,6 +719,8 @@ function emptyMigrationSummary(): FeedV1MigrationSummary {
 
 test("seeds the canonical rich artifact at its declared document path", async () => {
   const documentKeys: string[] = [];
+  const documents = new Map<string, unknown>();
+  const publications: string[] = [];
   const seedRows: Array<{ dbName: string; rows: Array<{ table: string; values: Record<string, string | number | null> }> }> = [];
   const hostStorage = new FeedHostStorage();
   const storage = {
@@ -666,6 +729,7 @@ test("seeds the canonical rich artifact at its declared document path", async ()
       dbName: string,
       rows: Array<{ table: string; values: Record<string, string | number | null> }>,
     ) => {
+      publications.push(`sql:${dbName}`);
       seedRows.push({ dbName, rows });
     },
     writeArtifactDocument: async (actor: FeedHostActorStorage, artifact: FeedArtifact) =>
@@ -674,10 +738,15 @@ test("seeds the canonical rich artifact at its declared document path", async ()
   const actor = {
     documents: {
       kv: {
-        put: async (key: string) => {
+        put: async (key: string, value: unknown) => {
+          publications.push("document");
           documentKeys.push(key);
+          documents.set(key, value);
           return { ok: true, data: undefined };
         },
+        get: async (key: string) => documents.has(key)
+          ? (publications.push("verify"), { ok: true, data: { data: documents.get(key) } })
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
       },
     },
   } as unknown as FeedHostActorStorage;
@@ -690,4 +759,81 @@ test("seeds the canonical rich artifact at its declared document path", async ()
       ?.rows.find((row) => row.table === "artifact_index")?.values.doc_key,
   ).toBe("runs/run-weekly-product-brief/brief.json");
   expect(documentKeys).toEqual(["xyz.tinycloud.artifacts/artifacts/runs/run-weekly-product-brief/brief.json"]);
+  expect(publications).toEqual(["document", "verify", "sql:artifacts_index", "sql:feed_index"]);
+});
+
+test("worker artifact publication rejects an absolute docKey before KV write", async () => {
+  const artifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;
+  artifact.storage.docKey = `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${artifact.storage.docKey}`;
+  let puts = 0;
+  const actor = {
+    documents: { kv: { put: async () => (puts += 1, { ok: true }) } },
+  } as unknown as FeedHostActorStorage;
+
+  await expect(new FeedHostStorage().writeArtifactDocument(actor, artifact)).rejects.toMatchObject({
+    name: "ResourceKvKeyError",
+    status: 400,
+    code: "invalid_storage_key",
+    reason: "absolute_namespace",
+  });
+  expect(puts).toBe(0);
+});
+
+test("a seed interrupted after the verified document repairs on the next bootstrap decision", async () => {
+  const artifacts = realHandle("artifacts_index");
+  const feed = realHandle("feed_index");
+  const documents = new Map<string, unknown>();
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xseedrepair",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    feed: { sql: { db: () => feed.handle } },
+    documents: {
+      kv: {
+        put: async (key: string, value: unknown) => {
+          documents.set(key, value);
+          return { ok: true, data: { data: undefined, headers: {} } };
+        },
+        get: async (key: string) => documents.has(key)
+          ? { ok: true, data: { data: documents.get(key), headers: {} } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+
+  class InterruptingStorage extends FeedHostStorage {
+    private interrupt = true;
+
+    override async insertSeedRows(
+      seedActor: FeedHostActorStorage,
+      dbName: Parameters<FeedHostStorage["insertSeedRows"]>[1],
+      rows: Parameters<FeedHostStorage["insertSeedRows"]>[2],
+    ): Promise<void> {
+      if (this.interrupt && dbName === "artifacts_index" && rows.some((row) => row.table === "artifact_index")) {
+        this.interrupt = false;
+        throw new Error("simulated process exit after document write");
+      }
+      return super.insertSeedRows(seedActor, dbName, rows);
+    }
+  }
+
+  const storage = new InterruptingStorage();
+  await expect(seedDefaultFeed(storage, actor)).rejects.toThrow("simulated process exit");
+  expect(documents).toHaveLength(1);
+  expect(artifacts.db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM artifact_index").get()?.count).toBe(0);
+  expect(await defaultSeedNeedsPublication(storage, actor)).toBe(true);
+
+  await seedDefaultFeed(storage, actor);
+  expect(artifacts.db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM artifact_index").get()?.count).toBe(1);
+  expect(feed.db.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM feed_artifact_projection").get()?.count).toBeGreaterThan(0);
+  expect(await defaultSeedNeedsPublication(storage, actor)).toBe(false);
+
+  // The old failure shape (index survived, document did not) must not take the
+  // historical "has artifacts" shortcut either.
+  documents.clear();
+  expect(await defaultSeedNeedsPublication(storage, actor)).toBe(true);
+  await seedDefaultFeed(storage, actor);
+  expect(await defaultSeedNeedsPublication(storage, actor)).toBe(false);
+
+  artifacts.db.close();
+  feed.db.close();
 });
