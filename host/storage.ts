@@ -37,6 +37,7 @@ import {
 import type { SqlSeedRow } from "../../artifactory/skills/_shared/lib/feed-v1-bootstrap.ts";
 import {
   FEED_HOST_ARTIFACT_DOC_PREFIX,
+  FEED_HOST_ARTIFACT_MEDIA_PREFIX,
   FEED_HOST_ARTIFACTS_DB_PATH,
   FEED_HOST_FEED_DB_PATH,
   FEED_HOST_FEED_SETTINGS_PREFIX,
@@ -77,6 +78,11 @@ import {
   FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL,
   withFeedHostMigrations,
 } from "./feed-schema.ts";
+import {
+  relativeKeyForLegacyAbsoluteRead,
+  resourceKv,
+  validateRelativeKvKey,
+} from "./resource-kv.ts";
 
 type ProjectionRow = {
   feed_item_id: string;
@@ -478,10 +484,18 @@ export class FeedHostStorage {
   }
 
   async writeArtifactDocument(actor: FeedHostActorStorage, artifact: FeedArtifact | MigratedFeedArtifact): Promise<void> {
-    const result = await actor.documents.kv.put(artifactDocKey(artifact.storage.docKey), artifact, {
+    const docKey = validateRelativeKvKey(artifact.storage.docKey);
+    const documents = resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX);
+    const result = await documents.put(docKey, artifact, {
       contentType: "application/json",
     });
     if (!result.ok) throw new Error(`Failed to write artifact document: ${resultError(result)}`);
+    const verified = await documents.get<FeedArtifact | string>(docKey);
+    if (!verified.ok) throw new Error(`Failed to verify artifact document write: ${resultError(verified)}`);
+    const hydrated = hydrateArtifactDocument(verified.data.data);
+    if (hydrated.kind !== "found" || hydrated.artifact.artifactId !== artifact.artifactId) {
+      throw new Error(`Failed to verify artifact document write: ${artifact.artifactId}`);
+    }
   }
 
   async listFeed(
@@ -551,7 +565,8 @@ export class FeedHostStorage {
     );
     const row = rows[0];
     if (!row) return { kind: "not_found" };
-    const result = await actor.documents.kv.get<FeedArtifact | string>(artifactDocKey(row.doc_key));
+    const docKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, row.doc_key);
+    const result = await resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX).get<FeedArtifact | string>(docKey);
     if (!result.ok) {
       if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") {
         return { kind: "hydration_failed", artifactId: row.artifact_id, docKey: row.doc_key };
@@ -578,10 +593,9 @@ export class FeedHostStorage {
     // Migrated distillery docs store a bare filename ("hero.png") whose blob
     // lives under the artifact's media directory, usually as base64 with a
     // .b64 suffix. Try candidates in order until one resolves.
-    for (const candidate of heroKeyCandidates(reference.key, result.artifact.artifactId)) {
-      const key = artifactMediaKey(candidate);
-      if (!key) continue;
-      const media = await (actor.media ?? actor.documents).kv.get<string>(key);
+    const mediaKv = resourceKv(actor.media ?? actor.documents, FEED_HOST_ARTIFACT_MEDIA_PREFIX);
+    for (const key of heroKeyCandidates(reference.key, result.artifact.artifactId)) {
+      const media = await mediaKv.get<string>(key);
       if (!media.ok) {
         if (media.error.code === "KV_NOT_FOUND" || media.error.code === "NOT_FOUND") continue;
         throw new Error(`Failed to read artifact hero: ${resultError(media)}`);
@@ -685,6 +699,14 @@ export class FeedHostStorage {
     for (const artifactRow of artifactRows) {
       const current = currentRows.find((row) => row.target.artifactId === artifactRow.artifact_id);
       const artifactResult = await this.readArtifactDocument(actor, artifactRow.doc_key);
+      const relativeDocKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, artifactRow.doc_key);
+      if (artifactResult.kind === "found" && relativeDocKey !== artifactRow.doc_key) {
+        await batch(this.db(actor, "artifacts_index"), [{
+          sql: "UPDATE artifact_index SET doc_key = ? WHERE artifact_id = ? AND doc_key = ?",
+          params: [relativeDocKey, artifactRow.artifact_id, artifactRow.doc_key],
+        }]);
+        artifactRow.doc_key = relativeDocKey;
+      }
       if (artifactResult.kind === "malformed" || artifactResult.kind === "schema_mismatch") {
         console.warn("Feed Host skipped invalid artifact doc during hydration", {
           artifactId: artifactRow.artifact_id,
@@ -1749,7 +1771,8 @@ export class FeedHostStorage {
     | { kind: "malformed"; docKey: string; error: string }
     | { kind: "schema_mismatch"; docKey: string; errors: string[] }
   > {
-    const result = await actor.documents.kv.get<FeedArtifact | string>(artifactDocKey(docKey));
+    const relativeDocKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, docKey);
+    const result = await resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX).get<FeedArtifact | string>(relativeDocKey);
     if (!result.ok) {
       if (result.error.code === "KV_NOT_FOUND" || result.error.code === "NOT_FOUND") return { kind: "not_found" };
       throw new Error(`Failed to read artifact document: ${resultError(result)}`);
@@ -1808,9 +1831,13 @@ export class FeedHostStorage {
       },
     ]);
     this.preferenceCache.delete(storageCacheKey(actor));
-    const result = await actor.settings.kv.put(preferenceKey(record.actorId, record.scope), record, {
-      contentType: "application/json",
-    });
+    const result = await resourceKv(actor.settings, FEED_HOST_FEED_SETTINGS_PREFIX).put(
+      preferenceKey(record.actorId, record.scope),
+      record,
+      {
+        contentType: "application/json",
+      },
+    );
     if (!result.ok) throw new Error(`Failed to persist preference profile: ${resultError(result)}`);
   }
 
@@ -2065,6 +2092,21 @@ export class FeedHostStorage {
     if (legacyArtifacts.length === 0 && legacyInteractions.length === 0) return emptyMigrationSummary();
 
     const plan = buildFeedV1MigrationPlan({ legacyArtifacts, legacyInteractions });
+    // The shared legacy converter predates the relative-only storage contract.
+    // Normalize its publication plan before it reaches either write boundary.
+    plan.artifactDocs = plan.artifactDocs.map((doc) => {
+      const docKey = relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, doc.value.storage.docKey);
+      return { docKey, value: { ...doc.value, storage: { ...doc.value.storage, docKey } } };
+    });
+    plan.artifactRows = plan.artifactRows.map((row) => ({
+      ...row,
+      values: {
+        ...row.values,
+        ...(typeof row.values.doc_key === "string"
+          ? { doc_key: relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_DOC_PREFIX, row.values.doc_key) }
+          : {}),
+      },
+    }));
     const storage = this;
     await applyFeedV1MigrationPlan(plan, {
       writeSqlRows: async (dbName, rows) => {
@@ -2451,14 +2493,6 @@ function sqlValue(value: string | number | null): SqlValue {
   return value;
 }
 
-function artifactDocKey(docKey: string): string {
-  const trimmed = docKey.replace(/^\/+/, "");
-  if (trimmed === "" || trimmed.includes("..")) throw new Error(`unsafe artifact doc key: ${docKey}`);
-  return trimmed.startsWith(`${FEED_HOST_ARTIFACT_DOC_PREFIX}/`)
-    ? trimmed
-    : `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${trimmed}`;
-}
-
 function artifactHeroReference(body: unknown): { key: string; contentType?: string } | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return null;
   const record = body as Record<string, unknown>;
@@ -2483,24 +2517,19 @@ function artifactHeroReference(body: unknown): { key: string; contentType?: stri
 // the .b64 variant the legacy pipeline wrote.
 function heroKeyCandidates(reference: string, artifactId: string): string[] {
   const trimmed = reference.trim();
-  if (trimmed.includes("/")) return [trimmed];
+  if (trimmed.includes("/")) {
+    const mediaRelative = trimmed.startsWith("media/") ? trimmed.slice("media/".length) : trimmed;
+    try {
+      return [relativeKeyForLegacyAbsoluteRead(FEED_HOST_ARTIFACT_MEDIA_PREFIX, mediaRelative)];
+    } catch {
+      return [];
+    }
+  }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(trimmed) || !/^[A-Za-z0-9._:-]+$/.test(artifactId)) return [];
-  const dir = `xyz.tinycloud.artifacts/media/${artifactId}`;
+  const dir = artifactId;
   return trimmed.endsWith(".b64")
     ? [`${dir}/${trimmed}`]
     : [`${dir}/${trimmed}.b64`, `${dir}/${trimmed}`];
-}
-
-function artifactMediaKey(value: string): string | null {
-  const trimmed = value.replace(/^\/+/, "");
-  if (!trimmed || trimmed.includes("..") || /^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return null;
-  const mediaPrefix = "xyz.tinycloud.artifacts/media/";
-  const key = trimmed.startsWith(mediaPrefix)
-    ? trimmed
-    : trimmed.startsWith("media/")
-      ? `xyz.tinycloud.artifacts/${trimmed}`
-      : "";
-  return key.startsWith(mediaPrefix) ? key : null;
 }
 
 // Raster whitelist only — image/svg+xml is script-capable markup and serving
@@ -2608,7 +2637,7 @@ function preferenceProfileId(actorId: string, scope: string): string {
 }
 
 function preferenceKey(actorId: string, scope: string): string {
-  return `${FEED_HOST_FEED_SETTINGS_PREFIX}/${encodeURIComponent(normalizeActorId(actorId))}/${encodeURIComponent(scope)}.json`;
+  return `${encodeURIComponent(normalizeActorId(actorId))}/${encodeURIComponent(scope)}.json`;
 }
 
 function plainObjectOrUndefined(value: unknown): Record<string, unknown> | undefined {

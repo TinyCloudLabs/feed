@@ -1,5 +1,6 @@
 import { FEED_HOST_FEED_SETTINGS_PREFIX, isCanonicalDelegationCid, normalizeActorId } from "./delegation.ts";
 import { FeedHostError, type FeedHostActorStorage } from "./storage.ts";
+import { resourceKv } from "./resource-kv.ts";
 
 export type InputAuthorityState = "active" | "expired" | "revoked" | "unavailable";
 
@@ -203,7 +204,8 @@ export class InputAuthorityRegistry {
   }
 
   private async read(actor: FeedHostActorStorage): Promise<StoredInputAuthority[]> {
-    const result = await actor.settings.kv.get<StoredInputAuthority[] | string>(keyFor(actor.actorId));
+    const result = await resourceKv(actor.settings, FEED_HOST_FEED_SETTINGS_PREFIX)
+      .get<StoredInputAuthority[] | string>(keyFor(actor.actorId));
     if (!result.ok) {
       if (isNotFound(result.error)) return [];
       throw new FeedHostError("input authority storage read failed", 500, "internal_error");
@@ -220,7 +222,8 @@ export class InputAuthorityRegistry {
   }
 
   private async write(actor: FeedHostActorStorage, records: StoredInputAuthority[]): Promise<void> {
-    const result = await actor.settings.kv.put(keyFor(actor.actorId), records, { contentType: "application/json" });
+    const result = await resourceKv(actor.settings, FEED_HOST_FEED_SETTINGS_PREFIX)
+      .put(keyFor(actor.actorId), records, { contentType: "application/json" });
     if (!result.ok) throw new FeedHostError("input authority storage write failed", 500, "internal_error");
   }
 }
@@ -418,7 +421,7 @@ function keyFor(actorId: string): string {
   if (!normalized || normalized.includes("/") || normalized.includes("\\") || normalized.includes("..")) {
     throw new FeedHostError("actor id is invalid", 400, "actor_mismatch");
   }
-  return `${FEED_HOST_FEED_SETTINGS_PREFIX}/${INPUT_AUTHORITY_PREFIX}/${encodeURIComponent(normalized)}.json`;
+  return `${INPUT_AUTHORITY_PREFIX}/${encodeURIComponent(normalized)}.json`;
 }
 
 function validStoredRecord(value: unknown, actorId: string): value is StoredInputAuthority {
