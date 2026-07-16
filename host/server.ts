@@ -100,6 +100,11 @@ type ActorState = AcceptedFeedDelegation & {
   preparation?: ActorPreparationStatus;
   traceId?: string;
   expiresAt: string;
+  // Re-activates this actor's stored delegations when the node reports the
+  // current activation unauthorized (node-side activation sessions expire on
+  // an hours timescale while the delegation chains stay valid for days).
+  heal?: () => Promise<boolean>;
+  reactivation?: Promise<void>;
 };
 
 type ActorPreparationPhase = "idle" | "bootstrap" | "starter_packages" | "artifact_check" | "seed" | "reconcile" | "ready" | "failed";
@@ -529,6 +534,10 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
         ? existing
         : state;
+      actor.heal = () => reactivateActorAccess(
+        { delegationStore, activateDelegation, delegateDID: policy.delegateDID },
+        actor,
+      );
       if (requestTraceId(request)) actor.traceId = requestTraceId(request);
       if (currentProofComplete || !hasCompleteFeedHostDelegation(existing)) actors.set(actorKey, actor);
       if (delegationStore && (currentProofComplete || !hasCompleteFeedHostDelegation(existing))) {
@@ -1457,6 +1466,14 @@ async function restoreActorFromStore(
       resources: [...new Set(resources)],
       accessByResource,
     };
+    state.heal = () => reactivateActorAccess(
+      {
+        delegationStore: store,
+        activateDelegation: context.activateDelegation,
+        delegateDID: context.policy.delegateDID,
+      },
+      state,
+    );
     context.actors.set(actorKey, state);
     return state;
   } catch (error) {
@@ -1468,7 +1485,108 @@ async function restoreActorFromStore(
   }
 }
 
-function actorStorage(actor: ActorState): FeedHostActorStorage {
+// The node reports an expired activation session as a 401 "Unauthorized
+// Action" result (or AUTH_UNAUTHORIZED on KV) even while the underlying
+// delegation chain remains valid. Detecting that shape is what lets access
+// self-heal instead of surfacing errors until a human signs in again.
+function isUnauthorizedAccessResult(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const result = value as { ok?: boolean; error?: { code?: unknown; message?: unknown } };
+  if (result.ok !== false) return false;
+  const code = typeof result.error?.code === "string" ? result.error.code : "";
+  const message = typeof result.error?.message === "string" ? result.error.message : "";
+  return code === "AUTH_UNAUTHORIZED" || /unauthorized action/i.test(message);
+}
+
+type ReactivationDeps = {
+  delegationStore: FeedHostDelegationStore | null;
+  activateDelegation: FeedHostContext["activateDelegation"];
+  delegateDID: string;
+};
+
+// Single-flight per actor: concurrent unauthorized results share one
+// re-activation. Returns false when healing is impossible (no store, chain
+// truly expired/revoked) so callers surface the original error and the web
+// client's delegation recovery takes over as the final fallback.
+export async function reactivateActorAccess(deps: ReactivationDeps, actor: ActorState): Promise<boolean> {
+  if (!deps.delegationStore) return false;
+  actor.reactivation ??= (async () => {
+    const startedAt = performance.now();
+    const stored = await deps.delegationStore!.load(normalizeActorId(actor.actorId));
+    if (!stored || stored.delegateDID !== deps.delegateDID) {
+      throw new FeedDelegationError("no stored delegation to re-activate", "insufficient_policy");
+    }
+    const live = liveDelegationResources(stored);
+    if (live.length === 0) throw new FeedDelegationError("stored delegations are expired", "expired");
+    const uniqueDelegations = [...new Map(live.map((resource) => [resource.serializedDelegation, resource])).values()];
+    for (const resource of uniqueDelegations) {
+      const accepted = await deps.activateDelegation({
+        serializedDelegation: resource.serializedDelegation,
+        expectedDelegateDID: deps.delegateDID,
+      });
+      for (const path of accepted.resources) actor.accessByResource.set(path, accepted.access);
+    }
+    logEvent("info", "delegation_reactivated", {
+      actor: actor.actorId,
+      ms: Math.round(performance.now() - startedAt),
+    });
+  })().finally(() => {
+    actor.reactivation = undefined;
+  });
+  try {
+    await actor.reactivation;
+    return true;
+  } catch (error) {
+    logEvent("warn", "delegation_reactivation_failed", { actor: actor.actorId, ...errorLogFields(error) });
+    return false;
+  }
+}
+
+// Wraps a resource's access so every operation reads the CURRENT handle from
+// the actor's access map and, on an expired-activation result, heals once and
+// retries. Handles stay valid across re-activations because they resolve
+// lazily instead of capturing the handle that existed at wrap time.
+export function selfHealingAccess(actor: ActorState, path: string): DelegatedAccess {
+  const current = (): DelegatedAccess => {
+    const access = actor.accessByResource.get(path);
+    if (!access) {
+      throw new FeedDelegationError("Feed Host delegation is missing activated TinyCloud access", "insufficient_policy");
+    }
+    return access;
+  };
+  const heal = async <T>(run: (access: DelegatedAccess) => Promise<T>): Promise<T> => {
+    const first = await run(current());
+    if (!isUnauthorizedAccessResult(first) || !actor.heal) return first;
+    if (!(await actor.heal())) return first;
+    return run(current());
+  };
+  type AnyDb = { query: Function; batch: Function; execute: Function; migrations?: { apply: (input: unknown) => Promise<unknown> } };
+  const db = (dbPath: string) => {
+    const handle: AnyDb = {
+      query: (sql: string, params?: unknown[]) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).query(sql, params) as Promise<unknown>),
+      batch: (statements: unknown) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).batch(statements) as Promise<unknown>),
+      execute: (sql: string) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).execute(sql) as Promise<unknown>),
+    };
+    const inner = current().sql.db(dbPath) as unknown as AnyDb;
+    if (inner.migrations?.apply) {
+      handle.migrations = {
+        apply: (input: unknown) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).migrations!.apply(input)),
+      };
+    }
+    return handle;
+  };
+  return {
+    sql: { db },
+    kv: {
+      get: (key: string) => heal((access) => access.kv.get(key)),
+      put: (key: string, value: unknown, options?: unknown) =>
+        heal((access) => (access.kv as unknown as { put: Function }).put(key, value, options) as Promise<unknown>),
+      delete: (key: string) => heal((access) => access.kv.delete(key)),
+    },
+  } as unknown as DelegatedAccess;
+}
+
+export function actorStorage(actor: ActorState): FeedHostActorStorage {
   if (actor.storageAccess) return actor.storageAccess;
   const artifacts = actor.accessByResource.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feed = actor.accessByResource.get(FEED_HOST_FEED_DB_PATH);
@@ -1479,12 +1597,16 @@ function actorStorage(actor: ActorState): FeedHostActorStorage {
   }
   actor.storageAccess = {
     actorId: actor.actorId,
-    artifacts,
-    feed,
-    settings,
-    documents,
-    legacyArtifacts: actor.accessByResource.get(LEGACY_FEED_DB_PATH),
-    legacyInteractions: actor.accessByResource.get(LEGACY_INTERACTIONS_DB_PATH),
+    artifacts: selfHealingAccess(actor, FEED_HOST_ARTIFACTS_DB_PATH),
+    feed: selfHealingAccess(actor, FEED_HOST_FEED_DB_PATH),
+    settings: selfHealingAccess(actor, FEED_HOST_FEED_SETTINGS_PREFIX),
+    documents: selfHealingAccess(actor, FEED_HOST_ARTIFACT_DOC_PREFIX),
+    legacyArtifacts: actor.accessByResource.get(LEGACY_FEED_DB_PATH)
+      ? selfHealingAccess(actor, LEGACY_FEED_DB_PATH)
+      : undefined,
+    legacyInteractions: actor.accessByResource.get(LEGACY_INTERACTIONS_DB_PATH)
+      ? selfHealingAccess(actor, LEGACY_INTERACTIONS_DB_PATH)
+      : undefined,
   };
   return actor.storageAccess;
 }
