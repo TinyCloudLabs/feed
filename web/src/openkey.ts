@@ -6,6 +6,8 @@ export interface ConnectWalletResult {
   address: string;
   keyId: string;
   web3Provider: providers.Web3Provider;
+  /** Checks connector state without opening auth or wallet UI. */
+  canSignSilently: () => Promise<boolean>;
 }
 
 class OpenKeyEIP1193Provider {
@@ -54,5 +56,9 @@ export async function connectWallet(): Promise<ConnectWalletResult> {
     address: authResult.address,
     keyId: authResult.keyId,
     web3Provider: new providers.Web3Provider(eip1193),
+    // OpenKey's isConnected() reports auth state, not whether the next
+    // signature is prompt-free. signMessage() opens an iframe and may fall
+    // back to a popup, so this SDK version cannot promise silent signing.
+    canSignSilently: async () => false,
   };
 }

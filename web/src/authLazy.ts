@@ -28,8 +28,10 @@ export async function restoreSession(
   return (await auth()).restoreSession(policy);
 }
 
-export async function signOut(): ReturnType<AuthModule["signOut"]> {
-  return (await auth()).signOut();
+export async function signOut(
+  ...args: Parameters<AuthModule["signOut"]>
+): ReturnType<AuthModule["signOut"]> {
+  return (await auth()).signOut(...args);
 }
 
 export async function submitFeedHostDelegations(

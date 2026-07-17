@@ -16,7 +16,11 @@ import {
   type FeedLoginTrace,
   type FeedSession,
 } from "./authLazy.ts";
-import { isFeedReconnectRequiredError } from "./authPolicy.ts";
+import {
+  FeedReconnectRequiredError,
+  MISSING_PARENT_RECONNECT_MESSAGE,
+  isFeedReconnectRequiredError,
+} from "./authPolicy.ts";
 import { errorDetail, reportClientEvent, reportClientTiming } from "./clientLog.ts";
 import type { FeedHostDelegationPolicy } from "./delegation.ts";
 import type { FeedHostSetupStatus } from "./delegation.ts";
@@ -41,6 +45,7 @@ import {
   type FeedItem,
   type FeedView,
 } from "./feedModel.ts";
+import { isMissingParentDelegationError } from "./missingParentDelegation.ts";
 
 type LoadState = "idle" | "loading" | "ready" | "error";
 type FeedState = "idle" | "starting" | "running" | "error";
@@ -114,6 +119,13 @@ class FeedSetupFailedError extends Error {
   }
 }
 
+class FeedSetupCancelledError extends Error {
+  constructor() {
+    super("Feed setup no longer belongs to the active session");
+    this.name = "FeedSetupCancelledError";
+  }
+}
+
 function shortAddress(value: string): string {
   return value.length > 12 ? `${value.slice(0, 6)}...${value.slice(-4)}` : value;
 }
@@ -122,11 +134,40 @@ function newNonce(): string {
   return crypto.randomUUID();
 }
 
-export function App() {
+export type AppAuthDependencies = {
+  attachReceivedInputAuthority: typeof attachReceivedInputAuthority;
+  restoreSession: typeof restoreSession;
+  signIn: typeof signIn;
+  signOut: typeof signOut;
+  submitFeedHostDelegations: typeof submitFeedHostDelegations;
+};
+
+const DEFAULT_AUTH: AppAuthDependencies = {
+  attachReceivedInputAuthority,
+  restoreSession,
+  signIn,
+  signOut,
+  submitFeedHostDelegations,
+};
+
+const DEFAULT_CREATE_CLIENT = (
+  options: ConstructorParameters<typeof FeedV1HostClient>[0],
+): FeedV1HostClient => new FeedV1HostClient(options);
+
+type AppProps = {
+  auth?: AppAuthDependencies;
+  createClient?: (options: ConstructorParameters<typeof FeedV1HostClient>[0]) => FeedV1HostClient;
+};
+
+export function App({
+  auth = DEFAULT_AUTH,
+  createClient = DEFAULT_CREATE_CLIENT,
+}: AppProps = {}) {
   const [session, setSession] = useState<FeedSession | null>(null);
   const [policy, setPolicy] = useState<FeedHostDelegationPolicy | null>(null);
   const [restoreDone, setRestoreDone] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
+  const [reconnectRequired, setReconnectRequired] = useState(false);
   const [feedState, setFeedState] = useState<FeedState>("idle");
   const [setupStage, setSetupStage] = useState<SetupStage>("identity");
   const [hostSetup, setHostSetup] = useState<FeedHostSetupStatus | null>(null);
@@ -147,12 +188,16 @@ export function App() {
   const [pageRequestArtifactId, setPageRequestArtifactId] = useState<string | null>(null);
   const [pageRetry, setPageRetry] = useState(0);
   const feedLoadInFlight = useRef(false);
-  const setupInFlight = useRef(false);
+  const setupInFlight = useRef<number | null>(null);
   const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastRecoveryAt = useRef(0);
   const loginTrace = useRef<FeedLoginTrace | null>(null);
   const firstContentReported = useRef<string | null>(null);
   const restoredHostSession = useRef(false);
+  // Async setup work captures this value. Teardown and new sign-ins advance
+  // it before awaiting, so late work from an old session cannot clear or
+  // mutate a newer session.
+  const sessionGeneration = useRef(0);
   const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
   const routeRef = useRef(route);
   const enteredFromFeed = useRef(false);
@@ -160,13 +205,13 @@ export function App() {
   const pendingFeedScrollY = useRef<number | null>(null);
 
   const client = useMemo(
-    () => new FeedV1HostClient({
+    () => createClient({
       baseUrl: FEED_HOST_URL,
       token: FEED_HOST_TOKEN || undefined,
       actorId: session?.readerDid,
       traceId: loginTrace.current?.traceId,
     }),
-    [session?.readerDid],
+    [createClient, session?.readerDid],
   );
   const artifactCache = useMemo(() => createLazyArtifactCache((artifactId) => client.getArtifact(artifactId)), [client]);
 
@@ -232,7 +277,7 @@ export function App() {
       if (cancelled) return;
       setPolicy(nextPolicy);
       const restoreStartedAt = performance.now();
-      const restored = await restoreSession(nextPolicy);
+      const restored = await auth.restoreSession(nextPolicy);
       if (!cancelled && restored) {
         restoredHostSession.current = true;
         reportClientTiming("login_session_restored", {
@@ -240,6 +285,7 @@ export function App() {
           phaseStartedAt: restoreStartedAt,
           actorId: restored.readerDid,
         });
+        sessionGeneration.current += 1;
         setSession(restored);
       } else if (!restored) {
         loginTrace.current = null;
@@ -249,7 +295,10 @@ export function App() {
     bootstrap()
       .then(() => undefined)
       .catch((error: unknown) => {
-        if (!cancelled) setSignInError(error instanceof Error ? error.message : String(error));
+        if (!cancelled) {
+          setReconnectRequired(false);
+          setSignInError(error instanceof Error ? error.message : String(error));
+        }
       })
       .finally(() => {
         if (!cancelled) setRestoreDone(true);
@@ -353,11 +402,46 @@ export function App() {
     firstContentReported.current = null;
   }, [artifactCache]);
 
-  const waitForHostSetup = useCallback(async (): Promise<void> => {
+  const requireReconnect = useCallback(async (
+    error: FeedReconnectRequiredError,
+    expectedGeneration = sessionGeneration.current,
+  ) => {
+    if (sessionGeneration.current !== expectedGeneration) return;
+    const reconnectGeneration = expectedGeneration + 1;
+    sessionGeneration.current = reconnectGeneration;
+    reportClientEvent("warn", "feed_reconnect_required", undefined, session?.readerDid);
+    await auth.signOut({ preserveAddress: true }).catch(() => undefined);
+    if (sessionGeneration.current !== reconnectGeneration) return;
+    setSession(null);
+    setSignInError(error.message);
+    setReconnectRequired(true);
+    restoredHostSession.current = false;
+    resetFeedState();
+  }, [auth, resetFeedState, session?.readerDid]);
+
+  const requireMissingParentReconnect = useCallback(async (
+    error: unknown,
+    expectedGeneration = sessionGeneration.current,
+  ) => {
+    if (sessionGeneration.current !== expectedGeneration) return;
+    reportClientEvent("warn", "missing_parent_recovery", undefined, session?.readerDid, {
+      session_mode: loginTrace.current?.sessionMode ?? "restored",
+      stage: "activate",
+      outcome: "reconnect_required",
+    });
+    await requireReconnect(
+      new FeedReconnectRequiredError(error, MISSING_PARENT_RECONNECT_MESSAGE),
+      expectedGeneration,
+    );
+  }, [requireReconnect, session?.readerDid]);
+
+  const waitForHostSetup = useCallback(async (expectedGeneration: number): Promise<void> => {
     let previousPhase: FeedHostSetupStatus["phase"] | undefined;
     let phaseStartedAt = performance.now();
     for (;;) {
+      if (sessionGeneration.current !== expectedGeneration) throw new FeedSetupCancelledError();
       const status = await client.getDelegationStatus();
+      if (sessionGeneration.current !== expectedGeneration) throw new FeedSetupCancelledError();
       if (!status.complete) throw new Error(`Feed Host delegation is ${status.state}`);
       if (status.setup) {
         setHostSetup(status.setup);
@@ -399,8 +483,10 @@ export function App() {
 
   const startFeed = useCallback(
     async () => {
-      if (!session || !policy || setupInFlight.current) return;
-      setupInFlight.current = true;
+      if (!session || !policy) return;
+      const setupGeneration = sessionGeneration.current;
+      if (setupInFlight.current === setupGeneration) return;
+      setupInFlight.current = setupGeneration;
       setFeedState("starting");
       setHostSetup(null);
       setSetupError(null);
@@ -423,7 +509,7 @@ export function App() {
         }
 
         setSetupStage("context");
-        const [receipt] = await submitFeedHostDelegations({
+        const [receipt] = await auth.submitFeedHostDelegations({
           client,
           policy,
           actorId: session.readerDid,
@@ -431,7 +517,7 @@ export function App() {
         });
         if (receipt?.setup) setHostSetup(receipt.setup);
         setSetupStage("preparing");
-        const setup = waitForHostSetup().then(
+        const setup = waitForHostSetup(setupGeneration).then(
           () => ({ ok: true as const }),
           (error: unknown) => ({ ok: false as const, error }),
         );
@@ -443,7 +529,12 @@ export function App() {
         if (existingFeed) {
           setFeedState("running");
           void setup.then((result) => {
-            if (result.ok) return;
+            if (result.ok || result.error instanceof FeedSetupCancelledError) return;
+            if (sessionGeneration.current !== setupGeneration) return;
+            if (isMissingParentDelegationError(result.error)) {
+              void requireMissingParentReconnect(result.error, setupGeneration);
+              return;
+            }
             reportClientEvent("warn", "feed_background_setup_failed", errorDetail(result.error), session.readerDid,
               loginTrace.current ? { traceId: loginTrace.current.traceId } : {});
             setEventsError("Feed is available, but background preparation needs attention.");
@@ -457,40 +548,52 @@ export function App() {
         if (!firstFeed) throw new Error("Feed did not become readable after setup completed");
         setFeedState("running");
       } catch (error) {
+        if (error instanceof FeedSetupCancelledError) return;
         if (isFeedReconnectRequiredError(error)) {
-          reportClientEvent("warn", "feed_reconnect_required", errorDetail(error), session.readerDid);
-          await signOut().catch(() => undefined);
-          setSession(null);
-          setSignInError(error.message);
-          resetFeedState();
+          await requireReconnect(error, setupGeneration);
+          return;
+        }
+        if (isMissingParentDelegationError(error)) {
+          await requireMissingParentReconnect(error, setupGeneration);
           return;
         }
         recordSetupFailure(error);
       } finally {
-        setupInFlight.current = false;
+        if (setupInFlight.current === setupGeneration) setupInFlight.current = null;
       }
     },
-    [client, loadFeed, policy, recordSetupFailure, resetFeedState, session, waitForHostSetup],
+    [auth, client, loadFeed, policy, recordSetupFailure, requireMissingParentReconnect, requireReconnect, session, waitForHostSetup],
   );
 
   const retryFeedSetup = useCallback(async () => {
-    if (!session || setupInFlight.current) return;
-    setupInFlight.current = true;
+    if (!session) return;
+    const setupGeneration = sessionGeneration.current;
+    if (setupInFlight.current === setupGeneration) return;
+    setupInFlight.current = setupGeneration;
     setFeedState("starting");
     setSetupStage("preparing");
     setSetupError(null);
     try {
       const response = await client.retrySetup();
       setHostSetup(response.setup);
-      await waitForHostSetup();
+      await waitForHostSetup(setupGeneration);
       await loadFeed();
       setFeedState("running");
     } catch (error) {
+      if (error instanceof FeedSetupCancelledError) return;
+      if (isFeedReconnectRequiredError(error)) {
+        await requireReconnect(error, setupGeneration);
+        return;
+      }
+      if (isMissingParentDelegationError(error)) {
+        await requireMissingParentReconnect(error, setupGeneration);
+        return;
+      }
       recordSetupFailure(error);
     } finally {
-      setupInFlight.current = false;
+      if (setupInFlight.current === setupGeneration) setupInFlight.current = null;
     }
-  }, [client, loadFeed, recordSetupFailure, session, waitForHostSetup]);
+  }, [client, loadFeed, recordSetupFailure, requireMissingParentReconnect, requireReconnect, session, waitForHostSetup]);
 
   useEffect(() => {
     if (!session || !policy) return;
@@ -544,7 +647,10 @@ export function App() {
   }, [client, feedState, loadFeed, recoverDelegation, session]);
 
   const connect = async () => {
+    const connectGeneration = sessionGeneration.current + 1;
+    sessionGeneration.current = connectGeneration;
     setSignInError(null);
+    setReconnectRequired(false);
     const loginStartedAt = performance.now();
     const trace: FeedLoginTrace = {
       traceId: crypto.randomUUID(),
@@ -569,31 +675,40 @@ export function App() {
       }
       setPolicy(nextPolicy);
       resetFeedState();
-      const nextSession = await signIn(nextPolicy, trace);
+      const nextSession = await auth.signIn(nextPolicy, trace);
+      if (sessionGeneration.current !== connectGeneration) return;
       trace.systemStartedAt = performance.now();
       reportClientEvent("info", "login_permissions_complete", undefined, nextSession.readerDid, {
         traceId: trace.traceId,
         elapsedMs: Math.round(trace.systemStartedAt - trace.loginStartedAt),
         session_mode: trace.sessionMode,
       });
+      setReconnectRequired(false);
       setSession(nextSession);
     } catch (error) {
+      if (sessionGeneration.current !== connectGeneration) return;
       reportClientEvent("error", "sign_in_failed", errorDetail(error), undefined, {
         traceId: trace.traceId,
         session_mode: trace.sessionMode,
       });
+      setReconnectRequired(false);
       setSignInError(error instanceof Error ? error.message : String(error));
     }
   };
 
   const disconnect = async () => {
+    const disconnectGeneration = sessionGeneration.current + 1;
+    sessionGeneration.current = disconnectGeneration;
     try {
       await client.disconnectFeed();
     } catch {
       // Local sign-out still completes if the Host is already unavailable or disconnected.
     } finally {
-      await signOut().catch(() => undefined);
+      await auth.signOut().catch(() => undefined);
+      if (sessionGeneration.current !== disconnectGeneration) return;
       setSession(null);
+      setSignInError(null);
+      setReconnectRequired(false);
       restoredHostSession.current = false;
       resetFeedState();
     }
@@ -794,7 +909,13 @@ export function App() {
   }
 
   if (!session) {
-    return <SignInScreen error={signInError} onSignIn={() => void connect()} />;
+    return (
+      <SignInScreen
+        error={signInError}
+        reconnectRequired={reconnectRequired}
+        onSignIn={() => void connect()}
+      />
+    );
   }
 
   if (feedState === "idle" || feedState === "starting") {
@@ -873,7 +994,14 @@ export function App() {
       )}
 
       {settingsOpen && (
-        <SkillCredentialsPanel client={client} policy={policy!} actorId={session.readerDid} onDisconnect={() => void disconnect()} />
+        <SkillCredentialsPanel
+          client={client}
+          policy={policy!}
+          actorId={session.readerDid}
+          onDisconnect={() => void disconnect()}
+          onReconnectRequired={(error) => void requireReconnect(error, sessionGeneration.current)}
+          attachInputAuthority={auth.attachReceivedInputAuthority}
+        />
       )}
 
       {route && routedArtifactId ? (
@@ -943,7 +1071,15 @@ export function App() {
   );
 }
 
-function SignInScreen({ error, onSignIn }: { error: string | null; onSignIn: () => void }) {
+export function SignInScreen({
+  error,
+  reconnectRequired,
+  onSignIn,
+}: {
+  error: string | null;
+  reconnectRequired: boolean;
+  onSignIn: () => void;
+}) {
   return (
     <main className="signin-screen">
       <header className="signin-header">
@@ -954,7 +1090,9 @@ function SignInScreen({ error, onSignIn }: { error: string | null; onSignIn: () 
         <h1 id="signin-title">Your private context, made useful.</h1>
         <p>Read, ask, and shape a Feed grounded in the conversations you choose.</p>
         {error && <p className="reconnect-message" role="alert">{error}</p>}
-        <button className="primary signin-action" onClick={onSignIn}>Sign in with OpenKey</button>
+        <button className="primary signin-action" onClick={onSignIn}>
+          {reconnectRequired ? "Sign in to reconnect" : "Sign in with OpenKey"}
+        </button>
       </section>
       <section className="signin-access" aria-labelledby="signin-access-title">
         <h2 id="signin-access-title">One sign-in connects</h2>
@@ -1454,11 +1592,15 @@ function SkillCredentialsPanel({
   policy,
   actorId,
   onDisconnect,
+  onReconnectRequired,
+  attachInputAuthority,
 }: {
   client: FeedV1HostClient;
   policy: FeedHostDelegationPolicy;
   actorId: string;
   onDisconnect: () => void;
+  onReconnectRequired: (error: FeedReconnectRequiredError) => void;
+  attachInputAuthority: typeof attachReceivedInputAuthority;
 }) {
   const [skills, setSkills] = useState<FeedHostSkillState[]>([]);
   const [workflows, setWorkflows] = useState<FeedHostWorkflowState[]>([]);
@@ -1780,12 +1922,18 @@ function SkillCredentialsPanel({
             const tc1Link = newSource.tc1Link.trim();
             if (!sourceId || !displayName || !tc1Link) return;
             setBusySourceId(sourceId);
-            void attachReceivedInputAuthority({ client, policy, sourceId, displayName, tc1Link })
+            void attachInputAuthority({ client, policy, sourceId, displayName, tc1Link })
               .then(() => {
                 setNewSource({ sourceId: "", displayName: "", tc1Link: "" });
                 return reload();
               })
-              .catch((error) => setLoadError(formatHostError(error)))
+              .catch((error) => {
+                if (isFeedReconnectRequiredError(error)) {
+                  onReconnectRequired(error);
+                  return;
+                }
+                setLoadError(formatHostError(error));
+              })
               .finally(() => setBusySourceId(null));
           }}
         >

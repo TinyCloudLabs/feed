@@ -53,12 +53,19 @@ describe("browser input authority SDK boundary", () => {
       displayName: "Team",
       delegateDID: "did:key:zFeedHost",
     })).rejects.toThrow("TinyCloud SDK update required");
-    await expect(delegateInputAuthorityLocally({
-      sdk: { sharing: { delegateReceivedShare: async () => { throw new Error("tc1:parent-secret"); } } },
+    const sdkFailure = new Error("tc1:parent-secret");
+    const delegation = delegateInputAuthorityLocally({
+      sdk: { sharing: { delegateReceivedShare: async () => { throw sdkFailure; } } },
       tc1Link: "tc1:parent-secret",
       sourceId: "team",
       displayName: "Team",
       delegateDID: "did:key:zFeedHost",
-    })).rejects.toThrow("TinyCloud could not delegate the received share");
+    });
+    await expect(delegation).rejects.toThrow("TinyCloud could not delegate the received share");
+    await delegation.catch((error: unknown) => {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).not.toContain("parent-secret");
+      expect((error as Error).cause).toEqual(sdkFailure);
+    });
   });
 });

@@ -11,9 +11,14 @@ export const FEED_MANIFEST: Manifest = {
   permissions: [],
 };
 
+export const MISSING_PARENT_RECONNECT_MESSAGE = "The storage service was updated. Sign in once to reconnect.";
+
 export class FeedReconnectRequiredError extends Error {
-  constructor(cause?: unknown) {
-    super("Your saved Feed access needs to be refreshed. Sign in again to continue.", { cause });
+  constructor(
+    cause?: unknown,
+    message = "Your saved Feed access needs to be refreshed. Sign in again to continue.",
+  ) {
+    super(message, { cause });
     this.name = "FeedReconnectRequiredError";
   }
 }
