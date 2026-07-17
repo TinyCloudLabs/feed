@@ -29,12 +29,11 @@ import {
 } from "./feedV1HostClient.ts";
 import {
   createLazyArtifactCache,
+  feedKickerSegments,
   feedItemAvailability,
   feedItemsForView,
   feedItemsFromProjections,
   projectedPost,
-  readableFeedTime,
-  readablePostKind,
   readableProvenance,
   sortedFeed,
   type FeedItem,
@@ -79,6 +78,8 @@ type ArtifactRoute = {
   postId?: string;
 };
 
+type AppRoute = ArtifactRoute | "activity";
+
 export function currentRoute(hash = typeof location === "undefined" ? "" : location.hash): ArtifactRoute | null {
   const match = hash.match(/^#\/a\/(.+)$/);
   if (!match) return null;
@@ -104,6 +105,11 @@ export function currentRoute(hash = typeof location === "undefined" ? "" : locat
   } catch {
     return { feedItemId, artifactId };
   }
+}
+
+function currentAppRoute(hash = typeof location === "undefined" ? "" : location.hash): AppRoute | null {
+  if (hash === "#/activity") return "activity";
+  return currentRoute(hash);
 }
 
 class FeedSetupFailedError extends Error {
@@ -140,6 +146,7 @@ export function App() {
   const [activeView, setActiveView] = useState<FeedView>("for_you");
   const [commandStatus, setCommandStatus] = useState<string | null>(null);
   const [route, setRoute] = useState<ArtifactRoute | null>(() => currentRoute());
+  const [activityOpen, setActivityOpen] = useState(() => currentAppRoute() === "activity");
   const [pageArtifact, setPageArtifact] = useState<FeedArtifact | null>(null);
   const [pageLoadState, setPageLoadState] = useState<ArtifactPageState>("loading");
   const [pageLoadError, setPageLoadError] = useState<string | undefined>();
@@ -153,7 +160,7 @@ export function App() {
   const firstContentReported = useRef<string | null>(null);
   const restoredHostSession = useRef(false);
   const feedbackAttempts = useRef(new Map<string, { eventId: string; readerNonce: string }>());
-  const routeRef = useRef(route);
+  const routeRef = useRef<AppRoute | null>(currentAppRoute());
   const enteredFromFeed = useRef(false);
   const savedFeedScrollY = useRef(0);
   const pendingFeedScrollY = useRef<number | null>(null);
@@ -184,7 +191,7 @@ export function App() {
     };
     const onHashChange = () => {
       const previous = routeRef.current;
-      const next = currentRoute();
+      const next = currentAppRoute();
       if (!previous && next) {
         pendingFeedScrollY.current = null;
         enteredFromFeed.current = true;
@@ -192,7 +199,8 @@ export function App() {
         pendingFeedScrollY.current = savedFeedScrollY.current;
       }
       routeRef.current = next;
-      setRoute(next);
+      setRoute(next === "activity" ? null : next);
+      setActivityOpen(next === "activity");
       setMenuOpen(false);
     };
     window.addEventListener("click", onCaptureClick, { capture: true });
@@ -733,9 +741,19 @@ export function App() {
 
   const visibleItems = feedItemsForView(items, activeView);
   const visibleLoadError = loadError ?? eventsError;
+  const generationInProgress = feedState === "starting"
+    || (hostSetup !== null && hostSetup.state !== "ready")
+    || busyAction === "ask_feed";
+  const routedAway = route !== null || activityOpen;
+
+  const openFeedView = (view: FeedView) => {
+    setActiveView(view);
+    setMenuOpen(false);
+    if (routedAway) location.hash = "";
+  };
 
   useLayoutEffect(() => {
-    if (route || pendingFeedScrollY.current === null) return;
+    if (routedAway || pendingFeedScrollY.current === null) return;
     const target = pendingFeedScrollY.current;
     let frame: number | undefined;
     const deadline = performance.now() + SCROLL_RESTORE_BUDGET_MS;
@@ -760,7 +778,7 @@ export function App() {
     return () => {
       if (frame !== undefined) cancelAnimationFrame(frame);
     };
-  }, [loadState, route, visibleItems.length]);
+  }, [loadState, routedAway, visibleItems.length]);
 
   useEffect(() => {
     const trace = loginTrace.current;
@@ -786,7 +804,7 @@ export function App() {
     return <SignInScreen error={signInError} onSignIn={() => void connect()} />;
   }
 
-  if (feedState === "idle" || feedState === "starting") {
+  if (feedState === "idle" || (feedState === "starting" && loadState !== "ready")) {
     return <SetupScreen stage={setupStage} setup={hostSetup} />;
   }
 
@@ -841,14 +859,13 @@ export function App() {
           <button className="primary" onClick={() => void sendAskFeed()} disabled={busyAction === "ask_feed"}>
             Ask Feed
           </button>
-          <button onClick={() => setMenuOpen((open) => !open)} aria-expanded={menuOpen} aria-haspopup="true" aria-controls="feed-menu">
+          <button className="topbar-menu" onClick={() => setMenuOpen((open) => !open)} aria-expanded={menuOpen} aria-haspopup="true" aria-controls="feed-menu">
             Menu
           </button>
         </div>
       </header>
 
-      {menuOpen && (
-        <nav id="feed-menu" className="menu-panel" aria-label="Feed menu">
+      <nav id="feed-menu" className="menu-panel" aria-label="Feed menu" hidden={!menuOpen}>
           <span className="identity">Signed in as {shortAddress(session.address)}</span>
           <button onClick={() => void loadFeed()}>Refresh</button>
           <button onClick={() => {
@@ -858,14 +875,15 @@ export function App() {
             {settingsOpen ? "Close access settings" : "Access & automation"}
           </button>
           <button onClick={() => void disconnect()}>Sign out</button>
-        </nav>
-      )}
+      </nav>
 
       {settingsOpen && (
         <SkillCredentialsPanel client={client} policy={policy!} actorId={session.readerDid} onDisconnect={() => void disconnect()} />
       )}
 
-      {route && routedArtifactId ? (
+      {activityOpen ? (
+        <ActivityStub onBack={returnToFeed} />
+      ) : route && routedArtifactId ? (
         <ArtifactPage
           feedItemId={route.feedItemId}
           artifactId={routedArtifactId}
@@ -912,7 +930,9 @@ export function App() {
         {loadState === "ready" && visibleLoadError === null && visibleItems.length === 0 && (
           activeView === "saved"
             ? <EmptySavedPanel onShowFeed={() => setActiveView("for_you")} />
-            : <EmptyFeedPanel onRetry={() => void loadFeed()} />
+            : generationInProgress
+              ? <PreparingFeedPanel />
+              : <EmptyFeedPanel onRetry={() => void loadFeed()} />
         )}
 
         <div className="feed-list">
@@ -928,6 +948,35 @@ export function App() {
           ))}
         </div>
         </main>}
+
+      <nav className="bottom-nav" aria-label="Primary navigation">
+        <button
+          aria-current={!routedAway && activeView === "for_you" ? "page" : undefined}
+          onClick={() => openFeedView("for_you")}
+        >For you</button>
+        <button
+          aria-current={!routedAway && activeView === "saved" ? "page" : undefined}
+          onClick={() => openFeedView("saved")}
+        >Saved</button>
+        <button
+          aria-current={activityOpen ? "page" : undefined}
+          onClick={() => {
+            if (activityOpen) return;
+            if (route) {
+              location.replace("#/activity");
+              return;
+            }
+            if (!routedAway) savedFeedScrollY.current = window.scrollY;
+            location.hash = "#/activity";
+          }}
+        >Activity</button>
+        <button
+          aria-expanded={menuOpen}
+          aria-haspopup="true"
+          aria-controls="feed-menu"
+          onClick={() => setMenuOpen((open) => !open)}
+        >Menu</button>
+      </nav>
     </div>
   );
 }
@@ -1067,6 +1116,33 @@ function NoticePanel({
   );
 }
 
+function ActivityStub({ onBack }: { onBack: () => void }) {
+  return (
+    <main className="activity-page" aria-labelledby="activity-title">
+      <a
+        className="artifact-back"
+        href="#"
+        onClick={(event) => {
+          event.preventDefault();
+          onBack();
+        }}
+      >← Feed</a>
+      <p className="card-meta"><span>Coming next</span></p>
+      <h2 id="activity-title">Activity</h2>
+      <p>The timeline of runs, asks, and access events arrives in the next update.</p>
+    </main>
+  );
+}
+
+function PreparingFeedPanel() {
+  return (
+    <section className="preparing-feed" role="status" aria-live="polite">
+      <h2>Your first Feed items are being made.</h2>
+      <p>CONTENT GENERATION IN PROGRESS</p>
+    </section>
+  );
+}
+
 function EmptyFeedPanel({ onRetry }: { onRetry: () => void }) {
   return (
     <section className="panel empty-panel" aria-live="polite">
@@ -1167,8 +1243,11 @@ function FeedCard({
   return (
     <article ref={cardRef} className="feed-card">
       <div className="card-meta">
-        <span>{readablePostKind(item)}</span>
-        <span>{readableFeedTime(item.projection.publishedAt)}</span>
+        {feedKickerSegments({
+          artifact,
+          post,
+          publishedAt: item.projection.publishedAt,
+        }).map((segment) => <span key={segment}>{segment}</span>)}
       </div>
       {title && <h2><a href={`#/a/${encodeURIComponent(item.projection.feedItemId)}`}>{title}</a></h2>}
       {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
@@ -1215,11 +1294,14 @@ function FeedCard({
           <button disabled={busyAction === `${item.projection.feedItemId}:helpful`} onClick={() => void act("helpful")}>Helpful</button>
           <button onClick={() => setNoteOpen((open) => !open)} aria-expanded={noteOpen}>Add note</button>
         </div>
-        <div className="card-actions-secondary">
-          <button disabled={busyAction === `${item.projection.feedItemId}:unhelpful`} onClick={() => void act("unhelpful")}>Not helpful</button>
-          <button disabled={busyAction === `${item.projection.feedItemId}:show_fewer`} onClick={() => void act("show_fewer")}>Show fewer like this</button>
-          <button disabled={busyAction === `${item.projection.feedItemId}:hide`} onClick={() => void act("hide")}>Hide</button>
-        </div>
+        <details className="card-overflow">
+          <summary aria-label="More actions">More</summary>
+          <div className="card-overflow-actions">
+            <button disabled={busyAction === `${item.projection.feedItemId}:unhelpful`} onClick={() => void act("unhelpful")}>Not helpful</button>
+            <button disabled={busyAction === `${item.projection.feedItemId}:show_fewer`} onClick={() => void act("show_fewer")}>Show fewer like this</button>
+            <button disabled={busyAction === `${item.projection.feedItemId}:hide`} onClick={() => void act("hide")}>Hide</button>
+          </div>
+        </details>
       </div>
       {noteOpen && (
         <form className="note-form" onSubmit={(event) => {

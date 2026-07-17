@@ -67,6 +67,42 @@ describe("Feed ranking and reconciliation logic", () => {
     expect(preferenceRank.map(artifactId)).toEqual(["beta", "alpha"]);
   });
 
+  test("a note gives its package the same positive ranking signal as helpful feedback", () => {
+    const noted = projection({
+      artifactId: "noted",
+      packageId: "noted-package",
+      sourceFingerprint: "sha256:noted-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:00:00.000Z",
+      rankScore: 0.5,
+    });
+    const unnoted = projection({
+      artifactId: "unnoted",
+      packageId: "unnoted-package",
+      sourceFingerprint: "sha256:unnoted-source",
+      publishedAt: "2026-06-29T12:00:00.000Z",
+      updatedAt: "2026-06-29T12:00:00.000Z",
+      rankScore: 0.5,
+    });
+    const feedback = summarizeFeedbackEvents([
+      { target: { kind: "feed_item", feedItemId: noted.feedItemId }, signal: "text_note", createdAt: NOW.toISOString() },
+    ]);
+
+    const ranked = rankFeedProjections({ items: [unnoted, noted], feedbackByArtifact: feedback, now: NOW });
+    const helpfulRanked = rankFeedProjections({
+      items: [unnoted, noted],
+      feedbackByArtifact: summarizeFeedbackEvents([
+        { target: { kind: "feed_item", feedItemId: noted.feedItemId }, signal: "helpful", createdAt: NOW.toISOString() },
+      ]),
+      now: NOW,
+    });
+
+    expect(ranked.map((item) => item.packageId)).toEqual(["noted-package", "unnoted-package"]);
+    expect(ranked[0]?.reasonCodes).toContain("helpful_signal");
+    expect(ranked[0]?.rankScore).toBe(helpfulRanked[0]?.rankScore);
+    expect(feedback.get(`feed_item:${noted.feedItemId}`)?.notes).toBe(1);
+  });
+
   test("deduplicates a canonical post across artifacts after ranking", () => {
     const higherRanked = projection({
       feedItemId: "higher::post:canonical",

@@ -476,6 +476,10 @@ button:disabled {
   background: var(--soft);
 }
 
+.menu-panel[hidden] {
+  display: none;
+}
+
 .menu-panel .identity {
   margin-right: auto;
 }
@@ -1579,5 +1583,158 @@ summary:focus-visible {
   .artifact-page {
     width: min(calc(100% - 32px), 62ch);
     padding-top: 14px;
+  }
+}
+
+/* Slice 2: the home face stays editorially spare; secondary feedback lives
+   behind one quiet, native disclosure. */
+.card-overflow summary {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 10px;
+  color: var(--quiet);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: .04em;
+  cursor: pointer;
+  list-style: none;
+}
+
+.card-overflow summary::-webkit-details-marker {
+  display: none;
+}
+
+.card-overflow summary:hover,
+.card-overflow[open] > summary {
+  color: var(--ink);
+}
+
+.card-overflow[open] {
+  flex: 1 0 100%;
+}
+
+.card-overflow-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  padding-top: 2px;
+  border-top: 1px solid var(--soft-line);
+}
+
+.activity-page {
+  width: min(calc(100% - 44px), 62ch);
+  margin: 0 auto;
+  padding: 22px 0 48px;
+}
+
+.activity-page h2,
+.preparing-feed h2 {
+  font-family: var(--serif);
+  font-weight: 600;
+  letter-spacing: -.012em;
+}
+
+.activity-page h2 {
+  margin: 12px 0 10px;
+  font-size: 32px;
+  line-height: 1.12;
+}
+
+.activity-page > p:last-child {
+  max-width: 54ch;
+  margin: 0;
+  color: var(--muted);
+}
+
+.preparing-feed {
+  padding: 32px 0;
+  border-block: 1px solid var(--line);
+}
+
+.preparing-feed h2 {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.preparing-feed p {
+  margin: 12px 0 0;
+  color: var(--quiet);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+
+.bottom-nav {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .app-shell {
+    padding-bottom: calc(80px + env(safe-area-inset-bottom));
+  }
+
+  .topbar {
+    padding: 10px 16px;
+  }
+
+  .feed-tabs,
+  .topbar-menu {
+    display: none;
+  }
+
+  .feed-card .card-actions-primary button {
+    flex: 0 0 auto;
+  }
+
+  .card-overflow-actions button {
+    flex: 1 1 calc(50% - 3px);
+  }
+
+  .activity-page {
+    width: min(calc(100% - 32px), 62ch);
+    padding-top: 14px;
+  }
+
+  .bottom-nav {
+    position: fixed;
+    z-index: 30;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    width: min(100%, 840px);
+    margin: 0 auto;
+    padding: 6px 6px calc(6px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+    background: color-mix(in srgb, var(--surface) 96%, transparent);
+    backdrop-filter: blur(12px);
+  }
+
+  .bottom-nav button {
+    min-width: 0;
+    min-height: 48px;
+    border-color: transparent;
+    background: transparent;
+    color: var(--quiet);
+    padding: 8px 4px;
+    font-size: 12px;
+  }
+
+  .bottom-nav button[aria-current="page"] {
+    color: var(--ink);
+    font-weight: 650;
+  }
+
+  .bottom-nav button[aria-current="page"]::after {
+    content: "";
+    display: block;
+    width: 18px;
+    height: 1px;
+    margin: 4px auto 0;
+    background: var(--accent);
   }
 }

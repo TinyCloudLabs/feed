@@ -22,6 +22,14 @@ export type ReadableProvenance = {
   workflowSummary?: string;
 };
 
+export type FeedKickerInput = {
+  artifact: FeedArtifact | null;
+  post?: FeedPost;
+  publishedAt: string;
+  kind?: string;
+  now?: Date;
+};
+
 export type LazyArtifactCache = {
   peek: (artifactId: string) => FeedArtifact | undefined;
   load: (artifactId: string) => Promise<FeedArtifact>;
@@ -89,6 +97,27 @@ export function readableFeedTime(publishedAt: string, now: Date = new Date()): s
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(new Date(timestamp));
 }
 
+export function feedKickerSegments({
+  artifact,
+  post,
+  publishedAt,
+  kind,
+  now = new Date(),
+}: FeedKickerInput): string[] {
+  const sourceCount = artifact
+    ? post
+      ? new Set(post.evidence.flatMap((entry) => "sourceRefId" in entry ? [entry.sourceRefId] : [])).size
+      : artifact.sourceRefs.length
+    : 0;
+  return [
+    humanizeLabel(kind ?? post?.kind ?? artifact?.artifactType ?? "feed_post"),
+    ...(sourceCount > 0
+      ? [`${sourceCount} conversation${sourceCount === 1 ? "" : "s"}`]
+      : []),
+    readableFeedTime(publishedAt, now),
+  ];
+}
+
 export function feedItemAvailability(item: FeedItem): FeedItemAvailability {
   const freshness = item.artifact?.freshness.label ?? item.projection.freshnessLabel;
   if (freshness === "source_revoked" || item.projection.reasonCodes.includes("source_revoked")) {
@@ -107,7 +136,7 @@ export function readableProvenance(item: FeedItem): ReadableProvenance {
   return {
     madeBy: "Feed",
     sourceSummary: artifact
-      ? sourceSummary(artifact.sourceRefs)
+      ? readableSourceSummary(artifact.sourceRefs)
       : "Source details are available when the artifact opens.",
     freshnessSummary: humanizeLabel(artifact?.freshness.label ?? item.projection.freshnessLabel),
     ...(artifact?.producedBy.disclosure.userCopy
@@ -182,7 +211,7 @@ function humanizeLabel(value: string): string {
   return normalized[0]!.toUpperCase() + normalized.slice(1).toLowerCase();
 }
 
-function sourceSummary(sourceRefs: FeedArtifact["sourceRefs"]): string {
+export function readableSourceSummary(sourceRefs: FeedArtifact["sourceRefs"]): string {
   const count = sourceRefs.length;
   if (count === 0) return "No source details available";
   if (sourceRefs.every((source) => source.sourceKind === "listen_conversation")) {

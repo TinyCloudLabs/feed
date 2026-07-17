@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { FeedArtifact, FeedbackEvent } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { postsFromArtifact, type FeedItemProjection, type FeedPost } from "../../shared/feed-item.ts";
 import { ArtifactBody } from "./ArtifactBody.tsx";
-import { readableFeedTime } from "./feedModel.ts";
+import { feedKickerSegments, readableSourceSummary } from "./feedModel.ts";
 
 export type ArtifactPageState = "loading" | "ready" | "gone" | "error";
 
@@ -107,11 +107,6 @@ export function ArtifactPage({
       entry.kind === "verified_quote",
   ) ?? [];
   const pullQuote = verifiedQuotes[0];
-  const evidenceSourceIds = new Set(
-    post?.evidence.flatMap((entry) => "sourceRefId" in entry ? [entry.sourceRefId] : []) ?? [],
-  );
-  const conversationCount = evidenceSourceIds.size || artifact.sourceRefs.length;
-  const kind = humanize(post?.kind ?? artifact.artifactType);
   const publishedAt = projection?.publishedAt ?? artifact.createdAt;
   const headline = post?.title ?? projection?.postTitle ?? artifact.title;
   const showHero = hasHeroReference(artifact.body) && !heroFailed;
@@ -130,7 +125,7 @@ export function ArtifactPage({
       {backLink}
       <article>
         <p className="card-meta artifact-kicker">
-          {kind} · {conversationCount} conversation{conversationCount === 1 ? "" : "s"} · {readableFeedTime(publishedAt)}
+          {feedKickerSegments({ artifact, post, publishedAt }).map((segment) => <span key={segment}>{segment}</span>)}
         </p>
         <h2 className="artifact-page-title">{headline}</h2>
 
@@ -155,7 +150,7 @@ export function ArtifactPage({
           <h3 id="artifact-sources-title">Why you&apos;re seeing this</h3>
           <dl className="provenance">
             <div><dt>Made by</dt><dd>Feed</dd></div>
-            <div><dt>Sources</dt><dd>{sourceSummary(artifact)}</dd></div>
+            <div><dt>Sources</dt><dd>{readableSourceSummary(artifact.sourceRefs)}</dd></div>
             <div><dt>Freshness</dt><dd>{humanize(artifact.freshness.label)}</dd></div>
           </dl>
           {artifact.producedBy.disclosure.userCopy && <p>{artifact.producedBy.disclosure.userCopy}</p>}
@@ -274,15 +269,6 @@ function hasHeroReference(body: unknown): boolean {
   if (typeof hero === "string") return hero.trim().length > 0;
   if (!hero || typeof hero !== "object" || Array.isArray(hero)) return false;
   return Object.values(hero).some((value) => typeof value === "string" && value.trim().length > 0);
-}
-
-function sourceSummary(artifact: FeedArtifact): string {
-  const count = artifact.sourceRefs.length;
-  if (count === 0) return "No source details available";
-  if (artifact.sourceRefs.every((source) => source.sourceKind === "listen_conversation")) {
-    return `${count} Listen conversation${count === 1 ? "" : "s"}`;
-  }
-  return `${count} authorized source${count === 1 ? "" : "s"}`;
 }
 
 function sourceTitle(artifact: FeedArtifact, sourceRefId: string): string | undefined {

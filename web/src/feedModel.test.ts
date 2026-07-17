@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   bodyPreview,
   createLazyArtifactCache,
+  feedKickerSegments,
   feedItemAvailability,
   feedItemsForView,
   feedItemsFromProjections,
@@ -164,6 +165,52 @@ describe("Feed v1 model helpers", () => {
     expect(readablePostKind(feedItem)).toBe("Decision memo");
     expect(readableFeedTime(projection.publishedAt, new Date("2026-07-14T12:00:00.000Z"))).toBe("1h ago");
     expect(readableFeedTime("not-a-date", new Date("2026-07-14T12:00:00.000Z"))).toBe("Recently");
+  });
+
+  test("builds kind, distinct conversation count, and age kicker segments", () => {
+    const hydrated = artifact({ sourceRefs: [sourceRef("one"), sourceRef("two"), sourceRef("three")] });
+    const post = {
+      kind: "decision_memo",
+      evidence: [
+        { kind: "located_source", sourceRefId: "source-one" },
+        { kind: "located_source", sourceRefId: "source-one" },
+        { kind: "verified_quote", sourceRefId: "source-two" },
+        { kind: "analytic_inference" },
+      ],
+    } as never;
+
+    expect(feedKickerSegments({
+      artifact: hydrated,
+      post,
+      publishedAt: "2026-07-14T10:30:00.000Z",
+      now: new Date("2026-07-14T12:00:00.000Z"),
+    })).toEqual(["Decision memo", "2 conversations", "1h ago"]);
+    expect(feedKickerSegments({
+      artifact: hydrated,
+      publishedAt: "2026-07-14T11:59:30.000Z",
+      now: new Date("2026-07-14T12:00:00.000Z"),
+    })).toEqual(["Daily brief", "3 conversations", "Just now"]);
+    expect(feedKickerSegments({
+      artifact: artifact(),
+      publishedAt: "2026-07-14T11:30:00.000Z",
+      now: new Date("2026-07-14T12:00:00.000Z"),
+    })).toEqual(["Daily brief", "1 conversation", "30m ago"]);
+  });
+
+  test("omits the conversation segment when sources are unavailable or zero", () => {
+    const now = new Date("2026-07-14T12:00:00.000Z");
+    expect(feedKickerSegments({
+      artifact: null,
+      kind: "insight",
+      publishedAt: "2026-07-14T11:30:00.000Z",
+      now,
+    })).toEqual(["Insight", "30m ago"]);
+    expect(feedKickerSegments({
+      artifact: artifact({ sourceRefs: [] }),
+      post: { kind: "insight", evidence: [] } as never,
+      publishedAt: "2026-07-14T11:30:00.000Z",
+      now,
+    })).toEqual(["Insight", "30m ago"]);
   });
 
   test("reports explicit availability states with revoked authority taking precedence", () => {

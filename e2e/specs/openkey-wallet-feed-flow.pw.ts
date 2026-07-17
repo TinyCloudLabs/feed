@@ -166,7 +166,7 @@ async function expectMobileLayout(page: Page): Promise<void> {
   expect(layout.overflows).toBe(false);
   expect(layout.undersized).toEqual([]);
   const accessibility = await new AxeBuilder({ page })
-    .include("main")
+    .include("body")
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"])
     .analyze();
   expect(accessibility.violations).toEqual([]);
@@ -459,11 +459,51 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await page.goto("/");
   await signInWithWallet(page, wallet);
 
+  const firstItemProgress = page.getByText("CONTENT GENERATION IN PROGRESS", { exact: true });
+  const sawFirstItemProgress = await Promise.race([
+    firstItemProgress.waitFor({ state: "visible", timeout: 180000 }).then(() => true),
+    page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })
+      .waitFor({ state: "visible", timeout: 180000 }).then(() => false),
+  ]);
+  if (sawFirstItemProgress) {
+    await expect(page.getByRole("heading", { name: "Your first Feed items are being made." })).toBeVisible();
+  }
+
   await expect(page.getByText(/approve the default bundle/i)).toHaveCount(0);
   await expect(page.getByText(/first-run-approval/i)).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible({ timeout: 180000 });
   await expect(page.locator("p.post-body", { hasText: /test an invite preview inside setup/i })).toBeVisible();
   await expect(page.getByText(/first collaborative action is now the dominant stall point/i).locator("visible=true").first()).toBeVisible();
+  const firstCard = page.locator(".feed-card").first();
+  await expect(firstCard.locator(".card-meta span")).toHaveCount(3);
+  await expect(firstCard.locator(".card-meta span").nth(1)).toHaveText("1 conversation");
+  await expect(firstCard.locator(".card-meta span").nth(2)).toHaveText(/^(Just now|Recently|\d+[mhd] ago|[A-Z][a-z]{2} \d{1,2})$/);
+  await expect(firstCard.locator(".card-actions-primary > button")).toHaveText(["Save", "Helpful", "Add note"]);
+  await expect(firstCard.getByRole("button", { name: "Not helpful", exact: true })).toBeHidden();
+  await expect(firstCard.getByRole("button", { name: "Show fewer like this", exact: true })).toBeHidden();
+  await expect(firstCard.getByRole("button", { name: "Hide", exact: true })).toBeHidden();
+  await firstCard.getByRole("button", { name: "More actions", exact: true }).click();
+  await expect(firstCard.getByRole("button", { name: "Not helpful", exact: true })).toBeVisible();
+  await expect(firstCard.getByRole("button", { name: "Show fewer like this", exact: true })).toBeVisible();
+  await expect(firstCard.getByRole("button", { name: "Hide", exact: true })).toBeVisible();
+  await firstCard.getByRole("button", { name: "More actions", exact: true }).click();
+
+  const bottomNav = page.getByRole("navigation", { name: "Primary navigation" });
+  await expect(page.locator(".feed-tabs")).toBeHidden();
+  for (const name of ["For you", "Saved", "Activity", "Menu"]) {
+    const target = bottomNav.getByRole("button", { name, exact: true });
+    await expect(target).toBeVisible();
+    const box = await target.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.width).toBeGreaterThanOrEqual(44);
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+  }
+  await bottomNav.getByRole("button", { name: "Activity", exact: true }).click();
+  await expect(page).toHaveURL(/#\/activity$/);
+  await expect(page.getByRole("heading", { name: "Activity", exact: true })).toBeVisible();
+  await expect(page.getByText("The timeline of runs, asks, and access events arrives in the next update.", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "← Feed" }).click();
+  await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();
   await expectMobileLayout(page);
   // Scroll down and open a card that is IN VIEW at that position — Playwright
   // auto-scrolls click targets into view, so clicking an above-the-fold card
@@ -498,9 +538,9 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(scrollBeforeArtifact);
   await page.getByRole("button", { name: "Save", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Saved", exact: true }).first()).toBeVisible();
-  await page.getByRole("tab", { name: "Saved" }).click();
+  await bottomNav.getByRole("button", { name: "Saved", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();
-  await page.getByRole("tab", { name: "For you" }).click();
+  await bottomNav.getByRole("button", { name: "For you", exact: true }).click();
   await page.getByRole("button", { name: "Add note" }).first().click();
   await page.getByLabel("Private note").fill("Follow up with the onboarding owner.");
   await page.getByRole("button", { name: "Save note" }).click();
@@ -521,7 +561,7 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
   );
   expect(feedHostSignaturePrompts).toHaveLength(0);
 
-  await page.getByRole("button", { name: "Menu", exact: true }).click();
+  await bottomNav.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "Access & automation", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Access & automation" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Routines" })).toBeVisible();
@@ -558,7 +598,7 @@ test("one sign-in sets up Feed automatically and streams the first artifact", as
 
   await page.setViewportSize({ width: 390, height: 844 });
   recoveryMode = true;
-  await page.getByRole("button", { name: "Menu", exact: true }).click();
+  await bottomNav.getByRole("button", { name: "Menu", exact: true }).click();
   await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await expect(page.getByRole("heading", { name: /feed failed to load/i })).toBeVisible({ timeout: 120000 });
   await expect(page.getByRole("heading", { name: "Activation moved; the bottleneck did too" })).toBeVisible();

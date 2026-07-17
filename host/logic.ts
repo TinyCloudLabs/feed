@@ -53,6 +53,7 @@ export type FeedFeedbackSummary = {
   saved: number;
   hidden: number;
   helpful: number;
+  notes: number;
   unhelpful: number;
   showFewer: number;
   lastEventAt?: string;
@@ -288,6 +289,7 @@ export function summarizeFeedbackEvents(
       saved: 0,
       hidden: 0,
       helpful: 0,
+      notes: 0,
       unhelpful: 0,
       showFewer: 0,
     };
@@ -306,6 +308,9 @@ export function summarizeFeedbackEvents(
         break;
       case "helpful":
         current.helpful += 1;
+        break;
+      case "text_note":
+        current.notes += 1;
         break;
       case "unhelpful":
         current.unhelpful += 1;
@@ -922,12 +927,13 @@ function scoreRank(
       score -= Math.min(0.4, 0.1 * feedback.hidden);
       reasons.push("hidden");
     }
-    if (feedback.helpful > feedback.unhelpful) {
-      score += Math.min(0.25, 0.08 * (feedback.helpful - feedback.unhelpful));
+    const positiveEngagement = feedback.helpful + feedback.notes;
+    if (positiveEngagement > feedback.unhelpful) {
+      score += Math.min(0.25, 0.08 * (positiveEngagement - feedback.unhelpful));
       reasons.push("helpful_signal");
     }
-    if (feedback.unhelpful > feedback.helpful) {
-      score -= Math.min(0.35, 0.08 * (feedback.unhelpful - feedback.helpful));
+    if (feedback.unhelpful > positiveEngagement) {
+      score -= Math.min(0.35, 0.08 * (feedback.unhelpful - positiveEngagement));
       reasons.push("less_like_this");
     }
     if (feedback.showFewer > 0) {
