@@ -8,6 +8,7 @@ import { FEED_HOST_URL } from "./config.ts";
 export type ClientLogLevel = "info" | "warn" | "error";
 export type ClientSessionMode = "fresh" | "restored";
 export type DelegationFailureStage = "mint" | "submit" | "activate";
+export type MissingParentRecoveryOutcome = "healed" | "reconnect_required";
 
 export type ClientLogFields = {
   traceId?: string;
@@ -17,6 +18,7 @@ export type ClientLogFields = {
   activeElapsedMs?: number;
   session_mode?: ClientSessionMode;
   stage?: DelegationFailureStage;
+  outcome?: MissingParentRecoveryOutcome;
 };
 
 export function buildClientEventPayload(

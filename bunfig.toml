@@ -1,0 +1,2 @@
+[test]
+preload = ["./host/no-spend-setup.ts", "./web/test-preload.ts"]

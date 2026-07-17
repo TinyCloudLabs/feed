@@ -20,4 +20,19 @@ describe("client event payloads", () => {
     expect(payload).toMatchObject({ session_mode: "restored", stage: "activate" });
     expect(String(payload.detail)).toHaveLength(500);
   });
+
+  test.each(["healed", "reconnect_required"] as const)("records missing-parent outcome=%s without raw detail", (outcome) => {
+    const payload = buildClientEventPayload("info", "missing_parent_recovery", undefined, {
+      session_mode: "restored",
+      stage: "activate",
+      outcome,
+    });
+    expect(payload).toMatchObject({
+      event: "missing_parent_recovery",
+      session_mode: "restored",
+      stage: "activate",
+      outcome,
+    });
+    expect(payload.detail).toBeUndefined();
+  });
 });

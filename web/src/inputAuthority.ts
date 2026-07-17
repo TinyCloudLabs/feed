@@ -48,8 +48,10 @@ export async function delegateInputAuthorityLocally(input: {
       ...(input.expiry ? { expiry: new Date(input.expiry) } : {}),
       ...(input.expectedHost ? { expectedHost: input.expectedHost } : {}),
     });
-  } catch {
-    throw new Error("TinyCloud could not delegate the received share");
+  } catch (error) {
+    // Keep the SDK failure available to typed recovery without exposing its
+    // potentially sensitive message in the user-facing error text.
+    throw new Error("TinyCloud could not delegate the received share", { cause: error });
   }
   const portableDelegation = portableDelegationFromResult(result);
   if (!portableDelegation || portableDelegation.startsWith("tc1:")) {
