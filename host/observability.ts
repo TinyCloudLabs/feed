@@ -9,7 +9,8 @@ export type StorageSpanOp =
   | "artifact_media_get"
   | "preference_get"
   | "preference_put"
-  | "seed_doc_write";
+  | "seed_doc_write"
+  | "listen_source_batch";
 
 export type StorageResultCode = "ok" | "not_found" | "unauthorized" | `error:${string}`;
 
@@ -40,15 +41,17 @@ export async function withStorageSpan<T>(input: {
   traceId?: string;
   run: () => Promise<T>;
   resultCode: (value: T) => StorageResultCode;
+  metrics?: (value: T) => { batchCount: number; batchBytes: number };
+  errorMetrics?: { batchCount: number; batchBytes: number };
 }): Promise<T> {
   const startedAt = performance.now();
   const state: StorageOperationState = { healed: false };
   try {
     const value = await storageOperation.run(state, input.run);
-    emitStorageSpan(input, startedAt, state.healed, input.resultCode(value));
+    emitStorageSpan(input, startedAt, state.healed, input.resultCode(value), input.metrics?.(value));
     return value;
   } catch (error) {
-    emitStorageSpan(input, startedAt, state.healed, storageErrorResultCode(error));
+    emitStorageSpan(input, startedAt, state.healed, storageErrorResultCode(error), input.errorMetrics);
     throw error;
   }
 }
@@ -90,6 +93,7 @@ function emitStorageSpan(
   startedAt: number,
   healed: boolean,
   resultCode: StorageResultCode,
+  metrics?: { batchCount: number; batchBytes: number },
 ): void {
   const traceId = input.traceId ?? requestTrace.getStore();
   logEvent(resultCode === "ok" || resultCode === "not_found" ? "info" : "warn", "storage_span", {
@@ -100,6 +104,7 @@ function emitStorageSpan(
     resourcePath: input.resourcePath,
     resultCode,
     healed,
+    ...(metrics ? { batchCount: metrics.batchCount, batchBytes: metrics.batchBytes } : {}),
     ...(traceId ? { traceId } : {}),
   });
 }

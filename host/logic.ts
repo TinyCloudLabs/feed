@@ -739,7 +739,7 @@ export function buildOpenApiDocument(serverInfo: FeedHostServerInfo): Record<str
             required: true,
             schema: {
               type: "string",
-              enum: ["heartbeat", "phase", "artifacts", "reconcile", "complete", "retry", "assert"],
+              enum: ["heartbeat", "phase", "artifacts", "reconcile", "complete", "retry", "assert", "sources"],
             },
           }],
           responses: {

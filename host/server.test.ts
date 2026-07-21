@@ -1333,6 +1333,149 @@ describe("Feed Host server", () => {
     expect(unset.headers.get("cache-control")).toBe("private, no-store");
   });
 
+  test("worker source batches require the worker token and a live matching generation fence", async () => {
+    const storage = new FakeFeedHostStorage();
+    const workerToken = "source-batch-worker-token-with-at-least-32-random-bytes";
+    const databasePaths: string[] = [];
+    const databaseStatements: string[] = [];
+    let transcriptReadGate: Promise<void> | undefined;
+    let markTranscriptReadStarted = () => {};
+    const sourceAccess = {
+      sql: {
+        db: (path: string) => {
+          databasePaths.push(path);
+          return {
+            query: async (sql: string) => {
+              databaseStatements.push(sql);
+              if (sql.startsWith("PRAGMA")) {
+                return { ok: false, error: { code: "AUTH_UNAUTHORIZED", message: "SQL admin is not delegated" } };
+              }
+              if (sql.includes("AS transcript_json")) {
+                return { ok: true, data: { rows: [{ transcript_json: null, transcript_text: "fenced source transcript" }] } };
+              }
+              return {
+                ok: true,
+                data: { rows: [{ id: "listen-conversation-1", title: "Listen title", started_at: "2026-07-21T12:00:00.000Z" }] },
+              };
+            },
+          };
+        },
+      },
+      kv: {
+        get: async () => {
+          if (transcriptReadGate) {
+            markTranscriptReadStarted();
+            await transcriptReadGate;
+          }
+          return { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } };
+        },
+      },
+    } as unknown as ActivatedFeedDelegation["access"];
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      workerToken,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => ({
+        ...fakeActivatedDelegation(serializedDelegation),
+        access: sourceAccess,
+      }),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+    const createdAt = new Date().toISOString();
+    await postJson(`${runtime.url}/control-intents`, {
+      actorId: ACTOR_ID,
+      eventId: "source-batch-request-1",
+      readerNonce: "source-batch-nonce-1",
+      intentKind: "ask_feed",
+      targetRef: "feed",
+      createdAt,
+    }, { "x-feed-actor-id": ACTOR_ID });
+    const claimResponse = await postJson(`${runtime.url}/api/worker/generation-requests/claim`, {
+      actorId: ACTOR_ID,
+      workflowId: "source-workflow",
+      claimOwner: "source-worker",
+    }, { authorization: `Bearer ${workerToken}` });
+    const claim = (await claimResponse.json()) as { request: { requestId: string; runId: string; fencingToken: number } };
+    const body = {
+      actorId: ACTOR_ID,
+      runId: claim.request.runId,
+      claimOwner: "source-worker",
+      fencingToken: claim.request.fencingToken,
+      limit: 1,
+    };
+
+    const actorSessionOnly = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/sources`,
+      body,
+      { "x-feed-actor-id": ACTOR_ID, cookie: "feed_session=forged" },
+    );
+    expect(actorSessionOnly.status).toBe(401);
+
+    const wrongFence = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/sources`,
+      { ...body, fencingToken: claim.request.fencingToken + 1 },
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(wrongFence.status).toBe(409);
+    expect(((await wrongFence.json()) as { error: { code: string } }).error.code).toBe("stale_generation_lease");
+
+    const valid = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/sources`,
+      body,
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(valid.status).toBe(200);
+    expect(await valid.json()).toMatchObject({
+      count: 1,
+      items: [{ conversationId: "listen-conversation-1", transcript: "fenced source transcript" }],
+    });
+    expect(databasePaths).toContain("xyz.tinycloud.listen/conversations");
+    expect(databaseStatements.some((statement) => /^\s*PRAGMA\b/i.test(statement))).toBe(false);
+
+    let releaseTranscriptRead = () => {};
+    const transcriptReadStarted = new Promise<void>((resolve) => {
+      markTranscriptReadStarted = resolve;
+    });
+    transcriptReadGate = new Promise<void>((resolve) => {
+      releaseTranscriptRead = resolve;
+    });
+    const slowSourceRequest = postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/sources`,
+      body,
+      { authorization: `Bearer ${workerToken}` },
+    );
+    await transcriptReadStarted;
+    const heartbeatRequest = postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/heartbeat`,
+      { ...body, leaseSeconds: 120 },
+      { authorization: `Bearer ${workerToken}` },
+    );
+    const heartbeatWhileReading = await Promise.race([
+      heartbeatRequest,
+      Bun.sleep(2_000).then(() => null),
+    ]);
+    releaseTranscriptRead();
+    transcriptReadGate = undefined;
+    const [slowSourceResponse, heartbeatResponse] = await Promise.all([
+      slowSourceRequest,
+      heartbeatWhileReading ?? heartbeatRequest,
+    ]);
+    expect(heartbeatWhileReading).not.toBeNull();
+    expect(heartbeatResponse.status).toBe(200);
+    expect(slowSourceResponse.status).toBe(200);
+
+    storage.expireGenerationLease(claim.request.requestId);
+    const expired = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/sources`,
+      body,
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(expired.status).toBe(409);
+    expect(((await expired.json()) as { error: { code: string } }).error.code).toBe("stale_generation_lease");
+  });
+
   test("generation cancellation requires the browser actor session", async () => {
     const storage = new FakeFeedHostStorage();
     runtime = startSecureFeedHost({
@@ -2720,6 +2863,48 @@ class FakeFeedHostStorage {
     row.cancellation_requested ??= 0;
     row.updated_at = input.now;
     return wireGenerationRequest(row);
+  }
+
+  async assertGenerationRequestFence(
+    _actor: FeedHostActorStorage,
+    input: { requestId: string; runId: string; claimOwner: string; fencingToken: number; now: string },
+  ): Promise<Record<string, unknown>> {
+    const row = this.generationRequests.find((candidate) => candidate.request_id === input.requestId);
+    if (
+      !row ||
+      row.status !== "pending" ||
+      row.run_id !== input.runId ||
+      row.claim_owner !== input.claimOwner ||
+      row.fencing_token !== input.fencingToken ||
+      !row.lease_expires_at ||
+      row.lease_expires_at <= input.now
+    ) {
+      throw new FeedHostError("generation request lease is stale", 409, "stale_generation_lease");
+    }
+    return wireGenerationRequest(row);
+  }
+
+  async heartbeatGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: {
+      requestId: string;
+      runId: string;
+      claimOwner: string;
+      fencingToken: number;
+      now: string;
+      leaseExpiresAt: string;
+    },
+  ): Promise<Record<string, unknown>> {
+    await this.assertGenerationRequestFence(actor, input);
+    const row = this.generationRequests.find((candidate) => candidate.request_id === input.requestId)!;
+    row.lease_expires_at = input.leaseExpiresAt;
+    row.updated_at = input.now;
+    return wireGenerationRequest(row);
+  }
+
+  expireGenerationLease(requestId: string): void {
+    const row = this.generationRequests.find((candidate) => candidate.request_id === requestId);
+    if (row) row.lease_expires_at = "2000-01-01T00:00:00.000Z";
   }
 
   async requestGenerationCancellation(
