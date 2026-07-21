@@ -5,6 +5,7 @@ import { logEvent } from "./log.ts";
 export type StorageSpanOp =
   | "artifact_index_lookup"
   | "artifact_document_get"
+  | "artifact_inline_media_decode"
   | "artifact_media_get"
   | "preference_get"
   | "preference_put"
