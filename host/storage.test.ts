@@ -1,6 +1,11 @@
 import { expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { FEED_HOST_ARTIFACT_DOC_PREFIX, FEED_HOST_ARTIFACTS_DB_PATH, FEED_HOST_FEED_DB_PATH } from "./delegation.ts";
+import {
+  FEED_HOST_ARTIFACT_DOC_PREFIX,
+  FEED_HOST_ARTIFACT_MEDIA_PREFIX,
+  FEED_HOST_ARTIFACTS_DB_PATH,
+  FEED_HOST_FEED_DB_PATH,
+} from "./delegation.ts";
 import type { FeedHostActorStorage } from "./storage.ts";
 import { FeedHostStorage, generationRequestSql } from "./storage.ts";
 import type { FeedV1MigrationSummary } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
@@ -511,58 +516,86 @@ test("listFeed excludes quarantined SQLite rows before pagination and can includ
   feed.db.close();
 });
 
-test("reads a base64 hero through the artifacts-prefix delegation with the declared image type", async () => {
-  const artifacts = realHandle("artifacts_index");
-  const artifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;
-  const heroKey = `xyz.tinycloud.artifacts/media/${artifact.artifactId}/hero.png.b64`;
-  (artifact.body as Record<string, unknown>).hero_image = { key: heroKey };
-  (artifact.body as Record<string, unknown>).hero_image_mime = "image/png";
-  artifacts.db.query(`INSERT INTO artifact_index
-    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
-     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
-     created_at, updated_at, published_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(
-      artifact.artifactId,
-      artifact.artifactType,
-      artifact.producedBy.packageId,
-      artifact.producedBy.packageVersion,
-      artifact.producedBy.packageDigest,
-      artifact.producedBy.runId,
-      artifact.idempotency.sourceFingerprint,
-      artifact.idempotency.artifactFingerprint,
-      artifact.idempotency.dedupeKey,
-      artifact.storage.docKey,
-      JSON.stringify(artifact.storage.mediaKeys ?? []),
-      artifact.createdAt,
-      artifact.updatedAt,
-      artifact.createdAt,
-    );
-  const docs = new Map<string, unknown>([
-    [artifactDocKey(artifact.storage.docKey), artifact],
-    [heroKey, Buffer.from("tiny hero bytes").toString("base64")],
-  ]);
-  const actor = {
-    actorId: "did:pkh:eip155:1:0xhero",
-    artifacts: { sql: { db: () => artifacts.handle } },
-    documents: {
-      kv: {
-        get: async (key: string) => docs.has(key)
-          ? { ok: true, data: { data: docs.get(key) } }
-          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
-      },
-    },
-  } as unknown as FeedHostActorStorage;
-  const storage = new FeedHostStorage();
+test("reads every existing KV hero-reference shape through the media delegation", async () => {
+  const fixture = makeHeroStorageFixture();
+  const body = fixture.artifact.body as Record<string, unknown>;
+  const physicalKey = `${FEED_HOST_ARTIFACT_MEDIA_PREFIX}${fixture.artifact.artifactId}/hero.png.b64`;
+  fixture.documents.set(physicalKey, Buffer.from("tiny hero bytes").toString("base64"));
+  body.hero_image_mime = "image/png";
 
-  expect((await storage.readArtifact(actor, artifact.artifactId)).kind).toBe("found");
-  const hero = await storage.readArtifactHero(actor, artifact.artifactId);
-  expect(hero?.contentType).toBe("image/png");
-  expect(Buffer.from(hero?.bytes ?? []).toString()).toBe("tiny hero bytes");
+  try {
+    for (const reference of [
+      "hero.png",
+      `media/${fixture.artifact.artifactId}/hero.png.b64`,
+      physicalKey,
+    ]) {
+      body.hero_image = { key: reference };
+      const hero = await fixture.storage.readArtifactHero(fixture.actor, fixture.artifact.artifactId);
+      expect(hero?.contentType).toBe("image/png");
+      expect(Buffer.from(hero?.bytes ?? []).toString()).toBe("tiny hero bytes");
+    }
 
-  docs.delete(heroKey);
-  expect(await storage.readArtifactHero(actor, artifact.artifactId)).toBeNull();
-  artifacts.db.close();
+    expect(fixture.mediaReads).toEqual([physicalKey, physicalKey, physicalKey]);
+    fixture.documents.delete(physicalKey);
+    expect(await fixture.storage.readArtifactHero(fixture.actor, fixture.artifact.artifactId)).toBeNull();
+  } finally {
+    fixture.close();
+  }
+});
+
+test("serves png, jpeg, and webp data-URI heroes without reading media KV", async () => {
+  const fixture = makeHeroStorageFixture();
+  const body = fixture.artifact.body as Record<string, unknown>;
+  const bytes = Buffer.from("inline hero bytes");
+
+  try {
+    for (const contentType of ["image/png", "image/jpeg", "image/webp"]) {
+      body.hero_image = `data:${contentType};base64,${bytes.toString("base64")}`;
+      const hero = await fixture.storage.readArtifactHero(fixture.actor, fixture.artifact.artifactId);
+      expect(hero?.contentType).toBe(contentType);
+      expect(Buffer.from(hero?.bytes ?? [])).toEqual(bytes);
+    }
+    expect(fixture.mediaReads).toEqual([]);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("rejects unsafe, oversized, and malformed data-URI heroes with scrubbed warning spans", async () => {
+  const previousLog = process.env.FEED_HOST_LOG;
+  process.env.FEED_HOST_LOG = "1";
+  const output: string[] = [];
+  const log = spyOn(console, "log").mockImplementation((line) => output.push(String(line)));
+  const fixture = makeHeroStorageFixture();
+  const body = fixture.artifact.body as Record<string, unknown>;
+  const rejected = [
+    `data:image/svg+xml;base64,${Buffer.from("<svg onload='alert(1)'></svg>").toString("base64")}`,
+    `data:image/png;base64,${Buffer.alloc(1024 * 1024 + 1).toString("base64")}`,
+    "data:image/webp;base64,%%%not-base64%%%",
+  ];
+
+  try {
+    for (const reference of rejected) {
+      body.hero_image = reference;
+      expect(await fixture.storage.readArtifactHero(fixture.actor, fixture.artifact.artifactId)).toBeNull();
+    }
+
+    const spans = output
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((event) => event.event === "storage_span" && event.op === "artifact_inline_media_decode");
+    expect(spans.map((event) => event.resultCode)).toEqual([
+      "error:unsupported_media_type",
+      "error:media_too_large",
+      "error:malformed_base64",
+    ]);
+    expect(spans.every((event) => event.level === "warn")).toBe(true);
+    expect(JSON.stringify(spans)).not.toContain("data:image");
+    expect(fixture.mediaReads).toEqual([]);
+  } finally {
+    fixture.close();
+    log.mockRestore();
+    process.env.FEED_HOST_LOG = previousLog;
+  }
 });
 
 test("reads a legacy absolute doc_key and normalizes it during reconciliation", async () => {
@@ -631,6 +664,58 @@ test("rejects feedback for a missing artifact before writing either interaction 
 
 function artifactDocKey(docKey: string): string {
   return `${FEED_HOST_ARTIFACT_DOC_PREFIX}/${docKey}`;
+}
+
+function makeHeroStorageFixture() {
+  const artifacts = realHandle("artifacts_index");
+  const artifact = structuredClone(RICH_ARTIFACT_FIXTURE) as unknown as FeedArtifact;
+  artifacts.db.query(`INSERT INTO artifact_index
+    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
+     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
+     created_at, updated_at, published_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(
+      artifact.artifactId,
+      artifact.artifactType,
+      artifact.producedBy.packageId,
+      artifact.producedBy.packageVersion,
+      artifact.producedBy.packageDigest,
+      artifact.producedBy.runId,
+      artifact.idempotency.sourceFingerprint,
+      artifact.idempotency.artifactFingerprint,
+      artifact.idempotency.dedupeKey,
+      artifact.storage.docKey,
+      JSON.stringify(artifact.storage.mediaKeys ?? []),
+      artifact.createdAt,
+      artifact.updatedAt,
+      artifact.createdAt,
+    );
+  const documents = new Map<string, unknown>([
+    [artifactDocKey(artifact.storage.docKey), artifact],
+  ]);
+  const mediaReads: string[] = [];
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xhero",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    documents: {
+      kv: {
+        get: async (key: string) => {
+          if (key.startsWith(FEED_HOST_ARTIFACT_MEDIA_PREFIX)) mediaReads.push(key);
+          return documents.has(key)
+            ? { ok: true, data: { data: documents.get(key) } }
+            : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } };
+        },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+  return {
+    actor,
+    artifact,
+    close: () => artifacts.db.close(),
+    documents,
+    mediaReads,
+    storage: new FeedHostStorage(),
+  };
 }
 
 function makeHydrationActor(input: {

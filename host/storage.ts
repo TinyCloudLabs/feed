@@ -650,6 +650,21 @@ export class FeedHostStorage {
     if (result.kind !== "found") return null;
     const reference = artifactHeroReference(result.artifact.body);
     if (!reference) return null;
+    // Inline heroes live in the already-hydrated artifact document. Resolve
+    // them before constructing media-key candidates so a data URI can never
+    // escape into a KV lookup (or into storage telemetry as a resource key).
+    if (isDataUriReference(reference.key)) {
+      const decoded = await withStorageSpan({
+        op: "artifact_inline_media_decode",
+        actorId: actor.actorId,
+        artifactId: result.artifact.artifactId,
+        resourcePath: resourceKv(actor.documents, FEED_HOST_ARTIFACT_DOC_PREFIX).resourcePath,
+        traceId: actor.traceId,
+        run: async () => decodeInlineArtifactHero(reference.key),
+        resultCode: (value) => value.kind === "found" ? "ok" : `error:${value.reason}`,
+      });
+      return decoded.kind === "found" ? decoded.hero : null;
+    }
     // Migrated distillery docs store a bare filename ("hero.png") whose blob
     // lives under the artifact's media directory, usually as base64 with a
     // .b64 suffix. Try candidates in order until one resolves.
@@ -2674,6 +2689,7 @@ function artifactHeroReference(body: unknown): { key: string; contentType?: stri
 // the .b64 variant the legacy pipeline wrote.
 function heroKeyCandidates(reference: string, artifactId: string): string[] {
   const trimmed = reference.trim();
+  if (isDataUriReference(trimmed)) return [];
   if (trimmed.includes("/")) {
     const mediaRelative = trimmed.startsWith("media/") ? trimmed.slice("media/".length) : trimmed;
     try {
@@ -2692,11 +2708,43 @@ function heroKeyCandidates(reference: string, artifactId: string): string[] {
 // Raster whitelist only — image/svg+xml is script-capable markup and serving
 // it from the authenticated host origin would be an XSS vector.
 const SAFE_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif", "image/avif"]);
+const MAX_INLINE_HERO_BYTES = 1024 * 1024;
+
+type InlineHeroDecodeResult =
+  | { kind: "found"; hero: ArtifactHero }
+  | { kind: "rejected"; reason: "unsupported_media_type" | "malformed_base64" | "media_too_large" };
 
 function imageMime(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const normalized = value.trim().toLowerCase();
   return SAFE_IMAGE_MIMES.has(normalized) ? normalized : undefined;
+}
+
+function isDataUriReference(value: string): boolean {
+  return value.trimStart().toLowerCase().startsWith("data:");
+}
+
+function decodeInlineArtifactHero(value: string): InlineHeroDecodeResult {
+  const trimmed = value.trim();
+  const mediaType = trimmed.match(/^data:([^;,]+)/i)?.[1];
+  const contentType = imageMime(mediaType);
+  if (!contentType) return { kind: "rejected", reason: "unsupported_media_type" };
+
+  const dataUri = trimmed.match(/^data:([^;,]+);base64,(.*)$/is);
+  const encoded = dataUri?.[2].replaceAll(/\s+/g, "") ?? "";
+  if (!encoded || encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    return { kind: "rejected", reason: "malformed_base64" };
+  }
+  const paddingBytes = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  const decodedSize = (encoded.length / 4) * 3 - paddingBytes;
+  if (decodedSize > MAX_INLINE_HERO_BYTES) {
+    return { kind: "rejected", reason: "media_too_large" };
+  }
+  const decoded = decodeBase64Media(trimmed);
+  if (!decoded || decoded.bytes.byteLength !== decodedSize) {
+    return { kind: "rejected", reason: "malformed_base64" };
+  }
+  return { kind: "found", hero: { bytes: decoded.bytes, contentType } };
 }
 
 function decodeBase64Media(value: string): { bytes: Uint8Array; contentType?: string } | null {

@@ -2041,12 +2041,15 @@ describe("Feed Host workflow routines", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toBe("image/png");
     expect(response.headers.get("cache-control")).toBe("private, max-age=3600");
+    expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(response.headers.get("content-security-policy")).toBe("sandbox");
     expect(Buffer.from(await response.arrayBuffer()).toString()).toBe("served hero bytes");
 
     const missing = await fetch(`${runtime.url}/artifacts/without-hero/hero`, {
       headers: { "x-feed-actor-id": ACTOR_ID },
     });
     expect(missing.status).toBe(404);
+    expect(missing.headers.get("cache-control")).toBe("private, no-store");
   });
 
   test("pausing a routine through control intents is reflected in /workflows", async () => {
