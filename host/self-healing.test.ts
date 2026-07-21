@@ -3,7 +3,7 @@
 // contract: an unauthorized result triggers exactly one re-activation from
 // the stored delegations and a transparent retry — no user action.
 import { expect, test } from "bun:test";
-import { reactivateActorAccess, selfHealingAccess } from "./server.ts";
+import { DELEGATED_ACCESS_TTL_MS, reactivateActorAccess, selfHealingAccess } from "./server.ts";
 import type { FeedHostDelegationStore } from "./delegation-store.ts";
 
 type Actor = Parameters<typeof selfHealingAccess>[0];
@@ -11,6 +11,7 @@ type Deps = Parameters<typeof reactivateActorAccess>[0];
 
 const PATH = "xyz.tinycloud.artifacts/index";
 const DELEGATE = "did:key:zHost";
+const POLICY_HASH = "sha256:current-policy";
 const UNAUTHORIZED = {
   ok: false,
   error: { message: "SQL query failed: 401 - Unauthorized Action: tinycloud:pkh:eip155:1:0xabc:applications/sql/xyz.tinycloud.artifacts/index / tinycloud.sql/read" },
@@ -53,6 +54,7 @@ function makeWorld() {
     load: async () => ({
       actorId: "did:pkh:eip155:1:0xabc",
       delegateDID: DELEGATE,
+      policyHash: POLICY_HASH,
       resources: [{
         path: PATH,
         serializedDelegation: "serialized-blob",
@@ -70,7 +72,7 @@ function makeWorld() {
     accessByResource: new Map([[PATH, makeAccess(session, 1)]]),
   } as unknown as Actor;
   actor.heal = () => reactivateActorAccess(
-    { delegationStore: store, activateDelegation, delegateDID: DELEGATE },
+    { delegationStore: store, activateDelegation, delegateDID: DELEGATE, policyHash: POLICY_HASH },
     actor,
   );
   return { session, actor, activations: () => activations, store };
@@ -130,7 +132,7 @@ test("when no stored delegation exists the original result surfaces", async () =
   const world = makeWorld();
   const emptyStore = { load: async () => null } as unknown as FeedHostDelegationStore;
   world.actor.heal = () => reactivateActorAccess(
-    { delegationStore: emptyStore, activateDelegation: async () => { throw new Error("unreachable"); }, delegateDID: DELEGATE },
+    { delegationStore: emptyStore, activateDelegation: async () => { throw new Error("unreachable"); }, delegateDID: DELEGATE, policyHash: POLICY_HASH },
     world.actor,
   );
   const access = selfHealingAccess(world.actor, PATH);
@@ -140,4 +142,75 @@ test("when no stored delegation exists the original result surfaces", async () =
   const result = await db.query("SELECT 1");
   expect(result.ok).toBe(false);
   expect(result.error?.message).toContain("Unauthorized Action");
+});
+
+test("access older than 50 minutes proactively re-activates before the next operation", async () => {
+  const world = makeWorld();
+  let now = 10_000;
+  world.actor.accessActivatedAtMs = now;
+  world.actor.accessNow = () => now;
+  const access = selfHealingAccess(world.actor, PATH);
+  const db = (access.sql as { db: (p: string) => { query: (sql: string) => Promise<{ ok: boolean }> } }).db(PATH);
+
+  now += DELEGATED_ACCESS_TTL_MS - 1;
+  expect((await db.query("still-fresh")).ok).toBe(true);
+  expect(world.activations()).toBe(0);
+
+  now += 1;
+  expect((await db.query("refresh-now")).ok).toBe(true);
+  expect(world.activations()).toBe(1);
+});
+
+test("TTL refresh rejects a changed delegatee DID without activating stale authority", async () => {
+  const world = makeWorld();
+  const staleStore = {
+    load: async () => ({
+      actorId: world.actor.actorId,
+      delegateDID: "did:key:zDifferentHost",
+      policyHash: POLICY_HASH,
+      resources: [{
+        path: PATH,
+        serializedDelegation: "serialized-blob",
+        acceptedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+      }],
+    }),
+  } as unknown as FeedHostDelegationStore;
+  world.actor.accessActivatedAtMs = 0;
+  world.actor.accessNow = () => DELEGATED_ACCESS_TTL_MS;
+  world.actor.heal = () => reactivateActorAccess(
+    { delegationStore: staleStore, activateDelegation: async () => { throw new Error("must not activate"); }, delegateDID: DELEGATE, policyHash: POLICY_HASH },
+    world.actor,
+  );
+
+  const access = selfHealingAccess(world.actor, PATH);
+  const db = (access.sql as { db: (p: string) => { query: (sql: string) => Promise<unknown> } }).db(PATH);
+  await expect(db.query("blocked")).rejects.toMatchObject({ code: "delegation_stale" });
+});
+
+test("TTL refresh rejects a changed policy hash without activating stale authority", async () => {
+  const world = makeWorld();
+  const staleStore = {
+    load: async () => ({
+      actorId: world.actor.actorId,
+      delegateDID: DELEGATE,
+      policyHash: "sha256:old-policy",
+      resources: [{
+        path: PATH,
+        serializedDelegation: "serialized-blob",
+        acceptedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+      }],
+    }),
+  } as unknown as FeedHostDelegationStore;
+  world.actor.accessActivatedAtMs = 0;
+  world.actor.accessNow = () => DELEGATED_ACCESS_TTL_MS;
+  world.actor.heal = () => reactivateActorAccess(
+    { delegationStore: staleStore, activateDelegation: async () => { throw new Error("must not activate"); }, delegateDID: DELEGATE, policyHash: POLICY_HASH },
+    world.actor,
+  );
+
+  const access = selfHealingAccess(world.actor, PATH);
+  const db = (access.sql as { db: (p: string) => { query: (sql: string) => Promise<unknown> } }).db(PATH);
+  await expect(db.query("blocked")).rejects.toMatchObject({ code: "delegation_stale" });
 });

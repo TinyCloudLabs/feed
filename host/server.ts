@@ -66,6 +66,14 @@ import {
   telemetryIdHash,
   withTelemetryTrace,
 } from "./observability.ts";
+import {
+  DEFAULT_LISTEN_SOURCE_LIMIT,
+  LISTEN_CONVERSATIONS_DB_PATH,
+  LISTEN_TRANSCRIPT_KV_PREFIX,
+  MAX_LISTEN_SOURCE_LIMIT,
+  parseListenSourceCursor,
+  readListenSourceBatchWithTelemetry,
+} from "./listen-source.ts";
 
 type JsonBody = Record<string, unknown>;
 type FeedbackRequestBody = Omit<FeedbackEvent, "actorId"> & { actorId?: string };
@@ -93,6 +101,8 @@ export type FeedHostServerOptions = {
   inputAuthorityExpectedHost?: string;
   requireActorSession?: boolean;
   allowedOrigins?: string[];
+  /** Test seam for the delegated-access cache lifetime. */
+  now?: () => Date;
 };
 
 export type FeedHostRuntime = {
@@ -114,6 +124,8 @@ type ActorState = AcceptedFeedDelegation & {
   // an hours timescale while the delegation chains stay valid for days).
   heal?: () => Promise<boolean>;
   reactivation?: Promise<void>;
+  accessActivatedAtMs?: number;
+  accessNow?: () => number;
 };
 
 type ActorPreparationPhase = "idle" | "bootstrap" | "starter_packages" | "artifact_check" | "seed" | "reconcile" | "ready" | "failed";
@@ -152,6 +164,7 @@ type FeedHostContext = {
   nodeTarget: string;
   nodeVersion: string;
   nodeInfo: Record<string, unknown>;
+  nowMs: () => number;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -178,6 +191,7 @@ const MAX_ACTOR_SESSIONS = 5;
 const MIN_WORKER_TOKEN_BYTES = 32;
 const DEFAULT_WORKER_LEASE_SECONDS = 120;
 const DEFAULT_WORKER_MAX_ATTEMPTS = 3;
+export const DELEGATED_ACCESS_TTL_MS = 50 * 60 * 1000;
 
 const SSE_HEADERS = {
   ...CORS_HEADERS,
@@ -249,6 +263,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const actorArtifactQueues = new Map<string, Promise<void>>();
   const actorSetupQueues = new Map<string, Promise<void>>();
   const workerClaims = new Map<string, { ts: string; result: string }>();
+  const nowMs = () => (options.now?.() ?? new Date()).getTime();
   const inputAuthorities = new InputAuthorityRegistry();
   const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
   const checkInputAuthority: InputAuthorityTruthCheck = options.checkInputAuthority ?? (async ({ childCid }) => {
@@ -313,6 +328,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       nodeTarget: nodeIdentity.nodeTarget,
       nodeVersion: nodeIdentity.nodeVersion,
       nodeInfo: nodeIdentity.nodeInfo,
+      nowMs,
     };
     return context;
   };
@@ -470,6 +486,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     checkInputAuthority,
     revokeInputAuthority,
     inputAuthorityExpectedHost,
+    nowMs,
   } = context;
   const url = new URL(request.url);
 
@@ -585,12 +602,14 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         ready: currentProofComplete ? undefined : existing?.ready,
         preparation: currentProofComplete ? undefined : existing?.preparation,
         traceId: requestTraceId(request) ?? existing?.traceId,
+        accessActivatedAtMs: nowMs(),
+        accessNow: nowMs,
       };
       const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
         ? existing
         : state;
       actor.heal = () => reactivateActorAccess(
-        { delegationStore, activateDelegation, delegateDID: policy.delegateDID },
+        { delegationStore, activateDelegation, delegateDID: policy.delegateDID, policyHash, nowMs },
         actor,
       );
       if (requestTraceId(request)) actor.traceId = requestTraceId(request);
@@ -1050,6 +1069,46 @@ async function routeWorker(
   }
   const body = await readJsonObject(request, "invalid_worker_request", "worker request body must be JSON");
   const actorId = readString(body, "actorId", "invalid_worker_request", "actorId is required");
+  const sourceMatch = url.pathname.match(/^\/api\/worker\/generation-requests\/([^/]+)\/sources$/);
+  if (sourceMatch) {
+    const requestId = decodeURIComponent(sourceMatch[1]);
+    const identity = {
+      requestId,
+      runId: readString(body, "runId", "invalid_worker_request", "runId is required"),
+      claimOwner: readString(body, "claimOwner", "invalid_worker_request", "claimOwner is required"),
+      fencingToken: boundedInteger(body.fencingToken, -1, 1, Number.MAX_SAFE_INTEGER),
+    };
+    const limit = boundedInteger(body.limit, DEFAULT_LISTEN_SOURCE_LIMIT, 1, MAX_LISTEN_SOURCE_LIMIT);
+    const cursor = parseListenSourceCursor(body.cursor);
+    const actor = await serializeActorRequest(actorRequestQueues, actorId, async () => {
+      const currentActor = await requireDelegationAndReady(context, actorId);
+      await context.storage.assertGenerationRequestFence(actorStorage(currentActor), {
+        ...identity,
+        now: new Date().toISOString(),
+      });
+      return currentActor;
+    });
+
+    // Listen can require many delegated reads. Keep that read outside the
+    // actor mutation queue so the worker can extend its lease concurrently.
+    const batch = await readListenSourceBatchWithTelemetry({
+      actorId: actor.actorId,
+      sqlAccess: selfHealingAccess(actor, LISTEN_CONVERSATIONS_DB_PATH),
+      transcriptAccess: selfHealingAccess(actor, LISTEN_TRANSCRIPT_KV_PREFIX),
+      limit,
+      cursor,
+    });
+    // A source read can outlive a short lease. Re-check under the actor queue
+    // before releasing transcript bytes to an expired or superseded worker.
+    await serializeActorRequest(actorRequestQueues, actorId, async () => {
+      const currentActor = await requireDelegationAndReady(context, actorId);
+      await context.storage.assertGenerationRequestFence(actorStorage(currentActor), {
+        ...identity,
+        now: new Date().toISOString(),
+      });
+    });
+    return json(batch);
+  }
   return serializeActorRequest(actorRequestQueues, actorId, async () => {
     const actor = await requireDelegationAndReady(context, actorId);
     const access = actorStorage(actor);
@@ -1647,12 +1706,16 @@ async function restoreActorFromStore(
       expiresAt: live[0]?.expiresAt ?? new Date().toISOString(),
       resources: [...new Set(resources)],
       accessByResource,
+      accessActivatedAtMs: context.nowMs(),
+      accessNow: context.nowMs,
     };
     state.heal = () => reactivateActorAccess(
       {
         delegationStore: store,
         activateDelegation: context.activateDelegation,
         delegateDID: context.policy.delegateDID,
+        policyHash: context.policyHash,
+        nowMs: context.nowMs,
       },
       state,
     );
@@ -1684,6 +1747,8 @@ type ReactivationDeps = {
   delegationStore: FeedHostDelegationStore | null;
   activateDelegation: FeedHostContext["activateDelegation"];
   delegateDID: string;
+  policyHash: string;
+  nowMs?: () => number;
 };
 
 // Single-flight per actor: concurrent unauthorized results share one
@@ -1698,16 +1763,33 @@ export async function reactivateActorAccess(deps: ReactivationDeps, actor: Actor
     if (!stored || stored.delegateDID !== deps.delegateDID) {
       throw new FeedDelegationError("no stored delegation to re-activate", "insufficient_policy");
     }
+    if (stored.policyHash && stored.policyHash !== deps.policyHash) {
+      throw new FeedDelegationError("stored delegation policy hash is stale", "delegation_stale");
+    }
     const live = liveDelegationResources(stored);
     if (live.length === 0) throw new FeedDelegationError("stored delegations are expired", "expired");
-    const uniqueDelegations = [...new Map(live.map((resource) => [resource.serializedDelegation, resource])).values()];
-    for (const resource of uniqueDelegations) {
+    const delegationGroups = new Map<string, typeof live>();
+    for (const resource of live) {
+      const group = delegationGroups.get(resource.serializedDelegation) ?? [];
+      group.push(resource);
+      delegationGroups.set(resource.serializedDelegation, group);
+    }
+    const refreshed = new Map<string, DelegatedAccess>();
+    for (const [serializedDelegation, resources] of delegationGroups) {
       const accepted = await deps.activateDelegation({
-        serializedDelegation: resource.serializedDelegation,
+        serializedDelegation,
         expectedDelegateDID: deps.delegateDID,
       });
-      for (const path of accepted.resources) actor.accessByResource.set(path, accepted.access);
+      if (!actorIdsMatch(accepted.actorId, actor.actorId)) {
+        throw new FeedDelegationError("stored delegation owner does not match actor", "actor_mismatch");
+      }
+      if (resources.some((resource) => !accepted.resources.includes(resource.path))) {
+        throw new FeedDelegationError("stored delegation no longer covers its persisted resource", "delegation_stale");
+      }
+      for (const path of accepted.resources) refreshed.set(path, accepted.access);
     }
+    for (const [path, access] of refreshed) actor.accessByResource.set(path, access);
+    actor.accessActivatedAtMs = (deps.nowMs ?? actor.accessNow ?? Date.now)();
     logEvent("info", "delegation_reactivated", {
       actorHash: telemetryIdHash(actor.actorId),
       ms: Math.round(performance.now() - startedAt),
@@ -1724,6 +1806,18 @@ export async function reactivateActorAccess(deps: ReactivationDeps, actor: Actor
   }
 }
 
+export async function ensureFreshActorAccess(actor: ActorState): Promise<void> {
+  const now = (actor.accessNow ?? Date.now)();
+  if (actor.accessActivatedAtMs === undefined) {
+    actor.accessActivatedAtMs = now;
+    return;
+  }
+  if (now - actor.accessActivatedAtMs < DELEGATED_ACCESS_TTL_MS) return;
+  if (!actor.heal || !(await actor.heal())) {
+    throw new FeedDelegationError("delegated access could not be refreshed before its cache lifetime expired", "delegation_stale");
+  }
+}
+
 // Wraps a resource's access so every operation reads the CURRENT handle from
 // the actor's access map and, on an expired-activation result, heals once and
 // retries. Handles stay valid across re-activations because they resolve
@@ -1737,6 +1831,7 @@ export function selfHealingAccess(actor: ActorState, path: string): DelegatedAcc
     return access;
   };
   const heal = async <T>(run: (access: DelegatedAccess) => Promise<T>): Promise<T> => {
+    await ensureFreshActorAccess(actor);
     const first = await run(current());
     if (!isUnauthorizedAccessResult(first) || !actor.heal) return first;
     const startedAt = performance.now();

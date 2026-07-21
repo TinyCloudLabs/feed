@@ -193,6 +193,8 @@ export function createFeedHostNode(input: { privateKey?: string; host?: string }
     enablePublicSpace: false,
     includeAccountRegistryPermissions: false,
     manifest: feedHostNodeManifest(FEED_HOST_SPACE_PREFIX),
+    // Content-bearing Listen reads must never enter an SDK telemetry sink.
+    telemetry: false,
   });
 }
 
