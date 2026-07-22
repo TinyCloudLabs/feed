@@ -202,6 +202,13 @@ export type FeedGenerationRequestRecord = {
   publicationManifest: unknown[] | null;
   error: { code: string; message?: string } | null;
   timingEvents: Array<{ name: string; at: string; durationMs?: number }>;
+  terminal: "published" | "zero_artifacts" | "dead_letter" | null;
+  errorCode: string | null;
+  publishedManifestIds: string[];
+  criticVerdicts: Array<{ attempt: number; count: number; finalVerdictCode: string | null }>;
+  strategy: string | null;
+  claimedAt: string | null;
+  finishedAt: string | null;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;

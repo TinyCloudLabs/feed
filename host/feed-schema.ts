@@ -150,11 +150,45 @@ export const FEED_GENERATION_WORKER_MIGRATION: FeedV1SchemaMigration = {
   ],
 };
 
+export const FEED_GENERATION_OBSERVABILITY_MIGRATION: FeedV1SchemaMigration = {
+  id: "004_generation_observability",
+  description: "Persist privacy-safe terminal generation outcomes and worker quality metadata.",
+  sql: [
+    "ALTER TABLE generation_request ADD COLUMN terminal_kind TEXT CHECK (terminal_kind IN ('published', 'zero_artifacts', 'dead_letter'))",
+    "ALTER TABLE generation_request ADD COLUMN error_code TEXT",
+    "ALTER TABLE generation_request ADD COLUMN published_manifest_ids_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE generation_request ADD COLUMN critic_verdicts_json TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE generation_request ADD COLUMN generation_strategy TEXT",
+    "ALTER TABLE generation_request ADD COLUMN claimed_at TEXT",
+    "ALTER TABLE generation_request ADD COLUMN finished_at TEXT",
+    `UPDATE generation_request
+        SET terminal_kind = CASE
+              WHEN phase = 'published' THEN 'published'
+              WHEN phase = 'zero_artifacts' THEN 'zero_artifacts'
+              WHEN phase = 'dead_letter' OR status = 'dead_letter' THEN 'dead_letter'
+              ELSE NULL
+            END,
+            error_code = CASE
+              WHEN error_json IS NOT NULL AND json_valid(error_json)
+                THEN json_extract(error_json, '$.code')
+              ELSE NULL
+            END,
+            claimed_at = started_at,
+            finished_at = completed_at
+      WHERE terminal_kind IS NULL`,
+    `CREATE INDEX IF NOT EXISTS generation_request_actor_recent
+       ON generation_request (actor_id, updated_at DESC)`,
+  ],
+};
+
 export function withFeedHostMigrations(migrations: readonly FeedV1SchemaMigration[]): FeedV1SchemaMigration[] {
   const byId = new Map(migrations.map((migration) => [migration.id, migration] as const));
   if (!byId.has(FEED_POST_MIGRATION.id)) byId.set(FEED_POST_MIGRATION.id, FEED_POST_MIGRATION);
   if (!byId.has(FEED_GENERATION_WORKER_MIGRATION.id)) {
     byId.set(FEED_GENERATION_WORKER_MIGRATION.id, FEED_GENERATION_WORKER_MIGRATION);
+  }
+  if (!byId.has(FEED_GENERATION_OBSERVABILITY_MIGRATION.id)) {
+    byId.set(FEED_GENERATION_OBSERVABILITY_MIGRATION.id, FEED_GENERATION_OBSERVABILITY_MIGRATION);
   }
   return [...byId.values()];
 }

@@ -161,8 +161,21 @@ describe("Feed Host server", () => {
         queue: { counts: Record<string, number>; oldestAcceptedAgeSec: number };
         integrity: { healthy: number; missing: number; quarantined: number };
         lastWorkerClaim: null;
+        recentRequests: Array<{
+          requestId: string;
+          dedupeKeyKind: "proactive" | "ask";
+          terminal: string | null;
+          errorCode: string | null;
+          manifestIds: string[];
+          strategy: string | null;
+          criticVerdicts: Array<{ attempt: number; count: number; finalVerdictCode: string | null }>;
+          timestamps: { createdAt: string; claimedAt: string | null; finishedAt: string | null; updatedAt: string };
+        }>;
+        deadLetterCount: number;
+        billingBlocked: boolean;
         alerts: { quarantined: boolean; oldestAccepted: boolean; workerClaimStale: boolean };
       }>;
+      recentEvents: Array<{ event: string; actorHash?: string }>;
     };
     const actorHash = telemetryIdHash(ACTOR_ID);
     expect(Object.keys(body.actors)).toEqual([actorHash]);
@@ -170,6 +183,16 @@ describe("Feed Host server", () => {
       queue: { counts: { accepted: 2, consumed: 1 }, oldestAcceptedAgeSec: 7201 },
       integrity: { healthy: 4, missing: 1, quarantined: 1 },
       lastWorkerClaim: null,
+      recentRequests: [{
+        requestId: "diagnostic-request",
+        dedupeKeyKind: "ask",
+        terminal: "published",
+        errorCode: null,
+        manifestIds: ["manifest-1"],
+        strategy: "context-variety-v1",
+      }],
+      deadLetterCount: 2,
+      billingBlocked: true,
       alerts: { quarantined: true, oldestAccepted: true, workerClaimStale: true },
     });
     expect(body.delegationStore.actors).toBe(1);
@@ -183,6 +206,7 @@ describe("Feed Host server", () => {
     });
     expect(body.buildSha).toBe("dev");
     expect(typeof body.nodeVersion).toBe("string");
+    expect(Array.isArray(body.recentEvents)).toBe(true);
     expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
   });
 
@@ -1346,6 +1370,75 @@ describe("Feed Host server", () => {
     );
     expect(unset.status).toBe(401);
     expect(unset.headers.get("cache-control")).toBe("private, no-store");
+  });
+
+  test("worker phase and reconcile endpoints accept optional generation observability metadata", async () => {
+    const storage = new FakeFeedHostStorage();
+    const workerToken = "observability-worker-token-with-at-least-32-random-bytes";
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      workerToken,
+      storage: storage as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+    await postJson(`${runtime.url}/control-intents`, {
+      actorId: ACTOR_ID,
+      eventId: "observed-worker-001",
+      readerNonce: "observed-worker-nonce-001",
+      intentKind: "ask_feed",
+      targetRef: "feed",
+      createdAt: new Date().toISOString(),
+    }, { "x-feed-actor-id": ACTOR_ID });
+    const claimResponse = await postJson(`${runtime.url}/api/worker/generation-requests/claim`, {
+      actorId: ACTOR_ID,
+      workflowId: "observed-workflow",
+      claimOwner: "observed-worker",
+    }, { authorization: `Bearer ${workerToken}` });
+    const claim = (await claimResponse.json()) as { request: { requestId: string; runId: string; fencingToken: number } };
+    const identity = {
+      actorId: ACTOR_ID,
+      runId: claim.request.runId,
+      claimOwner: "observed-worker",
+      fencingToken: claim.request.fencingToken,
+    };
+
+    const legacyPhase = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/phase`,
+      { ...identity, phase: "running" },
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(legacyPhase.status).toBe(200);
+
+    const phase = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/phase`,
+      {
+        ...identity,
+        phase: "validating",
+        metadata: {
+          generationStrategy: "context-variety/v2 verbatim",
+          criticVerdicts: [{ attempt: 1, count: 2, finalVerdictCode: "pass" }],
+        },
+      },
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(await phase.json()).toMatchObject({
+      request: {
+        strategy: "context-variety/v2 verbatim",
+        criticVerdicts: [{ attempt: 1, count: 2, finalVerdictCode: "pass" }],
+      },
+    });
+
+    const reconcile = await postJson(
+      `${runtime.url}/api/worker/generation-requests/${claim.request.requestId}/reconcile`,
+      { ...identity, terminalKind: "published", manifestIds: ["manifest-1"] },
+      { authorization: `Bearer ${workerToken}` },
+    );
+    expect(await reconcile.json()).toMatchObject({
+      request: { terminal: "published", publishedManifestIds: ["manifest-1"] },
+    });
   });
 
   test("worker source batches require the worker token and a live matching generation fence", async () => {
@@ -2819,6 +2912,33 @@ class FakeFeedHostStorage {
     return rows.slice(0, Math.max(1, Math.min(limit, 500)));
   }
 
+  async generationDiagnostics(_actor: FeedHostActorStorage, limit = 10) {
+    const rows = [...this.generationRequests]
+      .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.request_id.localeCompare(left.request_id));
+    const retry = rows.find((row) => row.status === "retry_wait");
+    const retryErrorCode = retry?.error_code ?? null;
+    return {
+      recentRequests: rows.slice(0, Math.min(limit, 10)).map((row) => ({
+        requestId: row.request_id,
+        dedupeKeyKind: row.dedupe_key?.startsWith("proactive:") ? "proactive" as const : "ask" as const,
+        terminal: row.terminal_kind ?? null,
+        errorCode: row.error_code ?? null,
+        manifestIds: row.published_manifest_ids ?? [],
+        strategy: row.generation_strategy ?? null,
+        criticVerdicts: row.critic_verdicts ?? [],
+        attemptCount: row.attempt_count ?? 0,
+        timestamps: {
+          createdAt: row.created_at,
+          claimedAt: row.claimed_at ?? null,
+          finishedAt: row.finished_at ?? null,
+          updatedAt: row.updated_at,
+        },
+      })),
+      deadLetterCount: rows.filter((row) => row.status === "dead_letter" || row.terminal_kind === "dead_letter").length,
+      billingBlocked: retryErrorCode ? /(?:billing|payment|credit|quota)/i.test(retryErrorCode) : false,
+    };
+  }
+
   async findGenerationRequestByDedupeKey(
     actor: FeedHostActorStorage,
     dedupeKey: string,
@@ -2884,6 +3004,7 @@ class FakeFeedHostStorage {
     row.lease_expires_at = input.leaseExpiresAt;
     row.fencing_token = (row.fencing_token ?? 0) + 1;
     row.attempt_count = (row.attempt_count ?? 0) + 1;
+    row.claimed_at ??= input.now;
     row.phase = row.phase === "publishing" || row.phase === "reconciling" ? row.phase : "running";
     row.cancellation_requested ??= 0;
     row.updated_at = input.now;
@@ -2925,6 +3046,45 @@ class FakeFeedHostStorage {
     row.lease_expires_at = input.leaseExpiresAt;
     row.updated_at = input.now;
     return wireGenerationRequest(row);
+  }
+
+  async updateGenerationRequestPhase(
+    actor: FeedHostActorStorage,
+    input: {
+      requestId: string;
+      runId: string;
+      claimOwner: string;
+      fencingToken: number;
+      now: string;
+      phase: string;
+      metadata: FakeGenerationMetadata;
+    },
+  ): Promise<Record<string, unknown>> {
+    await this.assertGenerationRequestFence(actor, input);
+    const row = this.generationRequests.find((candidate) => candidate.request_id === input.requestId)!;
+    row.phase = input.phase;
+    row.updated_at = input.now;
+    applyFakeGenerationMetadata(row, input.metadata);
+    return wireGenerationRequest(row);
+  }
+
+  async reconcileGenerationRequest(
+    actor: FeedHostActorStorage,
+    input: {
+      requestId: string;
+      runId: string;
+      claimOwner: string;
+      fencingToken: number;
+      now: string;
+      metadata?: FakeGenerationMetadata;
+    },
+  ): Promise<{ request: Record<string, unknown>; feedItemIds: string[] }> {
+    await this.assertGenerationRequestFence(actor, input);
+    const row = this.generationRequests.find((candidate) => candidate.request_id === input.requestId)!;
+    row.phase = "reconciling";
+    row.updated_at = input.now;
+    applyFakeGenerationMetadata(row, input.metadata ?? {});
+    return { request: wireGenerationRequest(row), feedItemIds: [] };
   }
 
   expireGenerationLease(requestId: string): void {
@@ -3151,6 +3311,29 @@ class DiagnosticsFeedHostStorage extends FakeFeedHostStorage {
       reconciledAt: FAKE_NOW,
     };
   }
+
+  override async generationDiagnostics() {
+    return {
+      recentRequests: [{
+        requestId: "diagnostic-request",
+        dedupeKeyKind: "ask" as const,
+        terminal: "published" as const,
+        errorCode: null,
+        manifestIds: ["manifest-1"],
+        strategy: "context-variety-v1",
+        criticVerdicts: [{ attempt: 1, count: 3, finalVerdictCode: "pass" }],
+        attemptCount: 1,
+        timestamps: {
+          createdAt: FAKE_NOW,
+          claimedAt: FAKE_NOW,
+          finishedAt: FAKE_NOW,
+          updatedAt: FAKE_NOW,
+        },
+      }],
+      deadLetterCount: 2,
+      billingBlocked: true,
+    };
+  }
 }
 
 class OverlapTrackingStorage extends FakeFeedHostStorage {
@@ -3348,10 +3531,31 @@ type StoredGenerationRequestRow = {
   cancellation_requested?: number;
   phase?: string;
   source_cursor_before?: string | null;
+  terminal_kind?: "published" | "zero_artifacts" | "dead_letter" | null;
+  error_code?: string | null;
+  published_manifest_ids?: string[];
+  critic_verdicts?: Array<{ attempt: number; count: number; finalVerdictCode: string | null }>;
+  generation_strategy?: string | null;
+  claimed_at?: string | null;
+  finished_at?: string | null;
   expires_at: string;
   created_at: string;
   updated_at: string;
 };
+
+type FakeGenerationMetadata = {
+  terminal?: "published" | "zero_artifacts" | "dead_letter";
+  publishedManifestIds?: string[];
+  criticVerdicts?: Array<{ attempt: number; count: number; finalVerdictCode: string | null }>;
+  strategy?: string;
+};
+
+function applyFakeGenerationMetadata(row: StoredGenerationRequestRow, metadata: FakeGenerationMetadata): void {
+  if (metadata.terminal !== undefined) row.terminal_kind = metadata.terminal;
+  if (metadata.publishedManifestIds !== undefined) row.published_manifest_ids = metadata.publishedManifestIds;
+  if (metadata.criticVerdicts !== undefined) row.critic_verdicts = metadata.criticVerdicts;
+  if (metadata.strategy !== undefined) row.generation_strategy = metadata.strategy;
+}
 
 function wireGenerationRequest(row: StoredGenerationRequestRow): Record<string, unknown> {
   return {
@@ -3373,6 +3577,13 @@ function wireGenerationRequest(row: StoredGenerationRequestRow): Record<string, 
     nextRetryAt: row.next_retry_at ?? null,
     cancellationRequested: row.cancellation_requested === 1,
     phase: row.phase ?? "queued",
+    terminal: row.terminal_kind ?? null,
+    errorCode: row.error_code ?? null,
+    publishedManifestIds: row.published_manifest_ids ?? [],
+    criticVerdicts: row.critic_verdicts ?? [],
+    strategy: row.generation_strategy ?? null,
+    claimedAt: row.claimed_at ?? null,
+    finishedAt: row.finished_at ?? null,
     sourceCursorBefore: row.source_cursor_before ? JSON.parse(row.source_cursor_before) : null,
     timing: {},
     expiresAt: row.expires_at,

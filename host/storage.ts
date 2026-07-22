@@ -319,6 +319,13 @@ type GenerationRequestRow = {
   publication_manifest_json: string | null;
   error_json: string | null;
   timing_events_json: string;
+  terminal_kind: FeedGenerationRequestRecord["terminal"];
+  error_code: string | null;
+  published_manifest_ids_json: string;
+  critic_verdicts_json: string;
+  generation_strategy: string | null;
+  claimed_at: string | null;
+  finished_at: string | null;
   expires_at: string;
   created_at: string;
   updated_at: string;
@@ -342,6 +349,10 @@ export type FeedGenerationMetadataPatch = {
   sourceCursorAfter?: unknown;
   sourceRefs?: unknown[];
   timingEvents?: FeedGenerationTimingEvent[];
+  terminal?: Exclude<FeedGenerationRequestRecord["terminal"], null>;
+  publishedManifestIds?: string[];
+  criticVerdicts?: FeedGenerationRequestRecord["criticVerdicts"];
+  strategy?: string;
 };
 
 export type FeedGenerationMutationIdentity = {
@@ -381,6 +392,27 @@ export type FeedProjectionParity = {
 export type FeedQueueSummary = {
   counts: Record<string, number>;
   oldestAcceptedAgeSec: number;
+};
+
+export type FeedGenerationDiagnostics = {
+  recentRequests: Array<{
+    requestId: string;
+    dedupeKeyKind: "proactive" | "ask";
+    terminal: FeedGenerationRequestRecord["terminal"];
+    errorCode: string | null;
+    manifestIds: string[];
+    strategy: string | null;
+    criticVerdicts: FeedGenerationRequestRecord["criticVerdicts"];
+    attemptCount: number;
+    timestamps: {
+      createdAt: string;
+      claimedAt: string | null;
+      finishedAt: string | null;
+      updatedAt: string;
+    };
+  }>;
+  deadLetterCount: number;
+  billingBlocked: boolean;
 };
 
 export type FeedIntegritySummary = {
@@ -424,6 +456,8 @@ const GENERATION_REQUEST_COLUMNS = `request_id, reader_nonce, actor_id, status, 
   attempt_count, next_retry_at, cancellation_requested, phase, phase_started_at, started_at,
   completed_at, last_attempt_at, source_cursor_before, source_cursor_after, source_refs_json,
   publication_key, artifact_ids_json, publication_manifest_json, error_json, timing_events_json,
+  terminal_kind, error_code, published_manifest_ids_json, critic_verdicts_json, generation_strategy,
+  claimed_at, finished_at,
   expires_at, created_at, updated_at`;
 
 function storageCacheKey(actor: FeedHostActorStorage): string {
@@ -1085,6 +1119,62 @@ export class FeedHostStorage {
     return { counts, oldestAcceptedAgeSec };
   }
 
+  async generationDiagnostics(actor: FeedHostActorStorage, limit = 10): Promise<FeedGenerationDiagnostics> {
+    const actorId = normalizeActorId(actor.actorId);
+    const db = this.db(actor, "feed_index");
+    const [recentRows, countRows, retryRows] = await Promise.all([
+      queryRows<GenerationRequestRow>(
+        db,
+        `SELECT ${GENERATION_REQUEST_COLUMNS}
+           FROM generation_request
+          WHERE actor_id = ?
+          ORDER BY updated_at DESC, request_id DESC
+          LIMIT ?`,
+        [actorId, Math.max(1, Math.min(limit, 10))],
+      ),
+      queryRows<{ total: number }>(
+        db,
+        `SELECT COUNT(*) AS total
+           FROM generation_request
+          WHERE actor_id = ? AND (terminal_kind = 'dead_letter' OR status = 'dead_letter')`,
+        [actorId],
+      ),
+      queryRows<{ error_code: string | null; error_json: string | null }>(
+        db,
+        `SELECT error_code, error_json
+           FROM generation_request
+          WHERE actor_id = ? AND status = 'retry_wait'
+          ORDER BY updated_at DESC, request_id DESC
+          LIMIT 1`,
+        [actorId],
+      ),
+    ]);
+    const latestRetryError = retryRows[0]?.error_code ?? parseJson<{ code?: string } | null>(retryRows[0]?.error_json, null)?.code ?? null;
+    return {
+      recentRequests: recentRows.map((row) => {
+        const request = generationRequestFromRow(row);
+        return {
+          requestId: request.requestId,
+          dedupeKeyKind: request.dedupeKey?.startsWith("proactive:") ? "proactive" : "ask",
+          terminal: request.terminal,
+          errorCode: request.errorCode,
+          manifestIds: request.publishedManifestIds,
+          strategy: request.strategy,
+          criticVerdicts: request.criticVerdicts,
+          attemptCount: request.attemptCount,
+          timestamps: {
+            createdAt: request.createdAt,
+            claimedAt: request.claimedAt,
+            finishedAt: request.finishedAt,
+            updatedAt: request.updatedAt,
+          },
+        };
+      }),
+      deadLetterCount: Number(countRows[0]?.total ?? 0),
+      billingBlocked: isBillingErrorCode(latestRetryError),
+    };
+  }
+
   latestIntegritySummary(actor: FeedHostActorStorage): FeedIntegritySummary | null {
     return this.latestIntegrity.get(storageCacheKey(actor)) ?? null;
   }
@@ -1098,10 +1188,11 @@ export class FeedHostStorage {
     await execute(
       db,
       `UPDATE generation_request
-          SET status = 'dead_letter', phase = 'dead_letter', completed_at = ?, updated_at = ?
+          SET status = 'dead_letter', phase = 'dead_letter', terminal_kind = 'dead_letter',
+              completed_at = ?, finished_at = ?, lease_expires_at = NULL, updated_at = ?
         WHERE actor_id = ? AND status = 'pending' AND lease_expires_at <= ?
           AND attempt_count >= max_attempts AND phase NOT IN ('publishing', 'reconciling')`,
-      [input.now, input.now, actorId, input.now],
+      [input.now, input.now, input.now, actorId, input.now],
     );
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const rows = await queryRows<GenerationRequestRow>(
@@ -1154,7 +1245,8 @@ export class FeedHostStorage {
                    ORDER BY prior.completed_at DESC, prior.request_id DESC
                    LIMIT 1
                 )),
-                started_at = COALESCE(started_at, ?), last_attempt_at = ?, updated_at = ?
+                started_at = COALESCE(started_at, ?), claimed_at = COALESCE(claimed_at, ?),
+                last_attempt_at = ?, updated_at = ?
           WHERE actor_id = ? AND request_id = ? AND fencing_token = ? AND expires_at > ?
             AND (workflow_id IS NULL OR workflow_id = ?) AND (
               (attempt_count < max_attempts AND (
@@ -1179,6 +1271,7 @@ export class FeedHostStorage {
           input.leaseExpiresAt,
           input.now,
           input.workflowId,
+          input.now,
           input.now,
           input.now,
           input.now,
@@ -1224,7 +1317,8 @@ export class FeedHostStorage {
       metadata: FeedGenerationMetadataPatch;
     },
   ): Promise<FeedGenerationRequestRecord> {
-    const patch = generationMetadataSql(input.metadata);
+    const current = await this.requireCurrentGenerationRun(actor, input);
+    const patch = generationMetadataSql(mergeGenerationMetadata(current, input.metadata));
     await this.executeFencedMutation(
       actor,
       input,
@@ -1347,18 +1441,20 @@ export class FeedHostStorage {
 
   async reconcileGenerationRequest(
     actor: FeedHostActorStorage,
-    input: FeedGenerationMutationIdentity,
+    input: FeedGenerationMutationIdentity & { metadata?: FeedGenerationMetadataPatch },
   ): Promise<{ request: FeedGenerationRequestRecord; feedItemIds: string[] }> {
-    const current = await this.requireCurrentGenerationRun(actor, input);
+    let current = await this.requireCurrentGenerationRun(actor, input);
     if (current.phase !== "publishing" && current.phase !== "reconciling") throw generationLeaseConflict();
     if (!current.publicationKey) throw new FeedHostError("artifacts must be checkpointed before reconciliation", 409, "publication_incomplete");
+    const metadataPatch = generationMetadataSql(mergeGenerationMetadata(current, input.metadata ?? {}));
     await this.executeFencedMutation(
       actor,
       input,
-      "SET phase = 'reconciling', phase_started_at = ?, updated_at = ?",
-      [input.now, input.now],
+      `SET phase = 'reconciling', phase_started_at = ?, ${metadataPatch.setClause} updated_at = ?`,
+      [input.now, ...metadataPatch.params, input.now],
       "AND phase IN ('publishing', 'reconciling')",
     );
+    current = await this.requireCurrentGenerationRun(actor, input);
     const plan = await this.reconcileFeedProjection(actor);
     const expectedFeedItemIds = new Set(current.publicationManifest!.flatMap((value) => {
       const artifact = value as FeedArtifact;
@@ -1398,6 +1494,7 @@ export class FeedHostStorage {
       cursor: unknown;
       artifactIds: string[];
       timingEvents?: FeedGenerationTimingEvent[];
+      metadata?: FeedGenerationMetadataPatch;
     },
   ): Promise<FeedGenerationRequestRecord> {
     const current = await this.requireCurrentGenerationRun(actor, input);
@@ -1406,15 +1503,23 @@ export class FeedHostStorage {
     if ((input.outcome === "published") !== (input.artifactIds.length > 0)) {
       throw new FeedHostError("terminal outcome does not match artifact ids", 400, "invalid_worker_request");
     }
+    const metadataPatch = generationMetadataSql({
+      ...mergeGenerationMetadata(current, input.metadata ?? {}),
+      terminal: input.outcome,
+    });
     await this.executeFencedMutation(
       actor,
       input,
-      "SET status = 'consumed', phase = ?, source_cursor_after = ?, completed_at = ?, timing_events_json = ?, lease_expires_at = NULL, updated_at = ?",
+      `SET status = 'consumed', phase = ?, source_cursor_after = ?, completed_at = ?, finished_at = ?,
+           timing_events_json = ?, ${metadataPatch.setClause} error_json = NULL, error_code = NULL,
+           lease_expires_at = NULL, updated_at = ?`,
       [
         input.outcome,
         JSON.stringify(input.cursor),
         input.now,
+        input.now,
         JSON.stringify(input.timingEvents ?? current.timingEvents),
+        ...metadataPatch.params,
         input.now,
       ],
       "AND phase = 'reconciling'",
@@ -1448,20 +1553,29 @@ export class FeedHostStorage {
              WHEN attempt_count >= max_attempts THEN 'dead_letter'
              ELSE 'retry_wait'
            END,
+           terminal_kind = CASE
+             WHEN cancellation_requested = 0 AND (? = 0 OR attempt_count >= max_attempts) THEN 'dead_letter'
+             ELSE NULL
+           END,
            next_retry_at = CASE
              WHEN ? = 1 AND cancellation_requested = 0 AND attempt_count < max_attempts THEN ?
              ELSE NULL
            END,
-           lease_expires_at = NULL, error_json = ?, timing_events_json = ?,
+           lease_expires_at = NULL, error_json = ?, error_code = ?, timing_events_json = ?,
            completed_at = CASE WHEN cancellation_requested = 1 OR ? = 0 OR attempt_count >= max_attempts THEN ? ELSE NULL END,
+           finished_at = CASE WHEN cancellation_requested = 1 OR ? = 0 OR attempt_count >= max_attempts THEN ? ELSE NULL END,
            updated_at = ?`,
       [
         input.retryable === false ? 0 : 1,
         input.retryable === false ? 0 : 1,
         input.retryable === false ? 0 : 1,
+        input.retryable === false ? 0 : 1,
         input.nextRetryAt,
         JSON.stringify(input.error),
+        input.error.code,
         JSON.stringify(input.timingEvents ?? []),
+        input.retryable === false ? 0 : 1,
+        input.now,
         input.retryable === false ? 0 : 1,
         input.now,
         input.now,
@@ -1495,10 +1609,15 @@ export class FeedHostStorage {
                   THEN ?
                 ELSE completed_at
               END,
+              finished_at = CASE
+                WHEN status IN ('accepted', 'retry_wait') OR (status = 'pending' AND phase NOT IN ('publishing', 'reconciling'))
+                  THEN ?
+                ELSE finished_at
+              END,
               updated_at = ?
         WHERE actor_id = ? AND request_id = ?
           AND status NOT IN ('consumed', 'cancelled', 'dead_letter', 'rejected', 'expired')`,
-      [input.now, input.now, actorId, input.requestId],
+      [input.now, input.now, input.now, actorId, input.requestId],
     );
     if (changes === 0) return this.requireGenerationRequest(actor, input.requestId);
     return this.requireGenerationRequest(actor, input.requestId);
@@ -2294,6 +2413,13 @@ export class FeedHostStorage {
       publicationManifest: null,
       error: null,
       timingEvents: [],
+      terminal: null,
+      errorCode: null,
+      publishedManifestIds: [],
+      criticVerdicts: [],
+      strategy: null,
+      claimedAt: null,
+      finishedAt: null,
       expiresAt,
       createdAt: input.createdAt,
       updatedAt: input.createdAt,
@@ -3188,6 +3314,8 @@ const GENERATION_REQUEST_INSERT_COLUMNS = [
   "next_retry_at", "cancellation_requested", "phase", "phase_started_at", "started_at",
   "completed_at", "last_attempt_at", "source_cursor_before", "source_cursor_after", "source_refs_json",
   "publication_key", "artifact_ids_json", "publication_manifest_json", "error_json", "timing_events_json",
+  "terminal_kind", "error_code", "published_manifest_ids_json", "critic_verdicts_json", "generation_strategy",
+  "claimed_at", "finished_at",
   "expires_at", "created_at", "updated_at",
 ] as const;
 
@@ -3223,6 +3351,13 @@ export function generationRequestSql(request: FeedGenerationRequestRecord): SqlS
     request.publicationManifest === null ? null : stableJson(request.publicationManifest),
     request.error === null ? null : JSON.stringify(request.error),
     JSON.stringify(request.timingEvents),
+    request.terminal,
+    request.errorCode,
+    JSON.stringify(request.publishedManifestIds),
+    JSON.stringify(request.criticVerdicts),
+    request.strategy,
+    request.claimedAt,
+    request.finishedAt,
     request.expiresAt,
     request.createdAt,
     request.updatedAt,
@@ -3270,6 +3405,13 @@ function generationRequestFromRow(row: GenerationRequestRow): FeedGenerationRequ
     publicationManifest: parseJson(row.publication_manifest_json, null),
     error: parseJson(row.error_json, null),
     timingEvents: parseJson(row.timing_events_json, []),
+    terminal: row.terminal_kind ?? null,
+    errorCode: row.error_code ?? parseJson<{ code?: string } | null>(row.error_json, null)?.code ?? null,
+    publishedManifestIds: parseJson(row.published_manifest_ids_json, []),
+    criticVerdicts: parseJson(row.critic_verdicts_json, []),
+    strategy: row.generation_strategy ?? null,
+    claimedAt: row.claimed_at ?? row.started_at ?? null,
+    finishedAt: row.finished_at ?? row.completed_at ?? null,
     expiresAt: row.expires_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -3304,10 +3446,41 @@ function generationMetadataSql(metadata: FeedGenerationMetadataPatch): { setClau
     assignments.push("timing_events_json = ?");
     params.push(JSON.stringify(metadata.timingEvents));
   }
+  if (metadata.terminal !== undefined) {
+    assignments.push("terminal_kind = ?");
+    params.push(metadata.terminal);
+  }
+  if (metadata.publishedManifestIds !== undefined) {
+    assignments.push("published_manifest_ids_json = ?");
+    params.push(JSON.stringify(metadata.publishedManifestIds));
+  }
+  if (metadata.criticVerdicts !== undefined) {
+    assignments.push("critic_verdicts_json = ?");
+    params.push(JSON.stringify(metadata.criticVerdicts));
+  }
+  if (metadata.strategy !== undefined) {
+    assignments.push("generation_strategy = ?");
+    params.push(metadata.strategy);
+  }
   return {
     setClause: assignments.length > 0 ? `${assignments.join(", ")},` : "",
     params,
   };
+}
+
+function mergeGenerationMetadata(
+  current: FeedGenerationRequestRecord,
+  metadata: FeedGenerationMetadataPatch,
+): FeedGenerationMetadataPatch {
+  if (metadata.criticVerdicts === undefined) return metadata;
+  const byAttempt = new Map(current.criticVerdicts.map((verdict) => [verdict.attempt, verdict]));
+  for (const verdict of metadata.criticVerdicts) byAttempt.set(verdict.attempt, verdict);
+  return { ...metadata, criticVerdicts: [...byAttempt.values()].sort((left, right) => left.attempt - right.attempt) };
+}
+
+function isBillingErrorCode(code: string | null): boolean {
+  if (!code) return false;
+  return /(?:billing|payment|required|credit|quota|insufficient[_-](?:funds|balance|credits))/i.test(code);
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
