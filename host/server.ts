@@ -74,6 +74,12 @@ import {
   parseListenSourceCursor,
   readListenSourceBatchWithTelemetry,
 } from "./listen-source.ts";
+import {
+  ensureProactiveGenerationRequest,
+  ProactiveDailyScheduler,
+  type ProactiveResult,
+  type ProactiveSchedulerState,
+} from "./proactive-scheduler.ts";
 
 type JsonBody = Record<string, unknown>;
 type FeedbackRequestBody = Omit<FeedbackEvent, "actorId"> & { actorId?: string };
@@ -103,6 +109,9 @@ export type FeedHostServerOptions = {
   allowedOrigins?: string[];
   /** Test seam for the delegated-access cache lifetime. */
   now?: () => Date;
+  /** Test seams; production reads FEED_PROACTIVE_ACTOR_ID and ticks minutely. */
+  proactiveActorId?: string | null;
+  proactiveIntervalMs?: number;
 };
 
 export type FeedHostRuntime = {
@@ -110,6 +119,8 @@ export type FeedHostRuntime = {
   port: number;
   url: string;
   stop: () => void;
+  ensureProactiveNow: () => Promise<ProactiveResult | "disabled">;
+  proactiveState: () => ProactiveSchedulerState;
 };
 
 type ActorState = AcceptedFeedDelegation & {
@@ -165,6 +176,7 @@ type FeedHostContext = {
   nodeVersion: string;
   nodeInfo: Record<string, unknown>;
   nowMs: () => number;
+  proactiveScheduler: ProactiveDailyScheduler;
 };
 
 const PUBLIC_PATHS = new Set([
@@ -329,9 +341,26 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
       nodeVersion: nodeIdentity.nodeVersion,
       nodeInfo: nodeIdentity.nodeInfo,
       nowMs,
+      proactiveScheduler,
     };
     return context;
   };
+
+  const configuredProactiveActorId = options.proactiveActorId === undefined
+    ? process.env.FEED_PROACTIVE_ACTOR_ID
+    : options.proactiveActorId;
+  const proactiveScheduler = new ProactiveDailyScheduler({
+    actorId: configuredProactiveActorId,
+    now: options.now,
+    intervalMs: options.proactiveIntervalMs,
+    ensureRequest: async (event) => {
+      const current = await getContext();
+      const actor = await requireDelegationAndReady(current, event.actorId ?? configuredProactiveActorId ?? "");
+      return serializeActorRequest(actorRequestQueues, actor.actorId, () =>
+        ensureProactiveGenerationRequest(current.storage, actorStorage(actor), event));
+    },
+  });
+  proactiveScheduler.start();
 
   const server = Bun.serve({
     port: options.port,
@@ -455,6 +484,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   });
 
   const stop = () => {
+    proactiveScheduler.stop();
     server.stop(true);
   };
 
@@ -468,6 +498,8 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
     port,
     url: `http://${hostname}:${port}`,
     stop,
+    ensureProactiveNow: () => proactiveScheduler.ensureCurrentSlot(),
+    proactiveState: () => proactiveScheduler.snapshot(),
   };
 }
 
@@ -528,7 +560,11 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const actorId = requireRequestActorId(request);
     const actor = await requireDelegation(context, actorId);
     if (actor.preparation?.state === "failed") actor.ready = undefined;
-    void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
+    void ensureActorReady(storage, actor, seedOnStart)
+      .then(() => context.proactiveScheduler.targetsActor(actor.actorId)
+        ? context.proactiveScheduler.ensureCurrentSlot()
+        : undefined)
+      .catch(() => undefined);
     const setup = actorPreparationSnapshot(actor);
     logEvent("info", "feed_preparation_retry_requested", {
       actorHash: telemetryIdHash(actor.actorId),
@@ -649,7 +685,14 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
           status: "activation_pending",
         }, 202);
       }
-      void ensureActorReady(storage, actor, seedOnStart).catch(() => undefined);
+      void ensureActorReady(storage, actor, seedOnStart)
+        .then(() => {
+          if (context.proactiveScheduler.targetsActor(actor.actorId)) {
+            return context.proactiveScheduler.ensureCurrentSlot();
+          }
+          return undefined;
+        })
+        .catch(() => undefined);
       const setup = actorPreparationSnapshot(actor);
       const sessionToken = issueActorSession(context, actorKey, actor.expiresAt);
       return json({
@@ -1276,6 +1319,7 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
       resources: delegationStats.resources,
       expiringSoonCount: delegationStats.expiringSoon,
     },
+    proactiveScheduler: context.proactiveScheduler.snapshot(),
     actors: actorAggregates,
   };
 }

@@ -24,6 +24,7 @@ Set these Vite variables for local development or deployment:
 | `FEED_HOST_STATE_DIR` | unset | Private directory for a generated, persistent Feed Host identity. Production containers should mount a named volume here. |
 | `FEED_HOST_PRIVATE_KEY` | unset | Explicit Feed Host identity override. Prefer `FEED_HOST_STATE_DIR` for deployments that can persist a private volume. |
 | `FEED_HOST_ALLOWED_ORIGINS` | unset | Comma-separated exact browser origins. Required when the web client and Host use different origins because actor sessions use credentialed CORS. |
+| `FEED_PROACTIVE_ACTOR_ID` | unset | Opt-in kill switch for Host-side daily generation. Set one delegated actor DID to ensure one unscoped request per UTC day; unset is inert. |
 | `VITE_OPENKEY_HOST` | `https://openkey.so` | OpenKey sign-in host. |
 | `VITE_TINYCLOUD_HOST` | `https://node.tinycloud.xyz` | TinyCloud node used for the OpenKey-backed session. |
 

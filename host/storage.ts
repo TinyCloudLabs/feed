@@ -1051,6 +1051,22 @@ export class FeedHostStorage {
     return rows;
   }
 
+  async findGenerationRequestByDedupeKey(
+    actor: FeedHostActorStorage,
+    dedupeKey: string,
+  ): Promise<FeedGenerationRequestRecord | null> {
+    const rows = await queryRows<GenerationRequestRow>(
+      this.db(actor, "feed_index"),
+      `SELECT ${GENERATION_REQUEST_COLUMNS}
+         FROM generation_request
+        WHERE actor_id = ? AND dedupe_key = ?
+        ORDER BY created_at DESC
+        LIMIT 1`,
+      [normalizeActorId(actor.actorId), dedupeKey],
+    );
+    return rows[0] ? generationRequestFromRow(rows[0]) : null;
+  }
+
   async queueSummary(actor: FeedHostActorStorage, now: Date = new Date()): Promise<FeedQueueSummary> {
     const rows = await queryRows<{ status: string; total: number; oldest_accepted_at: string | null }>(
       this.db(actor, "feed_index"),
