@@ -1122,33 +1122,33 @@ export class FeedHostStorage {
   async generationDiagnostics(actor: FeedHostActorStorage, limit = 10): Promise<FeedGenerationDiagnostics> {
     const actorId = normalizeActorId(actor.actorId);
     const db = this.db(actor, "feed_index");
-    const [recentRows, countRows, retryRows] = await Promise.all([
-      queryRows<GenerationRequestRow>(
-        db,
-        `SELECT ${GENERATION_REQUEST_COLUMNS}
-           FROM generation_request
-          WHERE actor_id = ?
-          ORDER BY updated_at DESC, request_id DESC
-          LIMIT ?`,
-        [actorId, Math.max(1, Math.min(limit, 10))],
-      ),
-      queryRows<{ total: number }>(
-        db,
-        `SELECT COUNT(*) AS total
-           FROM generation_request
-          WHERE actor_id = ? AND (terminal_kind = 'dead_letter' OR status = 'dead_letter')`,
-        [actorId],
-      ),
-      queryRows<{ error_code: string | null; error_json: string | null }>(
-        db,
-        `SELECT error_code, error_json
-           FROM generation_request
-          WHERE actor_id = ? AND status = 'retry_wait'
-          ORDER BY updated_at DESC, request_id DESC
-          LIMIT 1`,
-        [actorId],
-      ),
-    ]);
+    // Sequential on purpose: the tinycloud.sql session serves one statement at
+    // a time, so concurrent queries over the same handle are not safe.
+    const recentRows = await queryRows<GenerationRequestRow>(
+      db,
+      `SELECT ${GENERATION_REQUEST_COLUMNS}
+         FROM generation_request
+        WHERE actor_id = ?
+        ORDER BY updated_at DESC, request_id DESC
+        LIMIT ?`,
+      [actorId, Math.max(1, Math.min(limit, 10))],
+    );
+    const countRows = await queryRows<{ total: number }>(
+      db,
+      `SELECT COUNT(*) AS total
+         FROM generation_request
+        WHERE actor_id = ? AND (terminal_kind = 'dead_letter' OR status = 'dead_letter')`,
+      [actorId],
+    );
+    const retryRows = await queryRows<{ error_code: string | null; error_json: string | null }>(
+      db,
+      `SELECT error_code, error_json
+         FROM generation_request
+        WHERE actor_id = ? AND status = 'retry_wait'
+        ORDER BY updated_at DESC, request_id DESC
+        LIMIT 1`,
+      [actorId],
+    );
     const latestRetryError = retryRows[0]?.error_code ?? parseJson<{ code?: string } | null>(retryRows[0]?.error_json, null)?.code ?? null;
     return {
       recentRequests: recentRows.map((row) => {

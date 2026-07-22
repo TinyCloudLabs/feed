@@ -1303,37 +1303,72 @@ async function routeWorker(
   });
 }
 
+function diagnosticsErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.slice(0, 500);
+}
+
 async function buildDiagnostics(context: FeedHostContext): Promise<Record<string, unknown>> {
   const now = new Date();
   const actorAggregates: Record<string, unknown> = {};
   for (const [actorKey, actor] of context.actors) {
     if (isDelegationExpired(actor) || !hasCompleteFeedHostDelegation(actor)) continue;
     const access = actorStorage(actor);
-    const queue = await context.storage.queueSummary(access, now);
-    const generation = await context.storage.generationDiagnostics(access, 10);
-    const latest = context.storage.latestIntegritySummary(access);
-    const integrity = {
-      healthy: latest?.healthy ?? 0,
-      missing: latest?.docMissing ?? 0,
-      quarantined: latest?.quarantined ?? 0,
-    };
-    const claim = context.workerClaims.get(actorKey) ?? null;
-    const queueNonEmpty = ["accepted", "pending", "retry_wait"]
-      .reduce((total, status) => total + (queue.counts[status] ?? 0), 0) > 0;
-    const claimAgeMs = claim ? now.getTime() - Date.parse(claim.ts) : Number.POSITIVE_INFINITY;
-    actorAggregates[telemetryIdHash(actor.actorId)] = {
-      queue,
-      integrity,
-      lastWorkerClaim: claim,
-      recentRequests: generation.recentRequests,
-      deadLetterCount: generation.deadLetterCount,
-      billingBlocked: generation.billingBlocked,
-      alerts: {
-        quarantined: integrity.quarantined > 0,
-        oldestAccepted: queue.oldestAcceptedAgeSec > 3600,
-        workerClaimStale: queueNonEmpty && claimAgeMs > 30 * 60 * 1000,
-      },
-    };
+    const actorHash = telemetryIdHash(actor.actorId);
+    // Fault-isolate each actor and each section: this endpoint is the only
+    // window into the sealed prod CVM, so a failing query must degrade its own
+    // section (with the error text) instead of 500ing the whole endpoint.
+    try {
+      const queue = await context.storage.queueSummary(access, now);
+      let generationSection: Record<string, unknown>;
+      try {
+        const generation = await context.storage.generationDiagnostics(access, 10);
+        generationSection = {
+          recentRequests: generation.recentRequests,
+          deadLetterCount: generation.deadLetterCount,
+          billingBlocked: generation.billingBlocked,
+        };
+      } catch (error) {
+        logEvent("error", "diagnostics_section_failed", {
+          actorHash,
+          section: "generation",
+          errorMessage: diagnosticsErrorMessage(error),
+        });
+        generationSection = {
+          generationError: { code: "diagnostics_generation_failed", message: diagnosticsErrorMessage(error) },
+        };
+      }
+      const latest = context.storage.latestIntegritySummary(access);
+      const integrity = {
+        healthy: latest?.healthy ?? 0,
+        missing: latest?.docMissing ?? 0,
+        quarantined: latest?.quarantined ?? 0,
+      };
+      const claim = context.workerClaims.get(actorKey) ?? null;
+      const queueNonEmpty = ["accepted", "pending", "retry_wait"]
+        .reduce((total, status) => total + (queue.counts[status] ?? 0), 0) > 0;
+      const claimAgeMs = claim ? now.getTime() - Date.parse(claim.ts) : Number.POSITIVE_INFINITY;
+      actorAggregates[actorHash] = {
+        queue,
+        integrity,
+        lastWorkerClaim: claim,
+        ...generationSection,
+        alerts: {
+          quarantined: integrity.quarantined > 0,
+          oldestAccepted: queue.oldestAcceptedAgeSec > 3600,
+          workerClaimStale: queueNonEmpty && claimAgeMs > 30 * 60 * 1000,
+        },
+      };
+    } catch (error) {
+      logEvent("error", "diagnostics_section_failed", {
+        actorHash,
+        section: "actor",
+        errorMessage: diagnosticsErrorMessage(error),
+      });
+      actorAggregates[actorHash] = {
+        error: { code: "diagnostics_actor_failed", message: diagnosticsErrorMessage(error) },
+      };
+    }
   }
   const delegationStats = context.delegationStore?.stats(now) ?? {
     actors: 0,
