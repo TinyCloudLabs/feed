@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   bodyPreview,
   createLazyArtifactCache,
+  createOrderedHydrationQueue,
   feedItemAvailability,
   feedItemsForView,
   feedItemsFromProjections,
@@ -36,6 +37,58 @@ function item(id: string, rankScore: number, publishedAt: string): FeedItem {
 }
 
 describe("Feed v1 model helpers", () => {
+  test("commits staggered hydration completions in feed position order", async () => {
+    let releaseFirst!: () => void;
+    const firstResponse = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    // Lower responses have already resolved, modeling a faster lower card.
+    const responses = new Map<string, Promise<void>>([
+      ["first", firstResponse],
+      ["second", Promise.resolve()],
+      ["third", Promise.resolve()],
+    ]);
+    const started: string[] = [];
+    const committed: string[] = [];
+    const queue = createOrderedHydrationQueue(async (id: string) => {
+      started.push(id);
+      await responses.get(id);
+      committed.push(id);
+    });
+
+    queue.sync([
+      { key: "first", position: 0, value: "first" },
+      { key: "second", position: 1, value: "second" },
+      { key: "third", position: 2, value: "third" },
+    ]);
+    expect(started).toEqual(["first"]);
+    expect(committed).toEqual([]);
+    releaseFirst();
+    await queue.whenIdle();
+
+    expect(started).toEqual(["first", "second", "third"]);
+    expect(committed).toEqual(["first", "second", "third"]);
+  });
+
+  test("a deep viewport jump wins after the active card, then backfill resumes", async () => {
+    let releaseFirst!: () => void;
+    const firstResponse = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const started: string[] = [];
+    const queue = createOrderedHydrationQueue(async (id: string) => {
+      started.push(id);
+      if (id === "first") await firstResponse;
+    });
+
+    queue.sync([
+      { key: "first", position: 0, value: "first" },
+      { key: "second", position: 1, value: "second" },
+      { key: "third", position: 2, value: "third" },
+    ]);
+    queue.setVisible("third", true);
+    releaseFirst();
+    await queue.whenIdle();
+
+    expect(started).toEqual(["first", "third", "second"]);
+  });
+
   test("sorts by rank and then recency", () => {
     expect(
       sortedFeed([

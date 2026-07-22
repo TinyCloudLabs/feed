@@ -45,6 +45,43 @@ test("contract bodies render markdown and sections editorially", () => {
   expect(html).not.toContain("artifact-fields");
 });
 
+test("worker-produced modern bodies retain editorial metadata and verified moments", () => {
+  const html = renderToStaticMarkup(
+    <ArtifactBody body={{
+      markdown: "A finished modern card.",
+      quote: "The useful detail was already in the transcript.",
+      attribution: "Speaker one",
+      tags: ["product", "signal"],
+      quality: { critic_pass: true, quotes_verified: true },
+      sourceQuotes: [{
+        quote: "The useful detail was already in the transcript.",
+        sourceRefId: "source-one",
+        loc: "L12-L14",
+      }],
+    }} />,
+  );
+
+  expect(html).toContain("The useful detail was already in the transcript.");
+  expect(html).toContain("Speaker one");
+  expect(html).toContain("product");
+  expect(html).toContain("✓ critic · ✓ quotes");
+  expect(html).toContain("Verified moments");
+  expect(html).toContain("source-one · L12-L14 · verified");
+  expect(html).not.toContain("More detail");
+});
+
+test("false or absent quality never mints quality badges", () => {
+  const falseQuality = renderToStaticMarkup(
+    <ArtifactBody body={{ markdown: "Prose.", quality: { critic_pass: false, quotes_verified: false } }} />,
+  );
+  const absentQuality = renderToStaticMarkup(<ArtifactBody body={{ markdown: "Prose." }} />);
+
+  expect(falseQuality).not.toContain("critic");
+  expect(falseQuality).not.toContain("quotes");
+  expect(falseQuality).not.toContain("✗");
+  expect(absentQuality).not.toContain("artifact-foot");
+});
+
 test("unknown structured bodies still fall back to the structured view", () => {
   const html = renderToStaticMarkup(<ArtifactBody body={{ some: "thing", other: 2 }} />);
   expect(html).toContain("artifact-fields");

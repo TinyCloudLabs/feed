@@ -82,8 +82,49 @@ export function reportClientTiming(
 }
 
 export function errorDetail(error: unknown): string {
-  if (error instanceof Error) return `${error.name}: ${error.message}`;
-  return String(error);
+  return describeError(error, new Set<object>(), 0).slice(0, 500);
+}
+
+function describeError(value: unknown, seen: Set<object>, depth: number): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return String(value);
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "circular cause";
+  if (depth >= 4) return "cause depth exceeded";
+  seen.add(value);
+
+  const name = safeStringField(value, "name");
+  const code = safeStringField(value, "code");
+  const message = safeStringField(value, "message");
+  const label = name || (value instanceof Error ? value.name : undefined);
+  const parts = [
+    label,
+    code ? `[${code}]` : undefined,
+  ].filter(Boolean).join(" ");
+  let detail = message
+    ? `${parts ? `${parts}: ` : ""}${message}`
+    : parts || "Unknown error";
+
+  const cause = safeField(value, "cause");
+  if (cause !== undefined && cause !== null) {
+    detail += `; cause: ${describeError(cause, seen, depth + 1)}`;
+  }
+  return detail;
+}
+
+function safeField(value: object, key: string): unknown {
+  try {
+    return (value as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function safeStringField(value: object, key: string): string | undefined {
+  const field = safeField(value, key);
+  if (typeof field === "string" && field.trim()) return field.trim();
+  if (key === "code" && typeof field === "number" && Number.isFinite(field)) return String(field);
+  return undefined;
 }
 
 export function installGlobalErrorReporting(): void {

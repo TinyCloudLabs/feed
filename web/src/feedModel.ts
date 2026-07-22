@@ -29,6 +29,108 @@ export type LazyArtifactCache = {
   clear: () => void;
 };
 
+export type OrderedHydrationEntry<T> = {
+  key: string;
+  position: number;
+  value: T;
+};
+
+export type OrderedHydrationQueue<T> = {
+  sync: (entries: readonly OrderedHydrationEntry<T>[]) => void;
+  setVisible: (key: string, visible: boolean) => void;
+  whenIdle: () => Promise<void>;
+  clear: () => void;
+};
+
+/**
+ * A one-request hydration lane keeps DOM commits deterministic: even if a
+ * lower response is already resolved, it cannot apply before the card above
+ * it. Viewport entries jump ahead of background backfill, while retaining
+ * their own top-to-bottom order.
+ */
+export function createOrderedHydrationQueue<T>(
+  hydrate: (value: T) => Promise<void>,
+): OrderedHydrationQueue<T> {
+  const pending = new Map<string, OrderedHydrationEntry<T>>();
+  const visible = new Set<string>();
+  const active = new Set<string>();
+  const completed = new Set<string>();
+  let syncedKeys = new Set<string>();
+  let generation = 0;
+  let draining: Promise<void> | null = null;
+
+  const nextEntry = (): OrderedHydrationEntry<T> | undefined => {
+    const entries = [...pending.values()];
+    const visibleEntries = entries.filter((entry) => visible.has(entry.key));
+    return (visibleEntries.length > 0 ? visibleEntries : entries)
+      .sort((left, right) => left.position - right.position)[0];
+  };
+
+  const kick = () => {
+    if (draining || pending.size === 0) return;
+    const drainGeneration = generation;
+    draining = (async () => {
+      while (drainGeneration === generation) {
+        const entry = nextEntry();
+        if (!entry) return;
+        pending.delete(entry.key);
+        visible.delete(entry.key);
+        active.add(entry.key);
+        try {
+          await hydrate(entry.value);
+          // Let React commit this card before a fast/cached lower response
+          // can enqueue its state update in the same automatic batch.
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        } finally {
+          active.delete(entry.key);
+          if (drainGeneration === generation) completed.add(entry.key);
+        }
+      }
+    })().finally(() => {
+      draining = null;
+      if (pending.size > 0) kick();
+    });
+  };
+
+  return {
+    sync(entries) {
+      const currentKeys = new Set(entries.map((entry) => entry.key));
+      for (const entry of entries) {
+        // Re-entering after an error/refresh is a new hydration opportunity;
+        // staying present across incidental renders is not.
+        if (!syncedKeys.has(entry.key)) completed.delete(entry.key);
+      }
+      for (const key of pending.keys()) {
+        if (!currentKeys.has(key)) {
+          pending.delete(key);
+          visible.delete(key);
+        }
+      }
+      for (const entry of entries) {
+        if (!completed.has(entry.key) && !active.has(entry.key)) pending.set(entry.key, entry);
+      }
+      syncedKeys = currentKeys;
+      kick();
+    },
+    setVisible(key, isVisible) {
+      if (isVisible) visible.add(key);
+      else visible.delete(key);
+      kick();
+    },
+    async whenIdle() {
+      while (draining) await draining;
+    },
+    clear() {
+      generation += 1;
+      pending.clear();
+      visible.clear();
+      active.clear();
+      completed.clear();
+      syncedKeys.clear();
+    },
+  };
+}
+
 export function projectionLabel(projection: FeedItemProjection): string {
   const reasons = projection.reasonCodes.length > 0 ? projection.reasonCodes.join(", ") : "ranked";
   return `${projection.freshnessLabel} · ${projection.visibility} · ${reasons}`;

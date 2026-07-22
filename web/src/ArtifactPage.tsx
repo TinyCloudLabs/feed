@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { FeedArtifact, FeedbackEvent } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { postsFromArtifact, type FeedItemProjection, type FeedPost } from "../../shared/feed-item.ts";
-import { ArtifactBody } from "./ArtifactBody.tsx";
+import { ArtifactBody, editorialMetadata, hasHeroReference } from "./ArtifactBody.tsx";
 import { readableFeedTime } from "./feedModel.ts";
 
 export type ArtifactPageState = "loading" | "ready" | "gone" | "error";
@@ -106,7 +106,8 @@ export function ArtifactPage({
     (entry): entry is Extract<FeedPost["evidence"][number], { kind: "verified_quote" }> =>
       entry.kind === "verified_quote",
   ) ?? [];
-  const pullQuote = verifiedQuotes[0];
+  const bodyEditorial = editorialMetadata(artifact.body);
+  const pullQuote = bodyEditorial.quote ? undefined : verifiedQuotes[0];
   const evidenceSourceIds = new Set(
     post?.evidence.flatMap((entry) => "sourceRefId" in entry ? [entry.sourceRefId] : []) ?? [],
   );
@@ -266,14 +267,6 @@ function VerifiedQuote({
       {title && <span className="source-title">{title}</span>}
     </blockquote>
   );
-}
-
-function hasHeroReference(body: unknown): boolean {
-  if (!body || typeof body !== "object" || Array.isArray(body)) return false;
-  const hero = (body as Record<string, unknown>).hero_image;
-  if (typeof hero === "string") return hero.trim().length > 0;
-  if (!hero || typeof hero !== "object" || Array.isArray(hero)) return false;
-  return Object.values(hero).some((value) => typeof value === "string" && value.trim().length > 0);
 }
 
 function sourceSummary(artifact: FeedArtifact): string {
