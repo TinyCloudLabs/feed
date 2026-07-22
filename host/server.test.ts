@@ -137,8 +137,11 @@ describe("Feed Host server", () => {
       storage: new DiagnosticsFeedHostStorage() as unknown as FeedHostStorage,
       delegationStore,
       activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+      proactiveActorId: ACTOR_ID,
+      now: () => new Date(FAKE_NOW),
     });
     await grantAllDelegations(runtime, ACTOR_ID);
+    expect(await runtime.ensureProactiveNow()).toBe("ok");
 
     const response = await fetch(`${runtime.url}/admin/diagnostics`, {
       headers: { authorization: "Bearer diagnostics-test-token" },
@@ -148,6 +151,12 @@ describe("Feed Host server", () => {
       buildSha: string;
       nodeVersion: string;
       delegationStore: { actors: number; resources: number; expiringSoonCount: number };
+      proactiveScheduler: {
+        enabled: boolean;
+        actorHash: string | null;
+        lastEnsuredSlot: string | null;
+        lastResult: string | null;
+      };
       actors: Record<string, {
         queue: { counts: Record<string, number>; oldestAcceptedAgeSec: number };
         integrity: { healthy: number; missing: number; quarantined: number };
@@ -166,6 +175,12 @@ describe("Feed Host server", () => {
     expect(body.delegationStore.actors).toBe(1);
     expect(body.delegationStore.resources).toBeGreaterThan(0);
     expect(body.delegationStore.expiringSoonCount).toBeGreaterThan(0);
+    expect(body.proactiveScheduler).toEqual({
+      enabled: true,
+      actorHash,
+      lastEnsuredSlot: FAKE_NOW.slice(0, 10),
+      lastResult: "ok",
+    });
     expect(body.buildSha).toBe("dev");
     expect(typeof body.nodeVersion).toBe("string");
     expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
@@ -2802,6 +2817,16 @@ class FakeFeedHostStorage {
         : right.created_at.localeCompare(left.created_at),
     );
     return rows.slice(0, Math.max(1, Math.min(limit, 500)));
+  }
+
+  async findGenerationRequestByDedupeKey(
+    actor: FeedHostActorStorage,
+    dedupeKey: string,
+  ): Promise<Record<string, unknown> | null> {
+    const row = this.generationRequests.find(
+      (candidate) => candidate.actor_id === actor.actorId && candidate.dedupe_key === dedupeKey,
+    );
+    return row ? wireGenerationRequest(row) : null;
   }
 
   async updateGenerationRequestStatus(
