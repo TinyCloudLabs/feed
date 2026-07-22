@@ -291,6 +291,11 @@ function makeQueue(): {
     freshness_label TEXT NOT NULL, reason_codes_json TEXT NOT NULL, package_id TEXT NOT NULL,
     source_fingerprint TEXT NOT NULL, published_at TEXT NOT NULL, updated_at TEXT NOT NULL
   )`);
+  database.exec(`CREATE TABLE control_intent_event (
+    event_id TEXT PRIMARY KEY, reader_nonce TEXT NOT NULL, actor_id TEXT NOT NULL,
+    intent_kind TEXT NOT NULL, status TEXT NOT NULL, target_ref TEXT NOT NULL,
+    payload_hash TEXT, payload_json TEXT, created_at TEXT NOT NULL
+  )`);
   database.exec(`CREATE TABLE projection_checkpoint (
     checkpoint_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, artifact_cursor TEXT NOT NULL,
     last_reconciled_at TEXT NOT NULL, status TEXT NOT NULL
@@ -332,3 +337,35 @@ function makeQueue(): {
     close: () => database.close(),
   };
 }
+
+test("ask dedupe coalesces only onto live requests; nonce replays stay idempotent", async () => {
+  const { storage, actor, close } = makeQueue();
+  const base = {
+    actorId: actor.actorId,
+    intentKind: "generate_new_request" as const,
+    targetRef: "feed",
+    payload: { prompt: "same ask" },
+    createdAt: new Date().toISOString(),
+  };
+  const first = await storage.recordControlIntent(actor, { ...base, eventId: crypto.randomUUID(), readerNonce: "n-1" });
+  const dup = await storage.recordControlIntent(actor, { ...base, eventId: crypto.randomUUID(), readerNonce: "n-2" });
+  expect(dup.requestId).toBe(first.requestId);
+
+  await actor.feed.sql.db("xyz.tinycloud.feed/index").execute(
+    "UPDATE generation_request SET expires_at = ? WHERE request_id = ?",
+    [new Date(Date.now() - 1000).toISOString(), first.requestId],
+  );
+  const fresh = await storage.recordControlIntent(actor, { ...base, eventId: crypto.randomUUID(), readerNonce: "n-3", createdAt: new Date().toISOString() });
+  expect(fresh.requestId).not.toBe(first.requestId);
+
+  const replay = await storage.recordControlIntent(actor, { ...base, eventId: crypto.randomUUID(), readerNonce: "n-1" });
+  expect(replay.requestId).toBe(first.requestId);
+
+  await actor.feed.sql.db("xyz.tinycloud.feed/index").execute(
+    "UPDATE generation_request SET status = 'consumed' WHERE request_id = ?",
+    [fresh.requestId],
+  );
+  const after = await storage.recordControlIntent(actor, { ...base, eventId: crypto.randomUUID(), readerNonce: "n-4", createdAt: new Date().toISOString() });
+  expect(after.requestId).not.toBe(fresh.requestId);
+  close();
+});
