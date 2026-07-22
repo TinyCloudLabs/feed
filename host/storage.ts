@@ -2192,13 +2192,30 @@ export class FeedHostStorage {
     const scope = generationScopeFromPayload(input.payload, input.targetRef);
     const prompt = promptFromPayload(input.payload);
     const dedupeKey = input.payloadHash ?? hashJson({ actorId: input.actorId, scope, prompt, targetRef: input.targetRef });
+    // Two different matches with different lifetimes. A reader-nonce match is
+    // an idempotent replay of the same client event and must return the
+    // original row in any state. A dedupe-key match only coalesces onto LIVE
+    // work (claimable or in-flight): expired, exhausted, terminal, or already
+    // consumed twins must not swallow a new ask with the same prompt — that
+    // is the Ask Feed default prompt, and matching a dead twin leaves the
+    // user a button that silently does nothing.
     const existing = await queryRows<GenerationRequestRow>(
       this.db(actor, "feed_index"),
       `SELECT ${GENERATION_REQUEST_COLUMNS}
          FROM generation_request
-        WHERE actor_id = ? AND (reader_nonce = ? OR dedupe_key = ?)
+        WHERE actor_id = ?
+          AND (
+            reader_nonce = ?
+            OR (
+              dedupe_key = ?
+              AND (
+                (status = 'accepted' AND expires_at > ?)
+                OR (status IN ('pending', 'retry_wait') AND attempt_count < max_attempts)
+              )
+            )
+          )
         LIMIT 1`,
-      [input.actorId, input.readerNonce, dedupeKey],
+      [input.actorId, input.readerNonce, dedupeKey, input.createdAt],
     );
     const row = existing[0];
     if (row) return generationRequestFromRow(row);

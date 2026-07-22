@@ -1011,3 +1011,4 @@ test("a seed interrupted after the verified document repairs on the next bootstr
   artifacts.db.close();
   feed.db.close();
 });
+
