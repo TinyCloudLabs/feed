@@ -214,3 +214,22 @@ test("TTL refresh rejects a changed policy hash without activating stale authori
   const db = (access.sql as { db: (p: string) => { query: (sql: string) => Promise<unknown> } }).db(PATH);
   await expect(db.query("blocked")).rejects.toMatchObject({ code: "delegation_stale" });
 });
+
+test("selfHealingAccess forwards execute params to the underlying access", async () => {
+  const calls: unknown[][] = [];
+  const access = {
+    sql: {
+      db: () => ({
+        query: async () => ({ ok: true }),
+        batch: async () => ({ ok: true }),
+        execute: async (...args: unknown[]) => { calls.push(args); return { ok: true }; },
+      }),
+    },
+    kv: { get: async () => ({ ok: true }), put: async () => ({ ok: true }), delete: async () => ({ ok: true }), list: async () => ({ ok: true, data: { keys: [] } }) },
+  };
+  const actor: any = { actorId: "did:test:exec", access, accessByResource: new Map([["p", access]]) };
+  const healing: any = selfHealingAccess(actor, "p");
+  await healing.sql.db("p").execute("UPDATE t SET a=? WHERE b=? AND c=? AND d=?", [1, 2, 3, 4]);
+  expect(calls.length).toBe(1);
+  expect(calls[0][1]).toEqual([1, 2, 3, 4]);
+});
