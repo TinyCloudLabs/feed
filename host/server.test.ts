@@ -210,6 +210,75 @@ describe("Feed Host server", () => {
     expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
   });
 
+  test("diagnostics degrade per section instead of failing wholesale when a storage query throws", async () => {
+    class GenerationThrowingStorage extends DiagnosticsFeedHostStorage {
+      override async generationDiagnostics(): Promise<never> {
+        throw new Error("TinyCloud SQL query failed: no such column: terminal_kind");
+      }
+    }
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new GenerationThrowingStorage() as unknown as FeedHostStorage,
+      delegationStore: fakeDelegationStore(),
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+      proactiveActorId: ACTOR_ID,
+      now: () => new Date(FAKE_NOW),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+    expect(await runtime.ensureProactiveNow()).toBe("ok");
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics`, {
+      headers: { authorization: "Bearer diagnostics-test-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      actors: Record<string, {
+        queue?: { counts: Record<string, number> };
+        generationError?: { code: string; message: string };
+        alerts?: Record<string, boolean>;
+      }>;
+    };
+    const aggregate = body.actors[telemetryIdHash(ACTOR_ID)];
+    expect(aggregate.queue?.counts).toEqual({ accepted: 2, consumed: 1 });
+    expect(aggregate.alerts).toBeDefined();
+    expect(aggregate.generationError).toEqual({
+      code: "diagnostics_generation_failed",
+      message: "TinyCloud SQL query failed: no such column: terminal_kind",
+    });
+    expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
+  });
+
+  test("diagnostics report a per-actor error object when the whole actor aggregate fails", async () => {
+    class QueueThrowingStorage extends DiagnosticsFeedHostStorage {
+      override async queueSummary(): Promise<never> {
+        throw new Error("TinyCloud SQL query failed: session busy");
+      }
+    }
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new QueueThrowingStorage() as unknown as FeedHostStorage,
+      delegationStore: fakeDelegationStore(),
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+      proactiveActorId: ACTOR_ID,
+      now: () => new Date(FAKE_NOW),
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics`, {
+      headers: { authorization: "Bearer diagnostics-test-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      actors: Record<string, { error?: { code: string; message: string } }>;
+    };
+    expect(body.actors[telemetryIdHash(ACTOR_ID)].error).toEqual({
+      code: "diagnostics_actor_failed",
+      message: "TinyCloud SQL query failed: session busy",
+    });
+  });
+
   test("serves public metadata and an OpenAPI document that matches the host routes", async () => {
     runtime = startFeedHost({
       port: 0,
