@@ -19,6 +19,7 @@ import {
   FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL,
   FEED_POST_MIGRATION,
   FEED_GENERATION_WORKER_MIGRATION,
+  FEED_GENERATION_OBSERVABILITY_MIGRATION,
   withFeedHostMigrations,
 } from "./feed-schema.ts";
 
@@ -117,7 +118,7 @@ test("bootstraps schema with per-migration batches when migrations.apply cannot 
   expect(artifactLog?.applies).toBe(1);
   expect(feedLog?.applies).toBe(1);
   expect(artifactLog?.batches.length).toBe(1);
-  expect(feedLog?.batches.length).toBe(3);
+  expect(feedLog?.batches.length).toBe(4);
   expect(artifactLog?.batches[0]?.length).toBe(7);
   expect(feedLog?.batches[0]?.length).toBe(6);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
@@ -125,6 +126,7 @@ test("bootstraps schema with per-migration batches when migrations.apply cannot 
   expect(feedLog?.batches[1]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_item_projection");
   expect(feedLog?.batches[1]?.some((statement) => statement.sql.includes("CREATE TABLE IF NOT EXISTS feed_targeted_interaction_event"))).toBe(true);
   expect(feedLog?.batches[2]?.some((statement) => statement.sql.includes("ADD COLUMN fencing_token"))).toBe(true);
+  expect(feedLog?.batches[3]?.some((statement) => statement.sql.includes("ADD COLUMN terminal_kind"))).toBe(true);
   expect(artifactLog?.executes.length).toBe(0);
   expect(feedLog?.executes.length).toBe(2);
   expect(feedLog?.executes[0]).toContain("ON CONFLICT(feed_item_id) DO UPDATE");
@@ -141,6 +143,7 @@ test("converges with the canonical post migration without duplicating it", () =>
     "001_feed_index",
     "002_post_feed_items",
     "003_generation_worker_control",
+    "004_generation_observability",
   ]);
   expect(merged.filter((migration) => migration.id === "002_post_feed_items")).toHaveLength(1);
   expect(merged.find((migration) => migration.id === "002_post_feed_items")?.description).toBe(
@@ -150,6 +153,9 @@ test("converges with the canonical post migration without duplicating it", () =>
   expect(FEED_POST_MIGRATION.sql.every((sql) => !sql.startsWith("ALTER TABLE"))).toBe(true);
   expect(FEED_GENERATION_WORKER_MIGRATION.sql).toContain(
     "ALTER TABLE generation_request ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0",
+  );
+  expect(FEED_GENERATION_OBSERVABILITY_MIGRATION.sql).toContain(
+    "ALTER TABLE generation_request ADD COLUMN published_manifest_ids_json TEXT NOT NULL DEFAULT '[]'",
   );
 });
 
@@ -337,7 +343,9 @@ test("generation_request insert matches its column list and runs against the rea
     attemptCount: 0, nextRetryAt: null, cancellationRequested: false, phase: "queued", phaseStartedAt: null,
     startedAt: null, completedAt: null, lastAttemptAt: null, sourceCursorBefore: null, sourceCursorAfter: null,
     sourceRefs: [], publicationKey: null, artifactIds: [], publicationManifest: null, error: null,
-    timingEvents: [], expiresAt: "2026-07-15T00:00:00.000Z", createdAt: "2026-07-14T00:00:00.000Z",
+    timingEvents: [], terminal: null, errorCode: null, publishedManifestIds: [], criticVerdicts: [],
+    strategy: null, claimedAt: null, finishedAt: null,
+    expiresAt: "2026-07-15T00:00:00.000Z", createdAt: "2026-07-14T00:00:00.000Z",
     updatedAt: "2026-07-14T00:00:00.000Z",
   } as unknown as Parameters<typeof generationRequestSql>[0];
   const statement = generationRequestSql(record);
@@ -868,11 +876,11 @@ test("bootstraps legacy rows when the actor can read the old SQL resources", asy
   const artifactLog = logs.get(FEED_HOST_ARTIFACTS_DB_PATH);
   const feedLog = logs.get(FEED_HOST_FEED_DB_PATH);
   expect(artifactLog?.batches.length).toBe(2);
-  expect(feedLog?.batches.length).toBe(4);
+  expect(feedLog?.batches.length).toBe(5);
   expect(artifactLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS artifact_index");
   expect(feedLog?.batches[0]?.[0]?.sql).toContain("CREATE TABLE IF NOT EXISTS feed_artifact_projection");
   expect(artifactLog?.batches[1]?.[0]?.sql).toContain("INSERT OR REPLACE INTO artifact_index");
-  expect(feedLog?.batches[3]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
+  expect(feedLog?.batches[4]?.[0]?.sql).toContain("INSERT OR REPLACE INTO feed_item_projection");
 });
 
 function emptyMigrationSummary(): FeedV1MigrationSummary {

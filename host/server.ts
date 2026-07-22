@@ -42,7 +42,7 @@ import {
   LEGACY_INTERACTIONS_DB_PATH,
 } from "../../artifactory/skills/_shared/lib/feed-v1-migration.ts";
 import { FeedHostDelegationStore, liveDelegationResources } from "./delegation-store.ts";
-import { levelForStatus, logEvent } from "./log.ts";
+import { levelForStatus, logEvent, recentHostEvents } from "./log.ts";
 import { ensureFeedHostPrivateKey } from "./host-key.ts";
 import {
   InputAuthorityRegistry,
@@ -414,7 +414,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
           ms: Math.round(performance.now() - startedAt),
           queueWaitMs: Math.round(queueWaitMs),
           routeMs: Math.round(performance.now() - routeStartedAt),
-          actor: authenticatedActor,
+          ...(authenticatedActor ? { actorHash: telemetryIdHash(authenticatedActor) } : {}),
           ...(traceId ? { traceId } : {}),
           ...(errorCode ? { code: errorCode } : {}),
           ...(error ? errorLogFields(error) : {}),
@@ -807,8 +807,8 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     logEvent("info", "artifact_published", {
       artifactHash: telemetryIdHash(artifact.artifactId),
       artifactType: artifact.artifactType,
-      packageId: artifact.producedBy.packageId,
-      runId: artifact.producedBy.runId,
+      packageHash: telemetryIdHash(artifact.producedBy.packageId),
+      runHash: telemetryIdHash(artifact.producedBy.runId),
       actorHash: telemetryIdHash(actor.actorId),
       via: "dev_publisher",
     });
@@ -851,11 +851,10 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       updatedAt: new Date().toISOString(),
     });
     logEvent("info", "generation_request_status", {
-      requestId,
+      requestHash: telemetryIdHash(requestId),
       status,
       expectedStatus,
       actorHash: telemetryIdHash(actor.actorId),
-      note: optionalString(body.note),
     });
     return json({ updated: true, request: record });
   }
@@ -988,7 +987,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       now: new Date().toISOString(),
     });
     logEvent("info", "generation_request_cancellation", {
-      requestId,
+      requestHash: telemetryIdHash(requestId),
       status: record.status,
       phase: record.phase,
       actorHash: telemetryIdHash(actor.actorId),
@@ -1028,7 +1027,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
     const result = await storage.recordControlIntent(actorStorage(actor), event);
     if (result.requestId && !result.duplicate) {
       logEvent("info", "generation_request_accepted", {
-        requestId: result.requestId,
+        requestHash: result.requestId ? telemetryIdHash(result.requestId) : undefined,
         intentKind: event.intentKind,
         actorHash: telemetryIdHash(actorId),
       });
@@ -1174,8 +1173,8 @@ async function routeWorker(
       context.workerClaims.set(normalizeActorId(actor.actorId), { ts: now, result: resultCode });
       logEvent("info", "worker_claim", {
         actorHash: telemetryIdHash(actor.actorId),
-        workflowId,
-        ...(requestRecord?.packageId ? { packageId: requestRecord.packageId } : {}),
+        workflowHash: telemetryIdHash(workflowId),
+        ...(requestRecord?.packageId ? { packageHash: telemetryIdHash(requestRecord.packageId) } : {}),
         resultCode,
       });
       return json({ request: requestRecord, committedCursor: requestRecord?.sourceCursorBefore ?? null });
@@ -1185,7 +1184,7 @@ async function routeWorker(
       context.workerClaims.set(normalizeActorId(actor.actorId), { ts: now, result: resultCode });
       logEvent("warn", "worker_claim", {
         actorHash: telemetryIdHash(actor.actorId),
-        workflowId,
+        workflowHash: telemetryIdHash(workflowId),
         resultCode,
       });
       throw error;
@@ -1219,7 +1218,13 @@ async function routeWorker(
     const record = await context.storage.updateGenerationRequestPhase(access, {
       ...identity,
       phase,
-      metadata: readWorkerMetadata(body.metadata),
+      metadata: readWorkerMetadataFromBody(body),
+    });
+    logEvent("info", "generation_request_phase", {
+      actorHash: telemetryIdHash(actor.actorId),
+      requestHash: telemetryIdHash(requestId),
+      phase,
+      attemptCount: record.attemptCount,
     });
     return json({ request: record });
   }
@@ -1230,10 +1235,25 @@ async function routeWorker(
       artifacts: Object.hasOwn(body, "artifacts") ? readWorkerArtifacts(body.artifacts) : undefined,
       timingEvents: readWorkerTimingEvents(body.timingEvents),
     });
+    logEvent("info", "generation_request_publish", {
+      actorHash: telemetryIdHash(actor.actorId),
+      requestHash: telemetryIdHash(requestId),
+      outcome: result.outcome,
+      artifactCount: result.artifactIds.length,
+    });
     return json(result);
   }
   if (action === "reconcile") {
-    return json(await context.storage.reconcileGenerationRequest(access, identity));
+    const result = await context.storage.reconcileGenerationRequest(access, {
+      ...identity,
+      metadata: readWorkerMetadataFromBody(body),
+    });
+    logEvent("info", "generation_request_reconcile", {
+      actorHash: telemetryIdHash(actor.actorId),
+      requestHash: telemetryIdHash(requestId),
+      feedItemCount: result.feedItemIds.length,
+    });
+    return json(result);
   }
   if (action === "assert") {
     return json({ request: await context.storage.assertGenerationRequestFence(access, identity) });
@@ -1248,6 +1268,14 @@ async function routeWorker(
       cursor: body.cursor,
       artifactIds: readStringArray(body.artifactIds, "artifactIds"),
       timingEvents: readWorkerTimingEvents(body.timingEvents),
+      metadata: readWorkerMetadataFromBody(body),
+    });
+    logEvent("info", "generation_request_completed", {
+      actorHash: telemetryIdHash(actor.actorId),
+      requestHash: telemetryIdHash(requestId),
+      terminal: record.terminal,
+      attemptCount: record.attemptCount,
+      manifestCount: record.publishedManifestIds.length,
     });
     return json({ request: record });
   }
@@ -1262,9 +1290,9 @@ async function routeWorker(
     timingEvents: readWorkerTimingEvents(body.timingEvents),
   });
   logEvent("warn", "generation_request_retry", {
-    requestId,
-    runId: identity.runId,
-    claimOwner: identity.claimOwner,
+    requestHash: telemetryIdHash(requestId),
+    runHash: telemetryIdHash(identity.runId),
+    claimOwnerHash: telemetryIdHash(identity.claimOwner),
     fencingToken: identity.fencingToken,
     attemptCount: record.attemptCount,
     status: record.status,
@@ -1282,6 +1310,7 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
     if (isDelegationExpired(actor) || !hasCompleteFeedHostDelegation(actor)) continue;
     const access = actorStorage(actor);
     const queue = await context.storage.queueSummary(access, now);
+    const generation = await context.storage.generationDiagnostics(access, 10);
     const latest = context.storage.latestIntegritySummary(access);
     const integrity = {
       healthy: latest?.healthy ?? 0,
@@ -1296,6 +1325,9 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
       queue,
       integrity,
       lastWorkerClaim: claim,
+      recentRequests: generation.recentRequests,
+      deadLetterCount: generation.deadLetterCount,
+      billingBlocked: generation.billingBlocked,
       alerts: {
         quarantined: integrity.quarantined > 0,
         oldestAccepted: queue.oldestAcceptedAgeSec > 3600,
@@ -1321,6 +1353,7 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
     },
     proactiveScheduler: context.proactiveScheduler.snapshot(),
     actors: actorAggregates,
+    recentEvents: recentHostEvents(),
   };
 }
 
@@ -2323,6 +2356,14 @@ function normalizeGenerationRequestRecord(row: Record<string, unknown>): Record<
     artifactIds: row.artifactIds ?? parseMaybeJson(stringField(row, "artifact_ids_json")) ?? [],
     error: row.error ?? parseMaybeJson(stringField(row, "error_json")) ?? null,
     timingEvents: row.timingEvents ?? parseMaybeJson(stringField(row, "timing_events_json")) ?? [],
+    terminal: stringField(row, "terminal") ?? stringField(row, "terminalKind") ?? stringField(row, "terminal_kind") ?? null,
+    errorCode: stringField(row, "errorCode") ?? stringField(row, "error_code") ?? null,
+    publishedManifestIds:
+      row.publishedManifestIds ?? parseMaybeJson(stringField(row, "published_manifest_ids_json")) ?? [],
+    criticVerdicts: row.criticVerdicts ?? parseMaybeJson(stringField(row, "critic_verdicts_json")) ?? [],
+    strategy: stringField(row, "strategy") ?? stringField(row, "generation_strategy") ?? null,
+    claimedAt: stringField(row, "claimedAt") ?? stringField(row, "claimed_at") ?? stringField(row, "started_at") ?? null,
+    finishedAt: stringField(row, "finishedAt") ?? stringField(row, "finished_at") ?? stringField(row, "completed_at") ?? null,
     expiresAt: stringField(row, "expiresAt") ?? stringField(row, "expires_at"),
     createdAt: stringField(row, "createdAt") ?? stringField(row, "created_at"),
     updatedAt: stringField(row, "updatedAt") ?? stringField(row, "updated_at"),
@@ -2460,20 +2501,76 @@ function readWorkerMetadata(value: unknown): {
   sourceCursorAfter?: unknown;
   sourceRefs?: unknown[];
   timingEvents?: Array<{ name: string; at: string; durationMs?: number }>;
+  terminal?: "published" | "zero_artifacts" | "dead_letter";
+  publishedManifestIds?: string[];
+  criticVerdicts?: Array<{ attempt: number; count: number; finalVerdictCode: string | null }>;
+  strategy?: string;
 } {
   if (value === undefined) return {};
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new FeedHostError("metadata must be an object", 400, "invalid_worker_request");
   }
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).some((key) => !["sourceCursorAfter", "sourceRefs", "timingEvents"].includes(key))) {
+  if (Object.keys(record).some((key) => ![
+    "sourceCursorAfter", "sourceRefs", "timingEvents", "terminal", "terminalKind",
+    "publishedManifestIds", "manifestIds", "criticVerdicts", "strategy", "generationStrategy",
+  ].includes(key))) {
     throw new FeedHostError("metadata contains unsupported fields", 400, "invalid_worker_request");
   }
+  const terminalValue = record.terminal ?? record.terminalKind;
+  const manifestIdsValue = record.publishedManifestIds ?? record.manifestIds;
+  const strategyValue = record.strategy ?? record.generationStrategy;
   return {
     ...(Object.hasOwn(record, "sourceCursorAfter") ? { sourceCursorAfter: record.sourceCursorAfter } : {}),
     ...(record.sourceRefs === undefined ? {} : { sourceRefs: readObjectArray(record.sourceRefs, "sourceRefs", 500) }),
     ...(record.timingEvents === undefined ? {} : { timingEvents: readWorkerTimingEvents(record.timingEvents) }),
+    ...(terminalValue === undefined ? {} : { terminal: readWorkerTerminal(terminalValue) }),
+    ...(manifestIdsValue === undefined ? {} : { publishedManifestIds: readWorkerManifestIds(manifestIdsValue) }),
+    ...(record.criticVerdicts === undefined ? {} : { criticVerdicts: readWorkerCriticVerdicts(record.criticVerdicts) }),
+    ...(strategyValue === undefined ? {} : { strategy: readWorkerStrategy(strategyValue) }),
   };
+}
+
+function readWorkerMetadataFromBody(body: Record<string, unknown>): ReturnType<typeof readWorkerMetadata> {
+  const nested = readWorkerMetadata(body.metadata);
+  const topLevel = Object.fromEntries([
+    "terminal", "terminalKind", "publishedManifestIds", "manifestIds", "criticVerdicts", "strategy", "generationStrategy",
+  ].filter((key) => Object.hasOwn(body, key)).map((key) => [key, body[key]]));
+  return { ...nested, ...readWorkerMetadata(topLevel) };
+}
+
+function readWorkerTerminal(value: unknown): "published" | "zero_artifacts" | "dead_letter" {
+  if (value === "published" || value === "zero_artifacts" || value === "dead_letter") return value;
+  throw new FeedHostError("terminal must be published, zero_artifacts, or dead_letter", 400, "invalid_worker_request");
+}
+
+function readWorkerManifestIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > 128 || value.some((entry) => typeof entry !== "string" || entry.length === 0)) {
+    throw new FeedHostError("publishedManifestIds must be an array of strings", 400, "invalid_worker_request");
+  }
+  if (new Set(value).size !== value.length) {
+    throw new FeedHostError("publishedManifestIds must be unique", 400, "invalid_worker_request");
+  }
+  return value as string[];
+}
+
+function readWorkerCriticVerdicts(value: unknown): Array<{ attempt: number; count: number; finalVerdictCode: string | null }> {
+  return readObjectArray(value, "criticVerdicts", 32).map((entry) => {
+    const attempt = boundedInteger(entry.attempt, -1, 1, 100);
+    const count = boundedInteger(entry.count ?? entry.verdictCount, -1, 0, 10_000);
+    const rawCode = entry.finalVerdictCode ?? entry.verdictCode ?? entry.finalCode ?? null;
+    if (rawCode !== null && (typeof rawCode !== "string" || !/^[a-z0-9][a-z0-9_.-]{0,99}$/i.test(rawCode))) {
+      throw new FeedHostError("critic finalVerdictCode is invalid", 400, "invalid_worker_request");
+    }
+    return { attempt, count, finalVerdictCode: rawCode as string | null };
+  });
+}
+
+function readWorkerStrategy(value: unknown): string {
+  if (typeof value !== "string" || value.length > 512) {
+    throw new FeedHostError("generation strategy must be a string of at most 512 characters", 400, "invalid_worker_request");
+  }
+  return value;
 }
 
 function readWorkerTimingEvents(value: unknown): Array<{ name: string; at: string; durationMs?: number }> | undefined {

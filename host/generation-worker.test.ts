@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import type { IDatabaseHandle, SqlValue } from "@tinycloud/node-sdk";
 import type { FeedArtifact, TranscriptSourceRef } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
-import { FEED_GENERATION_WORKER_MIGRATION } from "./feed-schema.ts";
+import { FEED_GENERATION_OBSERVABILITY_MIGRATION, FEED_GENERATION_WORKER_MIGRATION } from "./feed-schema.ts";
 import { FeedHostStorage, type FeedHostActorStorage } from "./storage.ts";
 
 const ACTOR_ID = "did:pkh:eip155:1:0x0000000000000000000000000000000000000abc";
@@ -166,6 +166,19 @@ describe("generation worker storage", () => {
       publicationKey: "publication-artifact-1",
       artifacts: [{ ...artifact, title: "changed after boundary" }],
     })).rejects.toMatchObject({ code: "publication_conflict", status: 409 });
+    await queue.storage.reconcileGenerationRequest(queue.actor, {
+      ...identity(request!),
+      now: T_HALF,
+      metadata: { publishedManifestIds: ["manifest-artifact-1"] },
+    });
+    expect(await queue.storage.completeGenerationRequest(queue.actor, {
+      ...identity(request!), now: T_HALF, outcome: "published", cursor: { offset: 1 }, artifactIds: ["artifact-1"],
+    })).toMatchObject({
+      terminal: "published",
+      errorCode: null,
+      publishedManifestIds: ["manifest-artifact-1"],
+      finishedAt: T_HALF,
+    });
     queue.close();
   });
 
@@ -194,7 +207,14 @@ describe("generation worker storage", () => {
     const retrySecond = await retryQueue.storage.claimGenerationRequest(retryQueue.actor, claim("workflow", "worker", T1, T2, 2));
     expect(await retryQueue.storage.retryGenerationRequest(retryQueue.actor, {
       ...identity(retrySecond!), now: T1, nextRetryAt: T2, error: { code: "provider_timeout" },
-    })).toMatchObject({ status: "dead_letter", phase: "dead_letter", nextRetryAt: null });
+    })).toMatchObject({
+      status: "dead_letter",
+      phase: "dead_letter",
+      terminal: "dead_letter",
+      errorCode: "provider_timeout",
+      finishedAt: T1,
+      nextRetryAt: null,
+    });
     const permanentQueue = makeQueue();
     permanentQueue.insert("request-permanent");
     const permanent = await permanentQueue.storage.claimGenerationRequest(
@@ -211,6 +231,110 @@ describe("generation worker storage", () => {
     queue.close();
     retryQueue.close();
     permanentQueue.close();
+  });
+
+  test("phase and reconcile metadata persist a distinguishable terminal outcome for old-worker completion", async () => {
+    const queue = makeQueue();
+    queue.insert("request-observed");
+    const claimed = await queue.storage.claimGenerationRequest(queue.actor, claim("workflow-observed", "worker", T0, T1));
+    const criticVerdicts = [
+      { attempt: 1, count: 2, finalVerdictCode: "revise" },
+      { attempt: 2, count: 1, finalVerdictCode: "pass" },
+    ];
+    const phase = await queue.storage.updateGenerationRequestPhase(queue.actor, {
+      ...identity(claimed!),
+      now: T0,
+      phase: "validating",
+      metadata: { strategy: "context-variety/v2 exact", criticVerdicts },
+    });
+    expect(phase).toMatchObject({
+      claimedAt: T0,
+      strategy: "context-variety/v2 exact",
+      criticVerdicts,
+    });
+    await queue.storage.publishGenerationArtifacts(queue.actor, {
+      ...identity(claimed!), now: T_HALF, publicationKey: "publication-observed", artifacts: [],
+    });
+    await queue.storage.reconcileGenerationRequest(queue.actor, {
+      ...identity(claimed!),
+      now: T_HALF,
+      metadata: {
+        terminal: "zero_artifacts",
+        publishedManifestIds: ["manifest-observed"],
+      },
+    });
+    // This is the legacy completion shape: all new fields are optional.
+    const completed = await queue.storage.completeGenerationRequest(queue.actor, {
+      ...identity(claimed!), now: T_HALF, outcome: "zero_artifacts", cursor: { offset: 2 }, artifactIds: [],
+    });
+    expect(completed).toMatchObject({
+      status: "consumed",
+      terminal: "zero_artifacts",
+      errorCode: null,
+      publishedManifestIds: ["manifest-observed"],
+      criticVerdicts,
+      strategy: "context-variety/v2 exact",
+      attemptCount: 1,
+      claimedAt: T0,
+      finishedAt: T_HALF,
+    });
+    queue.close();
+  });
+
+  test("generation diagnostics cap recent requests at 10 and expose dead-letter and billing state", async () => {
+    const queue = makeQueue();
+    for (let index = 0; index < 12; index += 1) {
+      queue.insert(`request-${index}`, `2026-07-20T00:${String(index).padStart(2, "0")}:00.000Z`);
+    }
+    const db = queue.actor.feed.sql.db("xyz.tinycloud.feed/index");
+    await db.execute(
+      `UPDATE generation_request
+          SET status = 'consumed', phase = 'published', terminal_kind = 'published',
+              published_manifest_ids_json = '["manifest-10"]', generation_strategy = 'strategy-v1',
+              claimed_at = created_at, finished_at = created_at
+        WHERE request_id = 'request-10'`,
+    );
+    await db.execute(
+      `UPDATE generation_request
+          SET dedupe_key = 'proactive:extract-insights:v1:2026-07-20'
+        WHERE request_id = 'request-10'`,
+    );
+    await db.execute(
+      `UPDATE generation_request
+          SET status = 'dead_letter', phase = 'dead_letter', terminal_kind = 'dead_letter',
+              error_code = 'provider_timeout', error_json = '{"code":"provider_timeout"}', finished_at = created_at
+        WHERE request_id IN ('request-8', 'request-9')`,
+    );
+    await db.execute(
+      `UPDATE generation_request
+          SET status = 'retry_wait', phase = 'retry_wait', error_code = 'billing_quota_exhausted',
+              error_json = '{"code":"billing_quota_exhausted"}'
+        WHERE request_id = 'request-11'`,
+    );
+
+    const diagnostics = await queue.storage.generationDiagnostics(queue.actor);
+    expect(diagnostics.recentRequests).toHaveLength(10);
+    expect(diagnostics.recentRequests[0]).toEqual({
+      requestId: "request-11",
+      dedupeKeyKind: "ask",
+      terminal: null,
+      errorCode: "billing_quota_exhausted",
+      manifestIds: [],
+      strategy: null,
+      criticVerdicts: [],
+      attemptCount: 0,
+      timestamps: {
+        createdAt: "2026-07-20T00:11:00.000Z",
+        claimedAt: null,
+        finishedAt: null,
+        updatedAt: "2026-07-20T00:11:00.000Z",
+      },
+    });
+    expect(diagnostics.recentRequests.find((request) => request.requestId === "request-10"))
+      .toMatchObject({ dedupeKeyKind: "proactive", terminal: "published", manifestIds: ["manifest-10"] });
+    expect(diagnostics.deadLetterCount).toBe(2);
+    expect(diagnostics.billingBlocked).toBe(true);
+    queue.close();
   });
 });
 
@@ -273,6 +397,7 @@ function makeQueue(): {
     prompt TEXT, expires_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   )`);
   for (const sql of FEED_GENERATION_WORKER_MIGRATION.sql) database.exec(sql);
+  for (const sql of FEED_GENERATION_OBSERVABILITY_MIGRATION.sql) database.exec(sql);
   database.exec(`CREATE TABLE artifact_index (
     artifact_id TEXT PRIMARY KEY, artifact_type TEXT NOT NULL, package_id TEXT NOT NULL,
     package_version TEXT NOT NULL, package_digest TEXT NOT NULL, run_id TEXT NOT NULL,
