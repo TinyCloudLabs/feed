@@ -1858,7 +1858,9 @@ export function selfHealingAccess(actor: ActorState, path: string): DelegatedAcc
     const handle: AnyDb = {
       query: (sql: string, params?: unknown[]) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).query(sql, params) as Promise<unknown>),
       batch: (statements: unknown) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).batch(statements) as Promise<unknown>),
-      execute: (sql: string) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).execute(sql) as Promise<unknown>),
+      // Forward params: the node rejects parameterized executes that arrive
+      // without their bindings, and fakes can't catch a dropped argument.
+      execute: (sql: string, params?: unknown[]) => heal((access) => (access.sql.db(dbPath) as unknown as AnyDb).execute(sql, params) as Promise<unknown>),
     };
     const inner = current().sql.db(dbPath) as unknown as AnyDb;
     if (inner.migrations?.apply) {
