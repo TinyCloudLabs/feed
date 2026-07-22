@@ -132,6 +132,87 @@ test("bootstraps schema with per-migration batches when migrations.apply cannot 
   expect(feedLog?.executes[0]).toContain("ON CONFLICT(feed_item_id) DO UPDATE");
 });
 
+test("falls back to per-statement DDL when migrations.apply reports ok but skips ALTERs", async () => {
+  // Reproduces the 2026-07-22 prod incident: the node's ledger-based
+  // migrations.apply returned ok while 004_generation_observability's ALTER
+  // columns never materialized.
+  const documents = new Map<string, unknown>();
+  const executed: string[] = [];
+  const grantedColumns = new Set<string>();
+
+  function columnsFromSelect(sql: string): string[] {
+    const match = /^SELECT\s+(.+)\s+FROM\s+generation_request\s+LIMIT 0$/i.exec(sql.trim());
+    return match ? match[1]!.split(",").map((column) => column.trim()) : [];
+  }
+
+  const db = {
+    migrations: {
+      apply: async () => ({ ok: true }), // lies: applies nothing
+    },
+    batch: async () => ({ ok: false, error: MULTI_RESOURCE_ERROR }),
+    execute: async (sql: string) => {
+      executed.push(sql);
+      const match = /^ALTER\s+TABLE\s+generation_request\s+ADD\s+COLUMN\s+(\S+)/i.exec(sql.trim());
+      if (match) grantedColumns.add(match[1]!);
+      return { ok: true };
+    },
+    query: async (sql: string) => {
+      const probed = columnsFromSelect(sql);
+      if (probed.length === 0) return { ok: true, data: { columns: [], rows: [], rowCount: 0 } };
+      const missing = probed.find((column) => !grantedColumns.has(column));
+      return missing
+        ? { ok: false, error: { message: `SQLite error: no such column: ${missing}` } }
+        : { ok: true, data: { columns: probed, rows: [], rowCount: 0 } };
+    },
+  };
+  const actor = {
+    artifacts: { sql: { db: () => db } },
+    feed: { sql: { db: () => db } },
+    documents: {
+      kv: {
+        put: async (key: string, value: unknown) => {
+          documents.set(key, value);
+          return { ok: true };
+        },
+        get: async (key: string) => documents.has(key)
+          ? { ok: true, data: { data: documents.get(key) } }
+          : { ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } },
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+
+  const storage = new FeedHostStorage();
+  await storage.bootstrapSchema(actor);
+
+  expect(executed.some((sql) => sql.includes("ADD COLUMN terminal_kind"))).toBe(true);
+  expect(executed.some((sql) => sql.includes("ADD COLUMN published_manifest_ids_json"))).toBe(true);
+  expect(grantedColumns.has("terminal_kind")).toBe(true);
+});
+
+test("fails loudly when even the fallback executor cannot materialize migrated columns", async () => {
+  const db = {
+    migrations: { apply: async () => ({ ok: true }) },
+    batch: async () => ({ ok: false, error: MULTI_RESOURCE_ERROR }),
+    execute: async () => ({ ok: true }), // pretends to work but grants nothing
+    query: async (sql: string) => (/FROM\s+generation_request\s+LIMIT 0/i.test(sql)
+      ? { ok: false, error: { message: "SQLite error: no such column: terminal_kind" } }
+      : { ok: true, data: { columns: [], rows: [], rowCount: 0 } }),
+  };
+  const actor = {
+    artifacts: { sql: { db: () => db } },
+    feed: { sql: { db: () => db } },
+    documents: {
+      kv: {
+        put: async () => ({ ok: true }),
+        get: async () => ({ ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } }),
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+
+  const storage = new FeedHostStorage();
+  await expect(storage.bootstrapSchema(actor)).rejects.toThrow(/schema verification failed/);
+});
+
 test("converges with the canonical post migration without duplicating it", () => {
   const canonical = { ...FEED_POST_MIGRATION, description: "canonical Artifactory migration" };
   const merged = withFeedHostMigrations([

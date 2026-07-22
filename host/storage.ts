@@ -2476,8 +2476,18 @@ async function applyMigrations(
   };
   if (candidate.migrations?.apply) {
     const result = await candidate.migrations.apply(input).catch((error) => ({ ok: false, error }));
-    if (result.ok) return { ok: true };
-    if (!multiResourceInvocationUnsupported(resultError(result)) && !isDuplicateColumn(result.error)) {
+    if (result.ok) {
+      // Trust but verify: the node's ledger-based apply has reported ok while
+      // skipping a migration's ALTERs (prod, 004_generation_observability).
+      // Probe every ALTER-added column; fall through to the per-statement
+      // executor when any are missing.
+      const missing = await missingAlterColumns(db, input.migrations);
+      if (missing.length === 0) return { ok: true };
+      logEvent("warn", "schema_migration_fallback", {
+        namespace: input.namespace,
+        missingColumns: missing.join(","),
+      });
+    } else if (!multiResourceInvocationUnsupported(resultError(result)) && !isDuplicateColumn(result.error)) {
       return { ok: false, error: result.error };
     }
   }
@@ -2493,7 +2503,57 @@ async function applyMigrations(
       if (!result.ok && !isDuplicateColumn(result.error)) return { ok: false, error: result.error };
     }
   }
+
+  const stillMissing = await missingAlterColumns(db, input.migrations);
+  if (stillMissing.length > 0) {
+    return {
+      ok: false,
+      error: new Error(`schema verification failed after migration: missing ${stillMissing.join(", ")}`),
+    };
+  }
   return { ok: true };
+}
+
+const ALTER_ADD_COLUMN_PATTERN = /^ALTER\s+TABLE\s+(\S+)\s+ADD\s+COLUMN\s+(\S+)/i;
+
+/**
+ * Returns ALTER-added columns that provably do not exist yet. Detection is
+ * strict: only a "no such column" probe failure marks a column missing, so
+ * probe-incapable handles (test fakes) and transient errors never trigger the
+ * fallback path spuriously.
+ */
+async function missingAlterColumns(
+  db: IDatabaseHandle,
+  migrations: MigrationApplyInput["migrations"],
+): Promise<string[]> {
+  const probe = db as IDatabaseHandle & {
+    query?: (sql: string, params?: SqlValue[]) => Promise<{ ok: boolean; error?: unknown }>;
+  };
+  if (typeof probe.query !== "function") return [];
+  const tables = new Map<string, Set<string>>();
+  for (const migration of migrations) {
+    for (const sql of migration.sql) {
+      const match = ALTER_ADD_COLUMN_PATTERN.exec(sql.trim());
+      if (!match) continue;
+      const table = match[1]!;
+      if (!tables.has(table)) tables.set(table, new Set());
+      tables.get(table)!.add(match[2]!);
+    }
+  }
+  const missing: string[] = [];
+  for (const [table, columns] of tables) {
+    const combined = await probe.query(`SELECT ${[...columns].join(", ")} FROM ${table} LIMIT 0`).catch((error) => ({ ok: false as const, error }));
+    if (combined.ok) continue;
+    for (const column of columns) {
+      const single = await probe.query(`SELECT ${column} FROM ${table} LIMIT 0`).catch((error) => ({ ok: false as const, error }));
+      if (!single.ok && isNoSuchColumn(resultError(single))) missing.push(`${table}.${column}`);
+    }
+  }
+  return missing;
+}
+
+function isNoSuchColumn(message: string): boolean {
+  return /no such column/i.test(message);
 }
 
 async function queryRows<T extends Record<string, unknown>>(
