@@ -5,6 +5,7 @@ import type {
   FeedbackEvent,
 } from "../../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { type FeedItemProjection, type FeedPost } from "../../shared/feed-item.ts";
+import { editorialMetadata, hasHeroReference } from "./ArtifactBody.tsx";
 import { ArtifactPage, type ArtifactPageState } from "./ArtifactPage.tsx";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
@@ -33,6 +34,7 @@ import {
 } from "./feedV1HostClient.ts";
 import {
   createLazyArtifactCache,
+  createOrderedHydrationQueue,
   feedItemAvailability,
   feedItemsForView,
   feedItemsFromProjections,
@@ -189,7 +191,6 @@ export function App({
   const [pageRetry, setPageRetry] = useState(0);
   const feedLoadInFlight = useRef(false);
   const setupInFlight = useRef<number | null>(null);
-  const artifactHydrationQueue = useRef<Promise<void>>(Promise.resolve());
   const lastRecoveryAt = useRef(0);
   const loginTrace = useRef<FeedLoginTrace | null>(null);
   const firstContentReported = useRef<string | null>(null);
@@ -716,33 +717,37 @@ export function App({
 
   const hydrateArtifact = useCallback(async (projection: FeedItemProjection): Promise<void> => {
     if (!projectionCanHydrate(projection)) return;
-    const hydrate = artifactHydrationQueue.current.catch(() => undefined).then(async () => {
-      try {
-        const artifact = await artifactCache.load(projection.target.artifactId);
-        setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
-          ? { ...item, artifact, error: undefined }
-          : item));
-      } catch (error) {
-        // Authority rejected mid-session: re-submit the delegation instead of
-        // letting every card decay into "unavailable" until a manual sign-in.
-        // The cooldown inside recoverDelegation keeps a burst of failing
-        // hydrations from re-triggering it.
-        if (isDelegationLostError(error) && (await recoverDelegation())) return;
-        const permanent = error instanceof FeedV1HostError && error.status === 424;
-        setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
-          ? {
-              ...item,
-              artifact: null,
-              error: permanent
-                ? "This artifact is no longer available."
-                : "This artifact is temporarily unavailable.",
-            }
-          : item));
-      }
-    });
-    artifactHydrationQueue.current = hydrate.catch(() => undefined);
-    await hydrate;
+    try {
+      const artifact = await artifactCache.load(projection.target.artifactId);
+      setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+        ? { ...item, artifact, error: undefined }
+        : item));
+    } catch (error) {
+      // Authority rejected mid-session: re-submit the delegation instead of
+      // letting every card decay into "unavailable" until a manual sign-in.
+      // The cooldown inside recoverDelegation keeps a burst of failing
+      // hydrations from re-triggering it.
+      if (isDelegationLostError(error) && (await recoverDelegation())) return;
+      const permanent = error instanceof FeedV1HostError && error.status === 424;
+      setItems((current) => current.map((item) => item.projection.target.artifactId === projection.target.artifactId
+        ? {
+            ...item,
+            artifact: null,
+            error: permanent
+              ? "This artifact is no longer available."
+              : "This artifact is temporarily unavailable.",
+          }
+        : item));
+    }
   }, [artifactCache, recoverDelegation]);
+
+  const artifactHydration = useMemo(
+    () => createOrderedHydrationQueue(hydrateArtifact),
+    [hydrateArtifact],
+  );
+  const prioritizeArtifact = useCallback((projection: FeedItemProjection, visible: boolean) => {
+    artifactHydration.setVisible(projection.target.artifactId, visible);
+  }, [artifactHydration]);
 
   const routedItem = route
     ? items.find((item) => item.projection.feedItemId === route.feedItemId)
@@ -857,8 +862,23 @@ export function App({
     }
   };
 
-  const visibleItems = feedItemsForView(items, activeView);
+  const visibleItems = useMemo(() => feedItemsForView(items, activeView), [activeView, items]);
+  const hydrationEntries = useMemo(() => {
+    const seen = new Set<string>();
+    return visibleItems.flatMap((item, position) => {
+      const key = item.projection.target.artifactId;
+      if (seen.has(key) || item.artifact || item.error || !projectionCanHydrate(item.projection)) return [];
+      seen.add(key);
+      return [{ key, position, value: item.projection }];
+    });
+  }, [visibleItems]);
   const visibleLoadError = loadError ?? eventsError;
+
+  useEffect(() => {
+    artifactHydration.sync(route || feedState !== "running" ? [] : hydrationEntries);
+  }, [artifactHydration, feedState, hydrationEntries, route]);
+
+  useEffect(() => () => artifactHydration.clear(), [artifactHydration]);
 
   useLayoutEffect(() => {
     if (route || pendingFeedScrollY.current === null) return;
@@ -1059,8 +1079,9 @@ export function App({
             <FeedCard
               key={item.projection.feedItemId}
               item={item}
+              heroUrl={client.heroUrl(item.projection.target.artifactId)}
               busyAction={busyAction}
-              onExpand={hydrateArtifact}
+              onPrioritize={prioritizeArtifact}
               onFeedback={sendFeedback}
               onResetAttempt={(attemptKey) => feedbackAttempts.current.delete(attemptKey)}
             />
@@ -1256,16 +1277,18 @@ function FeedFailurePanel({ error, onRetry }: { error: string; onRetry: () => vo
   );
 }
 
-function FeedCard({
+export function FeedCard({
   item,
+  heroUrl,
   busyAction,
-  onExpand,
+  onPrioritize,
   onFeedback,
   onResetAttempt,
 }: {
   item: FeedItem;
+  heroUrl: string;
   busyAction: string | null;
-  onExpand: (projection: FeedItemProjection) => Promise<void>;
+  onPrioritize: (projection: FeedItemProjection, visible: boolean) => void;
   onFeedback: (
     projection: FeedItemProjection,
     signal: FeedbackEvent["signal"],
@@ -1274,7 +1297,7 @@ function FeedCard({
   ) => Promise<boolean>;
   onResetAttempt: (attemptKey: string) => void;
 }) {
-  const [artifactLoading, setArtifactLoading] = useState(false);
+  const [heroFailed, setHeroFailed] = useState(false);
   const [noteOpen, setNoteOpen] = useState(false);
   const [note, setNote] = useState("");
   const [noteAttemptKey, setNoteAttemptKey] = useState(() => crypto.randomUUID());
@@ -1287,28 +1310,35 @@ function FeedCard({
   const canHydrate = projectionCanHydrate(item.projection);
   const isSaved = item.projection.disposition === "saved";
   const title = item.projection.postTitle ?? post?.title ?? artifact?.title;
+  const editorial = editorialMetadata(artifact?.body);
+  const cardTags = editorial.tags.slice(0, 3);
+  const showQuality = editorial.quality?.criticPass === true || editorial.quality?.quotesVerified === true;
+  const sourceCount = artifact?.sourceRefs.length ?? 0;
+  const showHero = Boolean(artifact && hasHeroReference(artifact.body));
   // First verified quote reads as a distillery-style pull on the card face.
-  const pullQuote = post?.evidence.find(
+  const evidenceQuote = post?.evidence.find(
     (entry): entry is Extract<FeedPost["evidence"][number], { kind: "verified_quote" }> =>
       entry.kind === "verified_quote",
   );
-  const loadArtifact = async () => {
-    if (artifact || artifactLoading || !canHydrate) return;
-    setArtifactLoading(true);
-    await onExpand(item.projection);
-    setArtifactLoading(false);
-  };
+  const pullQuote = editorial.quote?.text ?? evidenceQuote?.quote;
+  const pullAttribution = editorial.quote?.attribution;
+
+  useEffect(() => {
+    setHeroFailed(false);
+  }, [item.projection.target.artifactId]);
+
   useEffect(() => {
     const element = cardRef.current;
     if (!element || artifact || !canHydrate || typeof IntersectionObserver === "undefined") return;
     const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      observer.disconnect();
-      void loadArtifact();
-    }, { rootMargin: "300px 0px" });
+      onPrioritize(item.projection, entries.some((entry) => entry.isIntersecting));
+    });
     observer.observe(element);
-    return () => observer.disconnect();
-  }, [artifact, canHydrate, item.projection.feedItemId]);
+    return () => {
+      observer.disconnect();
+      onPrioritize(item.projection, false);
+    };
+  }, [artifact, canHydrate, item.projection.feedItemId, onPrioritize]);
   const act = async (signal: FeedbackEvent["signal"]) => {
     setInteractionStatus(null);
     const ok = await onFeedback(item.projection, signal);
@@ -1316,29 +1346,56 @@ function FeedCard({
   };
   return (
     <article ref={cardRef} className="feed-card">
-      <div className="card-meta">
-        <span>{readablePostKind(item)}</span>
-        <span>{readableFeedTime(item.projection.publishedAt)}</span>
-      </div>
-      {title && <h2><a href={`#/a/${encodeURIComponent(item.projection.feedItemId)}`}>{title}</a></h2>}
-      {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
-      {(item.projection.target.kind === "post" || item.projection.postBody) && (
-        <>
-          <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
-            ? "This post’s preview is temporarily unavailable."
-            : "Loading this post…")}</p>
+      <div className={`card-face${showHero && !heroFailed ? " card-face-with-thumbnail" : ""}`}>
+        <div className="card-copy">
+          <div className="card-meta">
+            <span>{readablePostKind(item)}</span>
+            {sourceCount > 0 && <span>{sourceCount} source{sourceCount === 1 ? "" : "s"}</span>}
+            <span>{readableFeedTime(item.projection.publishedAt)}</span>
+          </div>
+          {title && <h2><a href={`#/a/${encodeURIComponent(item.projection.feedItemId)}`}>{title}</a></h2>}
+          {availability !== "available" && <p className="availability-message">{availabilityMessage(availability, Boolean(artifact))}</p>}
+          {(item.projection.target.kind === "post" || item.projection.postBody) && (
+            <p className="post-body">{item.projection.postBody ?? post?.body ?? (item.error
+              ? "This post’s preview is temporarily unavailable."
+              : "Loading this post…")}</p>
+          )}
           {pullQuote && (
-            <blockquote className="pull">
-              <p>&ldquo;{pullQuote.quote}&rdquo;</p>
-              <cite>
-                {pullQuote.sourceRefId}
-                {pullQuote.loc ? ` · ${pullQuote.loc}` : ""} · verified
-              </cite>
+            <blockquote className="pull card-pull">
+              <p>&ldquo;{pullQuote}&rdquo;</p>
+              {(pullAttribution || evidenceQuote) && (
+                <cite>
+                  {pullAttribution ?? evidenceQuote?.sourceRefId}
+                  {!pullAttribution && evidenceQuote?.loc ? ` · ${evidenceQuote.loc}` : ""}
+                  {!pullAttribution && evidenceQuote ? " · verified" : ""}
+                </cite>
+              )}
             </blockquote>
           )}
-        </>
-      )}
-      <details className="why-this" onToggle={(event) => event.currentTarget.open && void loadArtifact()}>
+          {cardTags.length > 0 && (
+            <div className="artifact-tags card-tags">
+              {cardTags.map((tag) => <span key={tag}>{tag}</span>)}
+            </div>
+          )}
+          {showQuality && (
+            <p className="artifact-foot card-foot">
+              {editorial.quality?.criticPass === true && "✓ critic"}
+              {editorial.quality?.criticPass === true && editorial.quality.quotesVerified === true && " · "}
+              {editorial.quality?.quotesVerified === true && "✓ quotes"}
+            </p>
+          )}
+        </div>
+        {showHero && (
+          <CardThumbnail
+            src={heroUrl}
+            failed={heroFailed}
+            onError={() => setHeroFailed(true)}
+          />
+        )}
+      </div>
+      <details className="why-this" onToggle={(event) => {
+        if (event.currentTarget.open && !artifact && canHydrate) onPrioritize(item.projection, true);
+      }}>
         <summary>Why this?</summary>
         <dl className="provenance">
           <div><dt>Made by</dt><dd>{provenance.madeBy}</dd></div>
@@ -1419,6 +1476,31 @@ function FeedCard({
         </p>
       )}
     </article>
+  );
+}
+
+export function CardThumbnail({
+  src,
+  failed,
+  onError,
+}: {
+  src: string;
+  failed: boolean;
+  onError: () => void;
+}) {
+  if (failed) return null;
+  return (
+    <figure className="card-thumbnail" style={{ aspectRatio: "4 / 3" }} aria-hidden="true">
+      <img
+        src={src}
+        alt=""
+        width="4"
+        height="3"
+        loading="lazy"
+        crossOrigin="use-credentials"
+        onError={onError}
+      />
+    </figure>
   );
 }
 

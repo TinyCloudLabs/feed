@@ -65,3 +65,41 @@ test("renders the gone state with the specified 424 copy", () => {
   expect(html).toContain("This artifact is no longer available.");
   expect(html).toContain("← Feed");
 });
+
+test("renders worker-produced modern metadata throughout the detail page", () => {
+  const artifact = structuredClone(fixture) as unknown as FeedArtifact;
+  artifact.posts = undefined;
+  artifact.body = {
+    markdown: "A finished worker-produced card.",
+    hero_image: "data:image/png;base64,aGVybw==",
+    quote: "A grounded pull quote.",
+    attribution: "Speaker one",
+    tags: ["grounded", "finished"],
+    quality: { critic_pass: true, quotes_verified: true },
+    sourceQuotes: [{ quote: "A verified source moment.", sourceRefId: "src-product-review", loc: "L42-L47" }],
+  };
+
+  const html = renderToStaticMarkup(
+    <ArtifactPage
+      feedItemId={`legacy:${artifact.artifactId}`}
+      artifactId={artifact.artifactId}
+      artifact={artifact}
+      state="ready"
+      heroUrl={`http://feed.test/artifacts/${artifact.artifactId}/hero`}
+      busyAction={null}
+      onBack={noop}
+      onRetry={noop}
+      onFeedback={feedback}
+      onResetAttempt={noop}
+    />,
+  );
+
+  expect(html).toContain(`src="http://feed.test/artifacts/${artifact.artifactId}/hero"`);
+  expect(html).toContain("A finished worker-produced card.");
+  expect(html).toContain("A grounded pull quote.");
+  expect(html).toContain("Speaker one");
+  expect(html).toContain("grounded");
+  expect(html).toContain("✓ critic · ✓ quotes");
+  expect(html).toContain("A verified source moment.");
+  expect(html).toContain("src-product-review · L42-L47 · verified");
+});

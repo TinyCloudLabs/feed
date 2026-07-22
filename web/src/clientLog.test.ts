@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildClientEventPayload } from "./clientLog.ts";
+import { buildClientEventPayload, errorDetail } from "./clientLog.ts";
 
 describe("client event payloads", () => {
   test.each(["fresh", "restored"] as const)("includes session_mode=%s on login events", (sessionMode) => {
@@ -34,5 +34,30 @@ describe("client event payloads", () => {
       outcome,
     });
     expect(payload.detail).toBeUndefined();
+  });
+});
+
+describe("error details", () => {
+  test("extracts Error names and messages", () => {
+    expect(errorDetail(new TypeError("wallet rejected"))).toBe("TypeError: wallet rejected");
+  });
+
+  test("extracts message, code, and name from Error-like objects", () => {
+    expect(errorDetail({ name: "ClientError", code: "AUTH_DENIED", message: "sign-in failed" }))
+      .toBe("ClientError [AUTH_DENIED]: sign-in failed");
+  });
+
+  test("preserves string errors", () => {
+    expect(errorDetail("connection closed")).toBe("connection closed");
+  });
+
+  test("walks nested causes and bounds the result", () => {
+    const detail = errorDetail({
+      name: "ClientError",
+      message: "request failed",
+      cause: { code: "ECONNRESET", message: "socket closed", cause: new Error("transport stopped") },
+    });
+    expect(detail).toBe("ClientError: request failed; cause: [ECONNRESET]: socket closed; cause: Error: transport stopped");
+    expect(errorDetail(new Error("x".repeat(700)))).toHaveLength(500);
   });
 });

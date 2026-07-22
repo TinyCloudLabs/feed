@@ -1117,6 +1117,33 @@ summary:focus-visible {
   letter-spacing: -.012em;
 }
 
+.card-face-with-thumbnail {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 20px;
+}
+
+.card-copy {
+  min-width: 0;
+}
+
+.card-thumbnail {
+  width: 112px;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #0d0d0e;
+}
+
+.card-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .signin-copy h1,
 .setup-copy h1,
 .status-screen h1 {
@@ -1270,6 +1297,19 @@ summary:focus-visible {
   color: var(--quiet);
 }
 
+.card-pull p {
+  display: -webkit-box;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-style: normal;
+  font-size: 11px;
+  line-height: 1.55;
+  letter-spacing: .04em;
+  color: var(--muted);
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
 /* Markdown prose inside artifacts: serif headings, readable measure. */
 .artifact-prose {
   max-width: 62ch;
@@ -1399,6 +1439,20 @@ summary:focus-visible {
   letter-spacing: .08em;
   text-transform: uppercase;
   color: var(--quiet);
+}
+
+.artifact-moments {
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--soft-line);
+}
+
+.artifact-moments h3 {
+  margin: 0 0 12px;
+  font-family: var(--serif);
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
 /* Artifact detail: a single editorial column, with hairlines carrying the
@@ -1576,6 +1630,15 @@ summary:focus-visible {
 }
 
 @media (max-width: 720px) {
+  .card-face-with-thumbnail {
+    gap: 14px;
+  }
+
+  .card-thumbnail {
+    width: 72px;
+    aspect-ratio: 1 / 1 !important;
+  }
+
   .artifact-page {
     width: min(calc(100% - 32px), 62ch);
     padding-top: 14px;
