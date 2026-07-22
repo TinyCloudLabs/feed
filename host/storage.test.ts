@@ -1012,3 +1012,35 @@ test("a seed interrupted after the verified document repairs on the next bootstr
   feed.db.close();
 });
 
+
+test("feed order is recency-first: a new low-rank card outranks an old rank-1.0 card", async () => {
+  const artifacts = realHandle("artifacts_index");
+  const feed = realHandle("feed_index");
+  const actor = {
+    actorId: "did:pkh:eip155:1:0xrecency",
+    artifacts: { sql: { db: () => artifacts.handle } },
+    feed: { sql: { db: () => feed.handle } },
+  } as unknown as FeedHostActorStorage;
+  const insertArtifact = artifacts.db.prepare(`INSERT INTO artifact_index
+    (artifact_id, artifact_type, package_id, package_version, package_digest, run_id,
+     source_fingerprint, artifact_fingerprint, dedupe_key, doc_key, media_keys_json,
+     created_at, updated_at, published_at)
+    VALUES (?, 'insight_card', 'pkg', '1.0.0', 'sha256:pkg', 'run', ?, 'sha256:artifact',
+      ?, ?, '[]', ?, ?, ?)`);
+  const insertProjection = feed.db.prepare(`INSERT INTO feed_item_projection
+    (feed_item_id, target_kind, artifact_id, post_id, rank_score, disposition, visibility,
+     freshness_label, reason_codes_json, package_id, source_fingerprint, published_at, updated_at)
+    VALUES (?, 'artifact_preview', ?, NULL, ?, 'default', 'ranked', 'fresh', '[]', 'pkg', ?, ?, ?)`);
+  for (const [id, rank, publishedAt] of [
+    ["old-hit", 1.0, "2026-06-23T00:00:00.000Z"],
+    ["fresh-card", 0.55, "2026-07-22T01:39:00.000Z"],
+  ] as const) {
+    insertArtifact.run(id, `sha256:${id}`, id, `${id}.json`, publishedAt, publishedAt, publishedAt);
+    insertProjection.run(`legacy:${id}`, id, rank, `sha256:${id}`, publishedAt, publishedAt);
+  }
+
+  const storage = new FeedHostStorage();
+  const { items } = await storage.listFeed(actor, { limit: 10 });
+  const ids = items.map((item) => item.target.artifactId);
+  expect(ids.indexOf("fresh-card")).toBeLessThan(ids.indexOf("old-hit"));
+});

@@ -572,7 +572,18 @@ export class FeedHostStorage {
       feedbackByArtifact: summarizeFeedbackEvents(feedbackRows),
       preferences: mergeFeedPreferences(preferenceRows),
     });
-    const page = ranked.slice(offset, offset + limit);
+    // At today's volume the feed is a diary, not a ranking contest: a brand
+    // new card must never be buried under an old high-rank one (it happened —
+    // Hunter couldn't find the first generated artifact). Ranking still owns
+    // filtering/dispositions above; the final order is recency first, rank as
+    // tiebreaker. Revisit day-bucketed rank when scheduled editions raise
+    // daily volume.
+    const recencyFirst = [...ranked].sort((left, right) =>
+      right.publishedAt.localeCompare(left.publishedAt)
+      || right.rankScore - left.rankScore
+      || left.feedItemId.localeCompare(right.feedItemId),
+    );
+    const page = recencyFirst.slice(offset, offset + limit);
     return {
       // Keep the ranked page request lightweight. Artifact documents are
       // hydrated progressively by the client; fetching dozens of documents
