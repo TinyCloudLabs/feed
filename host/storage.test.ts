@@ -189,11 +189,38 @@ test("falls back to per-statement DDL when migrations.apply reports ok but skips
   expect(grantedColumns.has("terminal_kind")).toBe(true);
 });
 
-test("fails loudly when even the fallback executor cannot materialize migrated columns", async () => {
+test("degrades instead of blocking bootstrap when migrated columns cannot materialize but base schema is usable", async () => {
+  // 2026-07-22 prod outage regression: a failing host-appended migration must
+  // never block feed serving when the base tables still work.
+  const NEW_COLUMNS = /terminal_kind|error_code|published_manifest_ids_json|critic_verdicts_json|generation_strategy|claimed_at|finished_at/;
   const db = {
     migrations: { apply: async () => ({ ok: true }) },
     batch: async () => ({ ok: false, error: MULTI_RESOURCE_ERROR }),
     execute: async () => ({ ok: true }), // pretends to work but grants nothing
+    query: async (sql: string) => (NEW_COLUMNS.test(sql)
+      ? { ok: false, error: { message: "SQLite error: no such column: terminal_kind" } }
+      : { ok: true, data: { columns: [], rows: [], rowCount: 0 } }),
+  };
+  const actor = {
+    artifacts: { sql: { db: () => db } },
+    feed: { sql: { db: () => db } },
+    documents: {
+      kv: {
+        put: async () => ({ ok: true }),
+        get: async () => ({ ok: false, error: { code: "KV_NOT_FOUND", message: "not found" } }),
+      },
+    },
+  } as unknown as FeedHostActorStorage;
+
+  const storage = new FeedHostStorage();
+  await storage.bootstrapSchema(actor); // must not throw
+});
+
+test("fails loudly when the base schema itself is unusable after migration failure", async () => {
+  const db = {
+    migrations: { apply: async () => ({ ok: true }) },
+    batch: async () => ({ ok: false, error: MULTI_RESOURCE_ERROR }),
+    execute: async () => ({ ok: true }),
     query: async (sql: string) => (/FROM\s+generation_request\s+LIMIT 0/i.test(sql)
       ? { ok: false, error: { message: "SQLite error: no such column: terminal_kind" } }
       : { ok: true, data: { columns: [], rows: [], rowCount: 0 } }),
@@ -210,7 +237,44 @@ test("fails loudly when even the fallback executor cannot materialize migrated c
   } as unknown as FeedHostActorStorage;
 
   const storage = new FeedHostStorage();
-  await expect(storage.bootstrapSchema(actor)).rejects.toThrow(/schema verification failed/);
+  await expect(storage.bootstrapSchema(actor)).rejects.toThrow(/schema verification failed|Failed to initialize/);
+});
+
+test("backfills terminal metadata for legacy rows in application code", async () => {
+  const updates: Array<{ sql: string; params: unknown[] }> = [];
+  const db = {
+    query: async (sql: string) => (/WHERE terminal_kind IS NULL/.test(sql)
+      ? {
+          ok: true,
+          data: {
+            columns: ["request_id", "phase", "status", "error_json"],
+            rows: [
+              { request_id: "r1", phase: "published", status: "consumed", error_json: null },
+              { request_id: "r2", phase: "dead_letter", status: "dead_letter", error_json: '{"code":"provider_billing"}' },
+            ],
+            rowCount: 2,
+          },
+        }
+      : { ok: true, data: { columns: [], rows: [], rowCount: 0 } }),
+    execute: async (sql: string, params: unknown[] = []) => {
+      updates.push({ sql, params });
+      return { ok: true, data: { changes: 1 } };
+    },
+  };
+  const actor = {
+    feed: { sql: { db: () => db } },
+    artifacts: { sql: { db: () => db } },
+  } as unknown as FeedHostActorStorage;
+
+  const storage = new FeedHostStorage();
+  const count = await storage.backfillGenerationTerminals(actor);
+
+  expect(count).toBe(2);
+  expect(updates).toHaveLength(2);
+  expect(updates[0]?.params).toEqual(["published", null, "r1"]);
+  expect(updates[1]?.params).toEqual(["dead_letter", "provider_billing", "r2"]);
+  expect(updates.every((update) => /SET terminal_kind = \?/.test(update.sql))).toBe(true);
+  expect(updates.every((update) => !/json_valid|json_extract/.test(update.sql))).toBe(true);
 });
 
 test("converges with the canonical post migration without duplicating it", () => {

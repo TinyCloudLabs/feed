@@ -161,21 +161,10 @@ export const FEED_GENERATION_OBSERVABILITY_MIGRATION: FeedV1SchemaMigration = {
     "ALTER TABLE generation_request ADD COLUMN generation_strategy TEXT",
     "ALTER TABLE generation_request ADD COLUMN claimed_at TEXT",
     "ALTER TABLE generation_request ADD COLUMN finished_at TEXT",
-    `UPDATE generation_request
-        SET terminal_kind = CASE
-              WHEN phase = 'published' THEN 'published'
-              WHEN phase = 'zero_artifacts' THEN 'zero_artifacts'
-              WHEN phase = 'dead_letter' OR status = 'dead_letter' THEN 'dead_letter'
-              ELSE NULL
-            END,
-            error_code = CASE
-              WHEN error_json IS NOT NULL AND json_valid(error_json)
-                THEN json_extract(error_json, '$.code')
-              ELSE NULL
-            END,
-            claimed_at = started_at,
-            finished_at = completed_at
-      WHERE terminal_kind IS NULL`,
+    // The legacy-row backfill deliberately lives in application code
+    // (FeedHostStorage.backfillGenerationTerminals): the node's SQL authorizer
+    // denies json_valid()/json_extract(), and one denied statement no-ops the
+    // whole migration while the ledger records success (TC-265, prod 2026-07-22).
     `CREATE INDEX IF NOT EXISTS generation_request_actor_recent
        ON generation_request (actor_id, updated_at DESC)`,
   ],
