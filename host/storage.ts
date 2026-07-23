@@ -495,13 +495,87 @@ export class FeedHostStorage {
           ? withFeedHostMigrations(plan.migrations)
           : plan.migrations,
       });
-      if (!migrated.ok) throw new Error(`Failed to initialize ${plan.dbName}: ${resultError(migrated)}`);
+      if (!migrated.ok) {
+        // Fail open when the base schema is usable: a failed host-appended
+        // migration must degrade observability, never block feed serving
+        // (2026-07-22 prod outage — bootstrap sat in front of every read).
+        const baseUsable = await this.baseSchemaUsable(db, plan.dbName);
+        if (!baseUsable) throw new Error(`Failed to initialize ${plan.dbName}: ${resultError(migrated)}`);
+        logEvent("error", "schema_migration_degraded", {
+          dbName: plan.dbName,
+          errorMessage: resultError(migrated).slice(0, 300),
+        });
+      }
     }
+    await this.backfillGenerationTerminals(actor);
     await execute(this.db(actor, "feed_index"), FEED_V1_LEGACY_PROJECTION_RECONCILIATION_SQL);
     await execute(this.db(actor, "feed_index"), FEED_V1_PREVIEW_TO_LEGACY_RECONCILIATION_SQL);
     const migrationSummary = await this.migrateLegacyDataHook(actor);
     this.bootstrapped.add(actor);
     return migrationSummary;
+  }
+
+  private async baseSchemaUsable(db: IDatabaseHandle, dbName: string): Promise<boolean> {
+    const probe = db as IDatabaseHandle & {
+      query?: (sql: string) => Promise<{ ok: boolean }>;
+    };
+    if (typeof probe.query !== "function") return false;
+    const sql = dbName === "feed_index"
+      ? "SELECT request_id FROM generation_request LIMIT 0"
+      : "SELECT artifact_id FROM artifact_index LIMIT 0";
+    const result = await probe.query(sql).catch(() => ({ ok: false as const }));
+    return result.ok;
+  }
+
+  /**
+   * Application-code replacement for 004's SQL backfill: the node's SQL
+   * authorizer denies json_valid()/json_extract() (TC-265), so terminal
+   * metadata for legacy rows is computed here with plain parameterized writes.
+   * Best-effort by design — failures degrade observability, nothing else.
+   */
+  async backfillGenerationTerminals(actor: FeedHostActorStorage): Promise<number> {
+    try {
+      const db = this.db(actor, "feed_index");
+      const rows = await queryRows<{
+        request_id: string;
+        phase: string | null;
+        status: string;
+        error_json: string | null;
+      }>(
+        db,
+        `SELECT request_id, phase, status, error_json
+           FROM generation_request
+          WHERE terminal_kind IS NULL
+            AND (phase IN ('published', 'zero_artifacts', 'dead_letter') OR status = 'dead_letter')`,
+      );
+      for (const row of rows) {
+        const terminal = row.phase === "published"
+          ? "published"
+          : row.phase === "zero_artifacts"
+            ? "zero_artifacts"
+            : "dead_letter";
+        const errorCode = parseJson<{ code?: string } | null>(row.error_json, null)?.code ?? null;
+        await execute(
+          db,
+          `UPDATE generation_request
+              SET terminal_kind = ?,
+                  error_code = ?,
+                  claimed_at = COALESCE(claimed_at, started_at),
+                  finished_at = COALESCE(finished_at, completed_at)
+            WHERE request_id = ? AND terminal_kind IS NULL`,
+          [terminal, errorCode, row.request_id],
+        );
+      }
+      if (rows.length > 0) {
+        logEvent("info", "generation_terminal_backfill", { count: rows.length });
+      }
+      return rows.length;
+    } catch (error) {
+      logEvent("warn", "generation_terminal_backfill_failed", {
+        errorMessage: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+      });
+      return 0;
+    }
   }
 
   async reconcileProjectionCompatibility(actor: FeedHostActorStorage): Promise<void> {
