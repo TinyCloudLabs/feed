@@ -249,16 +249,22 @@ describe("Feed Host server", () => {
     expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
   });
 
-  test("alerts-only diagnostics skip generation detail and stay within the monitor budget", async () => {
-    class HangingGenerationStorage extends DiagnosticsFeedHostStorage {
+  test("alerts-only diagnostics never open SQL and stay within the monitor budget", async () => {
+    class HangingSqlStorage extends DiagnosticsFeedHostStorage {
+      queueCalls = 0;
       generationCalls = 0;
+
+      override async queueSummary(): Promise<never> {
+        this.queueCalls += 1;
+        return await new Promise<never>(() => undefined);
+      }
 
       override async generationDiagnostics(): Promise<never> {
         this.generationCalls += 1;
         return await new Promise<never>(() => undefined);
       }
     }
-    const storage = new HangingGenerationStorage();
+    const storage = new HangingSqlStorage();
     runtime = startDiagnosticsHost("diagnostics-test-token", {
       port: 0,
       hostname: "127.0.0.1",
@@ -281,8 +287,12 @@ describe("Feed Host server", () => {
     };
     const aggregate = body.actors[telemetryIdHash(ACTOR_ID)];
     expect(body.detail).toBe("alerts");
-    expect(aggregate.alerts).toBeDefined();
+    expect(aggregate.alerts).toEqual({
+      quarantined: true,
+      workerClaimStale: true,
+    });
     expect(aggregate.recentRequests).toBeUndefined();
+    expect(storage.queueCalls).toBe(0);
     expect(storage.generationCalls).toBe(0);
   });
 
@@ -309,7 +319,7 @@ describe("Feed Host server", () => {
     await grantAllDelegations(runtime, ACTOR_ID);
 
     const requests = Array.from({ length: 3 }, () =>
-      fetch(`${runtime!.url}/admin/diagnostics?detail=alerts`, {
+      fetch(`${runtime!.url}/admin/diagnostics`, {
         headers: { authorization: "Bearer diagnostics-test-token" },
       }));
     const responses = await Promise.all(requests);
