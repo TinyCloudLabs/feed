@@ -112,6 +112,8 @@ export type FeedHostServerOptions = {
   /** Test seams; production reads FEED_PROACTIVE_ACTOR_ID and ticks minutely. */
   proactiveActorId?: string | null;
   proactiveIntervalMs?: number;
+  /** Test seam; production diagnostics must finish before the 15s external probe. */
+  diagnosticsTimeoutMs?: number;
 };
 
 export type FeedHostRuntime = {
@@ -204,6 +206,7 @@ const MIN_WORKER_TOKEN_BYTES = 32;
 const DEFAULT_WORKER_LEASE_SECONDS = 120;
 const DEFAULT_WORKER_MAX_ATTEMPTS = 3;
 export const DELEGATED_ACCESS_TTL_MS = 50 * 60 * 1000;
+const DEFAULT_DIAGNOSTICS_TIMEOUT_MS = 10_000;
 
 const SSE_HEADERS = {
   ...CORS_HEADERS,
@@ -275,6 +278,7 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
   const actorArtifactQueues = new Map<string, Promise<void>>();
   const actorSetupQueues = new Map<string, Promise<void>>();
   const workerClaims = new Map<string, { ts: string; result: string }>();
+  const diagnosticsInFlight = new Map<DiagnosticsDetail, Promise<Record<string, unknown>>>();
   const nowMs = () => (options.now?.() ?? new Date()).getTime();
   const inputAuthorities = new InputAuthorityRegistry();
   const inspectInputAuthority = options.inspectInputAuthority ?? createInputAuthorityInspector(hostNode);
@@ -427,8 +431,27 @@ export function startFeedHost(options: FeedHostServerOptions): FeedHostRuntime {
         if (!bearerTokenMatches(request, diagnosticsToken)) {
           return logRequest(jsonError(401, "unauthorized", "missing or invalid diagnostics bearer token"), "unauthorized");
         }
+        const detail: DiagnosticsDetail = url.searchParams.get("detail") === "alerts" ? "alerts" : "full";
         try {
-          return logRequest(json(await buildDiagnostics(await getContext())));
+          const current = diagnosticsInFlight.get(detail) ?? (() => {
+            const pending = getContext().then((context) => buildDiagnostics(context, detail));
+            diagnosticsInFlight.set(detail, pending);
+            void pending.then(
+              () => {
+                if (diagnosticsInFlight.get(detail) === pending) diagnosticsInFlight.delete(detail);
+              },
+              () => {
+                if (diagnosticsInFlight.get(detail) === pending) diagnosticsInFlight.delete(detail);
+              },
+            );
+            return pending;
+          })();
+          const diagnostics = await withDeadline(
+            current,
+            options.diagnosticsTimeoutMs ?? DEFAULT_DIAGNOSTICS_TIMEOUT_MS,
+            "Feed Host diagnostics timed out",
+          );
+          return logRequest(json(diagnostics));
         } catch (error) {
           return logRequest(mapError(error, url.pathname), "internal_error", error);
         }
@@ -1308,7 +1331,12 @@ function diagnosticsErrorMessage(error: unknown): string {
   return message.slice(0, 500);
 }
 
-async function buildDiagnostics(context: FeedHostContext): Promise<Record<string, unknown>> {
+type DiagnosticsDetail = "alerts" | "full";
+
+async function buildDiagnostics(
+  context: FeedHostContext,
+  detail: DiagnosticsDetail = "full",
+): Promise<Record<string, unknown>> {
   const now = new Date();
   const actorAggregates: Record<string, unknown> = {};
   for (const [actorKey, actor] of context.actors) {
@@ -1319,24 +1347,38 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
     // window into the sealed prod CVM, so a failing query must degrade its own
     // section (with the error text) instead of 500ing the whole endpoint.
     try {
+      const queueStartedAt = performance.now();
       const queue = await context.storage.queueSummary(access, now);
-      let generationSection: Record<string, unknown>;
-      try {
-        const generation = await context.storage.generationDiagnostics(access, 10);
-        generationSection = {
-          recentRequests: generation.recentRequests,
-          deadLetterCount: generation.deadLetterCount,
-          billingBlocked: generation.billingBlocked,
-        };
-      } catch (error) {
-        logEvent("error", "diagnostics_section_failed", {
-          actorHash,
-          section: "generation",
-          errorMessage: diagnosticsErrorMessage(error),
-        });
-        generationSection = {
-          generationError: { code: "diagnostics_generation_failed", message: diagnosticsErrorMessage(error) },
-        };
+      logEvent("info", "diagnostics_section_completed", {
+        actorHash,
+        section: "queue",
+        ms: Math.round(performance.now() - queueStartedAt),
+      });
+      let generationSection: Record<string, unknown> = {};
+      if (detail === "full") {
+        try {
+          const generationStartedAt = performance.now();
+          const generation = await context.storage.generationDiagnostics(access, 10);
+          logEvent("info", "diagnostics_section_completed", {
+            actorHash,
+            section: "generation",
+            ms: Math.round(performance.now() - generationStartedAt),
+          });
+          generationSection = {
+            recentRequests: generation.recentRequests,
+            deadLetterCount: generation.deadLetterCount,
+            billingBlocked: generation.billingBlocked,
+          };
+        } catch (error) {
+          logEvent("error", "diagnostics_section_failed", {
+            actorHash,
+            section: "generation",
+            errorMessage: diagnosticsErrorMessage(error),
+          });
+          generationSection = {
+            generationError: { code: "diagnostics_generation_failed", message: diagnosticsErrorMessage(error) },
+          };
+        }
       }
       const latest = context.storage.latestIntegritySummary(access);
       const integrity = {
@@ -1376,6 +1418,7 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
     expiringSoon: 0,
   };
   return {
+    detail,
     buildSha: context.buildSha,
     feedPackageVersion: feedPackage.version,
     nodeTarget: context.nodeTarget,
@@ -1390,6 +1433,23 @@ async function buildDiagnostics(context: FeedHostContext): Promise<Record<string
     actors: actorAggregates,
     recentEvents: recentHostEvents(),
   };
+}
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new FeedHostError(message, 503, "diagnostics_timeout")),
+          Math.max(1, timeoutMs),
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 function observedNodeIdentity(hostNode: TinyCloudNode, configuredTarget?: string): {
