@@ -1343,6 +1343,28 @@ async function buildDiagnostics(
     if (isDelegationExpired(actor) || !hasCompleteFeedHostDelegation(actor)) continue;
     const access = actorStorage(actor);
     const actorHash = telemetryIdHash(actor.actorId);
+    const latest = context.storage.latestIntegritySummary(access);
+    const integrity = {
+      healthy: latest?.healthy ?? 0,
+      missing: latest?.docMissing ?? 0,
+      quarantined: latest?.quarantined ?? 0,
+    };
+    const claim = context.workerClaims.get(actorKey) ?? null;
+    const claimAgeMs = claim ? now.getTime() - Date.parse(claim.ts) : Number.POSITIVE_INFINITY;
+    if (detail === "alerts") {
+      // Monitoring must never contend with worker traffic for the actor's
+      // single-statement TinyCloud SQL session. Queue-age diagnostics remain
+      // available on detail=full; this fast path reports only in-memory state.
+      actorAggregates[actorHash] = {
+        integrity,
+        lastWorkerClaim: claim,
+        alerts: {
+          quarantined: integrity.quarantined > 0,
+          workerClaimStale: claimAgeMs > 30 * 60 * 1000,
+        },
+      };
+      continue;
+    }
     // Fault-isolate each actor and each section: this endpoint is the only
     // window into the sealed prod CVM, so a failing query must degrade its own
     // section (with the error text) instead of 500ing the whole endpoint.
@@ -1380,16 +1402,8 @@ async function buildDiagnostics(
           };
         }
       }
-      const latest = context.storage.latestIntegritySummary(access);
-      const integrity = {
-        healthy: latest?.healthy ?? 0,
-        missing: latest?.docMissing ?? 0,
-        quarantined: latest?.quarantined ?? 0,
-      };
-      const claim = context.workerClaims.get(actorKey) ?? null;
       const queueNonEmpty = ["accepted", "pending", "retry_wait"]
         .reduce((total, status) => total + (queue.counts[status] ?? 0), 0) > 0;
-      const claimAgeMs = claim ? now.getTime() - Date.parse(claim.ts) : Number.POSITIVE_INFINITY;
       actorAggregates[actorHash] = {
         queue,
         integrity,
