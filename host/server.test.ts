@@ -249,6 +249,76 @@ describe("Feed Host server", () => {
     expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
   });
 
+  test("alerts-only diagnostics skip generation detail and stay within the monitor budget", async () => {
+    class HangingGenerationStorage extends DiagnosticsFeedHostStorage {
+      generationCalls = 0;
+
+      override async generationDiagnostics(): Promise<never> {
+        this.generationCalls += 1;
+        return await new Promise<never>(() => undefined);
+      }
+    }
+    const storage = new HangingGenerationStorage();
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: storage as unknown as FeedHostStorage,
+      delegationStore: fakeDelegationStore(),
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+      proactiveActorId: ACTOR_ID,
+      now: () => new Date(FAKE_NOW),
+      diagnosticsTimeoutMs: 25,
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics?detail=alerts`, {
+      headers: { authorization: "Bearer diagnostics-test-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      detail: string;
+      actors: Record<string, { alerts?: Record<string, boolean>; recentRequests?: unknown[] }>;
+    };
+    const aggregate = body.actors[telemetryIdHash(ACTOR_ID)];
+    expect(body.detail).toBe("alerts");
+    expect(aggregate.alerts).toBeDefined();
+    expect(aggregate.recentRequests).toBeUndefined();
+    expect(storage.generationCalls).toBe(0);
+  });
+
+  test("timed-out diagnostics are bounded and concurrent probes share one build", async () => {
+    class HangingQueueStorage extends DiagnosticsFeedHostStorage {
+      queueCalls = 0;
+
+      override async queueSummary(): Promise<never> {
+        this.queueCalls += 1;
+        return await new Promise<never>(() => undefined);
+      }
+    }
+    const storage = new HangingQueueStorage();
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: storage as unknown as FeedHostStorage,
+      delegationStore: fakeDelegationStore(),
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+      proactiveActorId: ACTOR_ID,
+      now: () => new Date(FAKE_NOW),
+      diagnosticsTimeoutMs: 25,
+    });
+    await grantAllDelegations(runtime, ACTOR_ID);
+
+    const requests = Array.from({ length: 3 }, () =>
+      fetch(`${runtime!.url}/admin/diagnostics?detail=alerts`, {
+        headers: { authorization: "Bearer diagnostics-test-token" },
+      }));
+    const responses = await Promise.all(requests);
+    expect(responses.map((response) => response.status)).toEqual([503, 503, 503]);
+    expect(storage.queueCalls).toBe(1);
+    const body = await responses[0]!.json() as { error?: { code?: string } };
+    expect(body.error?.code).toBe("diagnostics_timeout");
+  });
+
   test("diagnostics report a per-actor error object when the whole actor aggregate fails", async () => {
     class QueueThrowingStorage extends DiagnosticsFeedHostStorage {
       override async queueSummary(): Promise<never> {
