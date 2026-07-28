@@ -3,7 +3,12 @@ import { Database } from "bun:sqlite";
 import type { IDatabaseHandle, SqlValue } from "@tinycloud/node-sdk";
 import type { FeedArtifact, TranscriptSourceRef } from "../../artifactory/skills/_shared/lib/feed-v1.ts";
 import { FEED_GENERATION_OBSERVABILITY_MIGRATION, FEED_GENERATION_WORKER_MIGRATION } from "./feed-schema.ts";
-import { FeedHostStorage, type FeedHostActorStorage } from "./storage.ts";
+import {
+  FeedHostStorage,
+  RECOVERY_ATTEMPT_LIMIT,
+  type FeedHostActorStorage,
+  type FeedHostStorageOptions,
+} from "./storage.ts";
 
 const ACTOR_ID = "did:pkh:eip155:1:0x0000000000000000000000000000000000000abc";
 const T0 = "2026-07-20T00:00:00.000Z";
@@ -336,6 +341,94 @@ describe("generation worker storage", () => {
     expect(diagnostics.billingBlocked).toBe(true);
     queue.close();
   });
+
+  test("publishing reclaims back off with attempts and dead-letter at the recovery limit", async () => {
+    const queue = makeQueue({ deadLetterSweepIntervalMs: 0 });
+    queue.insert("request-stuck");
+    const first = await queue.storage.claimGenerationRequest(queue.actor, claim("workflow-a", "worker-a", T0, T1));
+    await queue.storage.publishGenerationArtifacts(queue.actor, {
+      ...identity(first!), now: T_HALF, publicationKey: "publication-stuck", artifacts: [],
+    });
+    const db = queue.actor.feed.sql.db("xyz.tinycloud.feed/index");
+
+    // Early recovery attempts reclaim as soon as the lease lapses.
+    const second = await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow-a", "worker-b", T2, "2026-07-20T00:03:00.000Z"),
+    );
+    expect(second).toMatchObject({ requestId: "request-stuck", phase: "publishing", attemptCount: 2 });
+
+    // Once attempts accumulate, an expired lease alone is not enough: the
+    // reclaim waits out the backoff window measured from last_attempt_at.
+    await db.execute(
+      `UPDATE generation_request
+          SET attempt_count = 7, lease_expires_at = '2026-07-20T00:04:00.000Z', last_attempt_at = '2026-07-20T00:04:00.000Z'
+        WHERE request_id = 'request-stuck'`,
+    );
+    expect(await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow-a", "worker-b", "2026-07-20T00:06:00.000Z", "2026-07-20T00:08:00.000Z"),
+    )).toBeNull();
+    expect(await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow-a", "worker-b", "2026-07-20T00:09:30.000Z", "2026-07-20T00:11:00.000Z"),
+    )).toMatchObject({ requestId: "request-stuck", attemptCount: 8 });
+
+    // At the recovery limit the request stops being claimable and the sweep
+    // parks it as a terminal dead letter for the repair surface.
+    await db.execute(
+      `UPDATE generation_request
+          SET attempt_count = ${RECOVERY_ATTEMPT_LIMIT}, lease_expires_at = '2026-07-20T00:12:00.000Z', last_attempt_at = '2026-07-20T00:12:00.000Z'
+        WHERE request_id = 'request-stuck'`,
+    );
+    expect(await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow-a", "worker-b", "2026-07-20T02:00:00.000Z", "2026-07-20T02:02:00.000Z"),
+    )).toBeNull();
+    const parked = (await db.query(
+      "SELECT status, phase, terminal_kind, error_code FROM generation_request WHERE request_id = 'request-stuck'",
+    )) as unknown as { data: { rows: Array<Record<string, unknown>> } };
+    expect(parked.data.rows[0]).toMatchObject({
+      status: "dead_letter",
+      phase: "dead_letter",
+      terminal_kind: "dead_letter",
+      error_code: "recovery_attempts_exhausted",
+    });
+    queue.close();
+  });
+
+  test("empty claim polls throttle the dead-letter sweep and queue-summary reads", async () => {
+    const queue = makeQueue();
+    const sweeps = () => queue.queryLog.filter((sql) => sql.includes("SET status = 'dead_letter'")).length;
+    const summaries = () => queue.queryLog.filter((sql) => sql.includes("COUNT(*) AS total")).length;
+
+    await queue.storage.claimGenerationRequest(queue.actor, claim("workflow", "worker", T0, T1));
+    expect(sweeps()).toBe(1);
+    expect(summaries()).toBe(1);
+
+    // A poll inside the interval reuses the janitor pass and the last summary.
+    await queue.storage.claimGenerationRequest(queue.actor, claim("workflow", "worker", T_HALF, T1));
+    expect(sweeps()).toBe(1);
+    expect(summaries()).toBe(1);
+
+    // Past the interval both refresh.
+    await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow", "worker", "2026-07-20T00:06:00.000Z", "2026-07-20T00:07:00.000Z"),
+    );
+    expect(sweeps()).toBe(2);
+    expect(summaries()).toBe(2);
+
+    // A successful claim is a real transition and always emits a fresh summary.
+    queue.insert("request-live", "2026-07-20T00:06:30.000Z");
+    const claimed = await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow", "worker", "2026-07-20T00:06:45.000Z", "2026-07-20T00:08:00.000Z"),
+    );
+    expect(claimed?.requestId).toBe("request-live");
+    expect(summaries()).toBe(3);
+    queue.close();
+  });
 });
 
 function claim(workflowId: string, claimOwner: string, now: string, leaseExpiresAt: string, maxAttempts = 3) {
@@ -383,10 +476,11 @@ function feedArtifact(runId: string, artifactId: string, artifactFingerprint: st
   };
 }
 
-function makeQueue(): {
+function makeQueue(options: FeedHostStorageOptions = {}): {
   storage: FeedHostStorage;
   actor: FeedHostActorStorage;
   documents: Map<string, unknown>;
+  queryLog: string[];
   insert: (requestId: string, createdAt?: string) => void;
   close: () => void;
 } {
@@ -425,17 +519,23 @@ function makeQueue(): {
     checkpoint_id TEXT PRIMARY KEY, source_kind TEXT NOT NULL, artifact_cursor TEXT NOT NULL,
     last_reconciled_at TEXT NOT NULL, status TEXT NOT NULL
   )`);
+  const queryLog: string[] = [];
   const handle = {
     query: async (sql: string, params: SqlValue[] = []) => {
+      queryLog.push(sql);
       const rows = database.query(sql).all(...params) as Record<string, unknown>[];
       return { ok: true, data: { columns: rows[0] ? Object.keys(rows[0]) : [], rows, rowCount: rows.length } };
     },
     execute: async (sql: string, params: SqlValue[] = []) => {
+      queryLog.push(sql);
       const result = database.query(sql).run(...params);
       return { ok: true, data: { changes: result.changes } };
     },
     batch: async (statements: Array<{ sql: string; params?: SqlValue[] }>) => {
-      for (const statement of statements) database.query(statement.sql).run(...(statement.params ?? []));
+      for (const statement of statements) {
+        queryLog.push(statement.sql);
+        database.query(statement.sql).run(...(statement.params ?? []));
+      }
       return { ok: true, data: [] };
     },
   } as unknown as IDatabaseHandle;
@@ -451,7 +551,7 @@ function makeQueue(): {
   };
   const actor = { actorId: ACTOR_ID, feed: access, artifacts: access, settings: access, documents: access } as unknown as FeedHostActorStorage;
   return {
-    storage: new FeedHostStorage(), actor, documents,
+    storage: new FeedHostStorage(options), actor, documents, queryLog,
     insert: (requestId, createdAt = T0) => {
       database.query(`INSERT INTO generation_request (
         request_id, reader_nonce, actor_id, status, scope_json, prompt,

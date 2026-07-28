@@ -89,6 +89,14 @@ export class ProactiveDailyScheduler {
   private async ensure(actorId: string, now: Date): Promise<ProactiveResult> {
     const slot = utcDailySlot(now);
     const actorHash = telemetryIdHash(actorId);
+    if (this.state.lastEnsuredSlot === slot && this.state.lastResult === "ok") {
+      // The durable dedupe row cannot change once ensured for the slot, so
+      // re-reading it every tick would spend a TinyCloud SQL invocation per
+      // minute for a constant answer. Restarts drop this memo; the first tick
+      // of a new process still checks durably.
+      this.log("info", "proactive_enqueue", { actorHash, slot, resultCode: "ok" });
+      return "ok";
+    }
     let result: ProactiveResult;
     let errorCode: string | undefined;
     try {

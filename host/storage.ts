@@ -380,6 +380,11 @@ export type FeedHostStorageOptions = {
   // Intake backpressure: reject new generation requests once an actor has this
   // many live (accepted/pending, unexpired) requests waiting for a worker.
   maxPendingGenerationRequests?: number;
+  // Every claim-path statement is a signed TinyCloud SQL invocation against
+  // the prod node, so janitorial work runs at most once per interval per
+  // actor. Tests may pass 0 to run it on every claim.
+  deadLetterSweepIntervalMs?: number;
+  queueSummaryEmitIntervalMs?: number;
 };
 
 export type FeedProjectionParity = {
@@ -464,6 +469,47 @@ function storageCacheKey(actor: FeedHostActorStorage): string {
   return normalizeActorId(actor.actorId);
 }
 
+/**
+ * Publishing/reconciling requests are exempt from `max_attempts` so a crashed
+ * worker's publication is always reconciled — but the exemption must still
+ * terminate. Without a bound, a request whose publish/reconcile fails
+ * persistently (e.g. node-side timeouts) is reclaimed every lease expiry
+ * forever; prod hit 124 and 536 attempts on single requests. Reclaims back
+ * off as attempts accumulate and stop at this limit, where the sweep
+ * dead-letters the request with `error_code = 'recovery_attempts_exhausted'`.
+ * With the backoff schedule the limit spans roughly two days of wall time.
+ */
+export const RECOVERY_ATTEMPT_LIMIT = 60;
+
+const DEFAULT_DEAD_LETTER_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_QUEUE_SUMMARY_EMIT_INTERVAL_MS = 5 * 60 * 1000;
+
+// Days between now and last_attempt_at that must elapse before a
+// publishing/reconciling request may be reclaimed again.
+const RECOVERY_RECLAIM_BACKOFF_DAYS_SQL = `(CASE
+  WHEN attempt_count < 5 THEN 0.0
+  WHEN attempt_count < 10 THEN 300.0
+  WHEN attempt_count < 15 THEN 1800.0
+  ELSE 3600.0
+END) / 86400.0`;
+
+// Shared between the candidate SELECT and the fenced claim UPDATE so the two
+// conditions can never drift. Placeholders, in order, all bind `input.now`:
+// next_retry_at bound, expired-lease bound (capped branch), expired-lease
+// bound (recovery branch), backoff clock.
+const CLAIMABLE_CONDITION_SQL = `(
+            (attempt_count < max_attempts AND (
+              status = 'accepted'
+              OR (status = 'retry_wait' AND next_retry_at <= ?)
+              OR (status = 'pending' AND lease_expires_at <= ? AND phase NOT IN ('publishing', 'reconciling'))
+            ))
+            OR (
+              status = 'pending' AND lease_expires_at <= ? AND phase IN ('publishing', 'reconciling')
+              AND attempt_count < ${RECOVERY_ATTEMPT_LIMIT}
+              AND (last_attempt_at IS NULL OR julianday(?) - julianday(last_attempt_at) >= ${RECOVERY_RECLAIM_BACKOFF_DAYS_SQL})
+            )
+          )`;
+
 function isQuarantinedProjection(row: FeedProjectionState): boolean {
   return row.visibility === "repair_only" || row.reasonCodes.includes("broken_ref");
 }
@@ -474,14 +520,20 @@ export class FeedHostStorage {
   private readonly feedbackCache = new Map<string, FeedbackRow[]>();
   private readonly preferenceCache = new Map<string, FeedPreferenceProfileRecord[]>();
   private readonly latestIntegrity = new Map<string, FeedIntegritySummary>();
+  private readonly lastDeadLetterSweepAt = new Map<string, number>();
+  private readonly lastQueueSummaryEmitAt = new Map<string, number>();
   private readonly migrateLegacyDataHook: (actor: FeedHostActorStorage) => Promise<FeedV1MigrationSummary>;
   private readonly maxPendingGenerationRequests: number;
+  private readonly deadLetterSweepIntervalMs: number;
+  private readonly queueSummaryEmitIntervalMs: number;
 
   constructor(options: FeedHostStorageOptions = {}) {
     this.migrateLegacyDataHook = options.migrateLegacyData ?? ((actor) => this.performLegacyMigration(actor));
     this.maxPendingGenerationRequests =
       options.maxPendingGenerationRequests ??
       Number(process.env.FEED_HOST_MAX_PENDING_GENERATION ?? DEFAULT_MAX_PENDING_GENERATION_REQUESTS);
+    this.deadLetterSweepIntervalMs = options.deadLetterSweepIntervalMs ?? DEFAULT_DEAD_LETTER_SWEEP_INTERVAL_MS;
+    this.queueSummaryEmitIntervalMs = options.queueSummaryEmitIntervalMs ?? DEFAULT_QUEUE_SUMMARY_EMIT_INTERVAL_MS;
   }
 
   async bootstrapSchema(actor: FeedHostActorStorage): Promise<FeedV1MigrationSummary> {
@@ -1259,28 +1311,35 @@ export class FeedHostStorage {
   ): Promise<FeedGenerationRequestRecord | null> {
     const actorId = normalizeActorId(actor.actorId);
     const db = this.db(actor, "feed_index");
-    await execute(
-      db,
-      `UPDATE generation_request
-          SET status = 'dead_letter', phase = 'dead_letter', terminal_kind = 'dead_letter',
-              completed_at = ?, finished_at = ?, lease_expires_at = NULL, updated_at = ?
-        WHERE actor_id = ? AND status = 'pending' AND lease_expires_at <= ?
-          AND attempt_count >= max_attempts AND phase NOT IN ('publishing', 'reconciling')`,
-      [input.now, input.now, input.now, actorId, input.now],
-    );
+    // Janitor, not per-poll work: dead-letters exhausted rows whose worker
+    // died without reporting. Worker-reported failures dead-letter through
+    // retryGenerationRequest immediately, so throttling this only delays the
+    // crashed-worker path by at most the sweep interval.
+    const nowMs = new Date(input.now).getTime();
+    const sweepKey = storageCacheKey(actor);
+    const sweptAt = this.lastDeadLetterSweepAt.get(sweepKey);
+    if (sweptAt === undefined || nowMs - sweptAt >= this.deadLetterSweepIntervalMs) {
+      this.lastDeadLetterSweepAt.set(sweepKey, nowMs);
+      await execute(
+        db,
+        `UPDATE generation_request
+            SET status = 'dead_letter', phase = 'dead_letter', terminal_kind = 'dead_letter',
+                error_code = CASE WHEN phase IN ('publishing', 'reconciling')
+                                  THEN 'recovery_attempts_exhausted' ELSE error_code END,
+                completed_at = ?, finished_at = ?, lease_expires_at = NULL, updated_at = ?
+          WHERE actor_id = ? AND status = 'pending' AND lease_expires_at <= ?
+            AND ((attempt_count >= max_attempts AND phase NOT IN ('publishing', 'reconciling'))
+              OR (attempt_count >= ${RECOVERY_ATTEMPT_LIMIT} AND phase IN ('publishing', 'reconciling')))`,
+        [input.now, input.now, input.now, actorId, input.now],
+      );
+    }
     for (let attempt = 0; attempt < 3; attempt += 1) {
       const rows = await queryRows<GenerationRequestRow>(
         db,
         `SELECT ${GENERATION_REQUEST_COLUMNS}
            FROM generation_request AS candidate
-          WHERE actor_id = ? AND expires_at > ? AND (workflow_id IS NULL OR workflow_id = ?) AND (
-            (attempt_count < max_attempts AND (
-              status = 'accepted'
-              OR (status = 'retry_wait' AND next_retry_at <= ?)
-              OR (status = 'pending' AND lease_expires_at <= ? AND phase NOT IN ('publishing', 'reconciling'))
-            ))
-            OR (status = 'pending' AND lease_expires_at <= ? AND phase IN ('publishing', 'reconciling'))
-          )
+          WHERE actor_id = ? AND expires_at > ? AND (workflow_id IS NULL OR workflow_id = ?)
+          AND ${CLAIMABLE_CONDITION_SQL}
           AND NOT EXISTS (
             SELECT 1 FROM generation_request AS inflight
              WHERE inflight.actor_id = candidate.actor_id
@@ -1291,11 +1350,11 @@ export class FeedHostStorage {
           )
           ORDER BY created_at ASC
           LIMIT 1`,
-        [actorId, input.now, input.workflowId, input.now, input.now, input.now, input.workflowId, input.now],
+        [actorId, input.now, input.workflowId, input.now, input.now, input.now, input.now, input.workflowId, input.now],
       );
       const row = rows[0];
       if (!row) {
-        await this.emitQueueSummary(actor, new Date(input.now));
+        await this.maybeEmitQueueSummary(actor, new Date(input.now));
         return null;
       }
       const changes = await execute(
@@ -1322,14 +1381,8 @@ export class FeedHostStorage {
                 started_at = COALESCE(started_at, ?), claimed_at = COALESCE(claimed_at, ?),
                 last_attempt_at = ?, updated_at = ?
           WHERE actor_id = ? AND request_id = ? AND fencing_token = ? AND expires_at > ?
-            AND (workflow_id IS NULL OR workflow_id = ?) AND (
-              (attempt_count < max_attempts AND (
-                status = 'accepted'
-                OR (status = 'retry_wait' AND next_retry_at <= ?)
-                OR (status = 'pending' AND lease_expires_at <= ? AND phase NOT IN ('publishing', 'reconciling'))
-              ))
-              OR (status = 'pending' AND lease_expires_at <= ? AND phase IN ('publishing', 'reconciling'))
-            )
+            AND (workflow_id IS NULL OR workflow_id = ?)
+            AND ${CLAIMABLE_CONDITION_SQL}
             AND NOT EXISTS (
               SELECT 1 FROM generation_request AS inflight
                WHERE inflight.actor_id = generation_request.actor_id
@@ -1357,6 +1410,7 @@ export class FeedHostStorage {
           input.now,
           input.now,
           input.now,
+          input.now,
           input.workflowId,
           input.now,
         ],
@@ -1367,7 +1421,7 @@ export class FeedHostStorage {
         return claimed;
       }
     }
-    await this.emitQueueSummary(actor, new Date(input.now));
+    await this.maybeEmitQueueSummary(actor, new Date(input.now));
     return null;
   }
 
@@ -2243,11 +2297,21 @@ export class FeedHostStorage {
   }
 
   private async emitQueueSummary(actor: FeedHostActorStorage, now: Date = new Date()): Promise<void> {
+    this.lastQueueSummaryEmitAt.set(storageCacheKey(actor), now.getTime());
     const summary = await this.queueSummary(actor, now);
     logEvent("info", "queue_summary", {
       ...summary,
       actorHash: telemetryIdHash(actor.actorId),
     });
+  }
+
+  // Empty and contended claim polls arrive at worker cadence; summarizing the
+  // queue costs TinyCloud SQL reads, so those polls only refresh the summary
+  // when the last emission is stale. Real transitions emit unconditionally.
+  private async maybeEmitQueueSummary(actor: FeedHostActorStorage, now: Date): Promise<void> {
+    const emittedAt = this.lastQueueSummaryEmitAt.get(storageCacheKey(actor));
+    if (emittedAt !== undefined && now.getTime() - emittedAt < this.queueSummaryEmitIntervalMs) return;
+    await this.emitQueueSummary(actor, now);
   }
 
   private async findFeedbackEvent(actor: FeedHostActorStorage, actorId: string, readerNonce: string): Promise<{ eventId: string } | null> {
