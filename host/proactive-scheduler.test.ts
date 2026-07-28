@@ -156,6 +156,38 @@ test("backlog cap is reported as skipped and later ticks can retry", async () =>
   }
 });
 
+test("an ensured slot is served from memory until the day rolls over", async () => {
+  const queue = realQueue();
+  const clock = { value: new Date("2026-07-21T12:00:00.000Z") };
+  const logs: Array<Record<string, unknown>> = [];
+  let ensureCalls = 0;
+  const daily = new ProactiveDailyScheduler({
+    actorId: ACTOR_ID,
+    now: () => clock.value,
+    ensureRequest: async (event) => {
+      ensureCalls += 1;
+      return ensureProactiveGenerationRequest(queue.storage, queue.actor, event);
+    },
+    log: (_level, event, fields) => logs.push({ event, ...fields }),
+  });
+  try {
+    expect(await daily.ensureCurrentSlot()).toBe("ok");
+    expect(await daily.ensureCurrentSlot()).toBe("ok");
+    // The second tick answers from the memo — no durable dedupe read — but
+    // still reports its result.
+    expect(ensureCalls).toBe(1);
+    expect(logs).toHaveLength(2);
+    expect(logs.every((entry) => entry.event === "proactive_enqueue" && entry.resultCode === "ok")).toBe(true);
+
+    clock.value = new Date("2026-07-22T00:00:05.000Z");
+    expect(await daily.ensureCurrentSlot()).toBe("ok");
+    expect(ensureCalls).toBe(2);
+    expect(requestCount(queue.db)).toBe(2);
+  } finally {
+    queue.close();
+  }
+});
+
 test("disabled scheduler performs no writes", async () => {
   const queue = realQueue();
   let calls = 0;
