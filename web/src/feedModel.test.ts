@@ -89,14 +89,23 @@ describe("Feed v1 model helpers", () => {
     expect(started).toEqual(["first", "third", "second"]);
   });
 
-  test("sorts by rank and then recency", () => {
+  test("sorts by recency first so rank recomputation never reshuffles the feed", () => {
     expect(
       sortedFeed([
         item("old", 10, "2026-06-27T10:00:00.000Z"),
         item("new", 10, "2026-06-28T10:00:00.000Z"),
         item("top", 20, "2026-06-26T10:00:00.000Z"),
       ]).map((feedItem) => feedItem.projection.target.artifactId),
-    ).toEqual(["top", "new", "old"]);
+    ).toEqual(["new", "old", "top"]);
+  });
+
+  test("rank breaks ties only within the same publish instant", () => {
+    expect(
+      sortedFeed([
+        item("lower", 5, "2026-06-28T10:00:00.000Z"),
+        item("higher", 9, "2026-06-28T10:00:00.000Z"),
+      ]).map((feedItem) => feedItem.projection.target.artifactId),
+    ).toEqual(["higher", "lower"]);
   });
 
   test("extracts readable artifact body previews", () => {
