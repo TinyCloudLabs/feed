@@ -711,7 +711,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       void ensureActorReady(storage, actor, seedOnStart)
         .then(() => {
           if (context.proactiveScheduler.targetsActor(actor.actorId)) {
-            return context.proactiveScheduler.ensureCurrentSlot();
+            return context.proactiveScheduler.resumeAfterDelegationAccept();
           }
           return undefined;
         })
@@ -1338,6 +1338,7 @@ async function buildDiagnostics(
   detail: DiagnosticsDetail = "full",
 ): Promise<Record<string, unknown>> {
   const now = new Date();
+  const proactiveScheduler = context.proactiveScheduler.snapshot();
   const actorAggregates: Record<string, unknown> = {};
   for (const [actorKey, actor] of context.actors) {
     if (isDelegationExpired(actor) || !hasCompleteFeedHostDelegation(actor)) continue;
@@ -1361,6 +1362,8 @@ async function buildDiagnostics(
         alerts: {
           quarantined: integrity.quarantined > 0,
           workerClaimStale: claimAgeMs > 30 * 60 * 1000,
+          delegationExpiringSoon: delegationExpiresSoon(actor, now),
+          delegationExpired: proactiveScheduler.pausedForExpiry && proactiveScheduler.actorHash === actorHash,
         },
       };
       continue;
@@ -1413,6 +1416,8 @@ async function buildDiagnostics(
           quarantined: integrity.quarantined > 0,
           oldestAccepted: queue.oldestAcceptedAgeSec > 3600,
           workerClaimStale: queueNonEmpty && claimAgeMs > 30 * 60 * 1000,
+          delegationExpiringSoon: delegationExpiresSoon(actor, now),
+          delegationExpired: proactiveScheduler.pausedForExpiry && proactiveScheduler.actorHash === actorHash,
         },
       };
     } catch (error) {
@@ -1431,6 +1436,17 @@ async function buildDiagnostics(
     resources: 0,
     expiringSoon: 0,
   };
+  if (detail === "alerts" && proactiveScheduler.pausedForExpiry && proactiveScheduler.actorHash) {
+    const aggregate = actorAggregates[proactiveScheduler.actorHash] as { alerts?: Record<string, boolean> } | undefined;
+    actorAggregates[proactiveScheduler.actorHash] = {
+      ...aggregate,
+      alerts: {
+        ...(aggregate?.alerts ?? {}),
+        delegationExpiringSoon: false,
+        delegationExpired: true,
+      },
+    };
+  }
   return {
     detail,
     buildSha: context.buildSha,
@@ -1443,10 +1459,19 @@ async function buildDiagnostics(
       resources: delegationStats.resources,
       expiringSoonCount: delegationStats.expiringSoon,
     },
-    proactiveScheduler: context.proactiveScheduler.snapshot(),
+    proactiveScheduler,
+    alerts: {
+      delegationExpiringSoon: delegationStats.expiringSoon > 0,
+      delegationExpired: proactiveScheduler.pausedForExpiry,
+    },
     actors: actorAggregates,
     recentEvents: recentHostEvents(),
   };
+}
+
+function delegationExpiresSoon(actor: Pick<ActorState, "expiresAt">, now: Date): boolean {
+  const expiry = Date.parse(actor.expiresAt);
+  return Number.isFinite(expiry) && expiry > now.getTime() && expiry <= now.getTime() + 24 * 60 * 60 * 1000;
 }
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

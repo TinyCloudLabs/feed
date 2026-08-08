@@ -1,18 +1,21 @@
 import type { FeedControlIntentInput } from "./logic.ts";
+import { FeedDelegationError } from "./delegation.ts";
 import { logEvent, type FeedHostLogFields } from "./log.ts";
 import { telemetryIdHash } from "./observability.ts";
 import type { FeedHostActorStorage, FeedHostStorage } from "./storage.ts";
 
 export const PROACTIVE_INTERVAL_MS = 60_000;
+export const PROACTIVE_EXPIRED_RETRY_MS = 60 * 60 * 1000;
 export const PROACTIVE_PROMPT = "Generate something useful from my latest authorized context.";
 
-export type ProactiveResult = "ok" | "skipped_backlog" | "error";
+export type ProactiveResult = "ok" | "skipped_backlog" | "paused_expired" | "error";
 
 export type ProactiveSchedulerState = {
   enabled: boolean;
   actorHash: string | null;
   lastEnsuredSlot: string | null;
   lastResult: ProactiveResult | null;
+  pausedForExpiry: boolean;
 };
 
 type EnsureResponse = {
@@ -40,6 +43,7 @@ export class ProactiveDailyScheduler {
   private readonly log: NonNullable<ProactiveSchedulerOptions["log"]>;
   private timer: ReturnType<typeof setInterval> | null = null;
   private inFlight: Promise<ProactiveResult | "disabled"> | null = null;
+  private expiryRetryAtMs: number | null = null;
   private state: ProactiveSchedulerState;
 
   constructor(options: ProactiveSchedulerOptions) {
@@ -53,6 +57,7 @@ export class ProactiveDailyScheduler {
       actorHash: this.actorId ? telemetryIdHash(this.actorId) : null,
       lastEnsuredSlot: null,
       lastResult: null,
+      pausedForExpiry: false,
     };
   }
 
@@ -78,12 +83,24 @@ export class ProactiveDailyScheduler {
   ensureCurrentSlot(): Promise<ProactiveResult | "disabled"> {
     if (!this.actorId) return Promise.resolve("disabled");
     if (this.inFlight) return this.inFlight;
-    const attempt = this.ensure(this.actorId, this.now());
+    const now = this.now();
+    if (this.expiryRetryAtMs !== null && now.getTime() < this.expiryRetryAtMs) {
+      return Promise.resolve("paused_expired");
+    }
+    const attempt = this.ensure(this.actorId, now);
     const tracked = attempt.finally(() => {
       if (this.inFlight === tracked) this.inFlight = null;
     });
     this.inFlight = tracked;
     return this.inFlight;
+  }
+
+  async resumeAfterDelegationAccept(): Promise<ProactiveResult | "disabled"> {
+    if (!this.actorId) return "disabled";
+    await this.inFlight?.catch(() => undefined);
+    this.expiryRetryAtMs = null;
+    this.state.pausedForExpiry = false;
+    return this.ensureCurrentSlot();
   }
 
   private async ensure(actorId: string, now: Date): Promise<ProactiveResult> {
@@ -103,11 +120,28 @@ export class ProactiveDailyScheduler {
       await this.ensureRequest(proactiveControlIntent(actorId, now));
       result = "ok";
       this.state.lastEnsuredSlot = slot;
+      this.expiryRetryAtMs = null;
+      this.state.pausedForExpiry = false;
     } catch (error) {
       errorCode = safeErrorCode(error);
-      result = errorCode === "generation_backlog_full" ? "skipped_backlog" : "error";
+      if (error instanceof FeedDelegationError && error.code === "expired") {
+        result = "paused_expired";
+        this.expiryRetryAtMs = now.getTime() + PROACTIVE_EXPIRED_RETRY_MS;
+        this.state.pausedForExpiry = true;
+      } else {
+        result = errorCode === "generation_backlog_full" ? "skipped_backlog" : "error";
+      }
     }
     this.state.lastResult = result;
+    if (result === "paused_expired") {
+      this.log("warn", "proactive_paused_expired", {
+        actorHash,
+        slot,
+        resultCode: result,
+        errorCode,
+      });
+      return result;
+    }
     this.log(result === "error" ? "error" : result === "skipped_backlog" ? "warn" : "info", "proactive_enqueue", {
       actorHash,
       slot,
