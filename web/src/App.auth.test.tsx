@@ -217,6 +217,7 @@ async function settle(): Promise<void> {
 function authDependencies(overrides: Partial<AppAuthDependencies> = {}): AppAuthDependencies {
   return {
     attachReceivedInputAuthority: async () => undefined,
+    renewFeedHostDelegation: async () => "renewed" as const,
     restoreSession: async () => ({ address: "0xfeed", readerDid: "did:key:zReader" }),
     signIn: async () => ({ address: "0xfeed", readerDid: "did:key:zReader" }),
     signOut: async () => undefined,
@@ -271,6 +272,92 @@ async function clickButton(container: TestElement, label: string): Promise<void>
   await act(async () => props.onClick?.());
   await settle();
 }
+
+describe("rolling delegation renewal", () => {
+  test("a readable restored session renews its delegation without resubmitting setup", async () => {
+    let renewals = 0;
+    let submissions = 0;
+    const auth = authDependencies({
+      renewFeedHostDelegation: async () => {
+        renewals += 1;
+        return "renewed" as const;
+      },
+      submitFeedHostDelegations: async () => {
+        submissions += 1;
+        return [];
+      },
+    });
+    const client = hostClient({
+      getFeedEvents: async () => ({ text: "" }),
+      listFeed: async () => ({ items: [] }),
+    });
+
+    const { container, root } = await renderApp(auth, client);
+
+    expect(renewals).toBe(1);
+    expect(submissions).toBe(0);
+    expect(container.textContent).toContain("Menu");
+
+    await unmount(root);
+  });
+
+  test("a session-scope renewal failure falls back to the reconnect path", async () => {
+    let signOuts = 0;
+    const auth = authDependencies({
+      renewFeedHostDelegation: async () => {
+        throw new FeedReconnectRequiredError(new Error("SessionExpiredError"));
+      },
+      signOut: async () => { signOuts += 1; },
+    });
+    const client = hostClient({
+      getFeedEvents: async () => ({ text: "" }),
+      listFeed: async () => ({ items: [] }),
+    });
+
+    const { container, root } = await renderApp(auth, client);
+
+    expect(signOuts).toBe(1);
+    expect(container.textContent).toContain("Sign in to reconnect");
+
+    await unmount(root);
+  });
+
+  test("sign-out waits for renewal before removing the host delegation", async () => {
+    let finishRenewal!: () => void;
+    const renewal = new Promise<void>((resolve) => { finishRenewal = resolve; });
+    const order: string[] = [];
+    let signOuts = 0;
+    const auth = authDependencies({
+      renewFeedHostDelegation: async () => {
+        await renewal;
+        order.push("renewed");
+        return "renewed" as const;
+      },
+      signOut: async () => { signOuts += 1; },
+    });
+    const client = hostClient({
+      disconnectFeed: async () => { order.push("disconnected"); },
+      getFeedEvents: async () => ({ text: "" }),
+      listFeed: async () => ({ items: [] }),
+    });
+
+    const { container, root } = await renderApp(auth, client);
+    await clickButton(container, "Menu");
+    await clickButton(container, "Sign out");
+
+    expect(order).toEqual([]);
+    expect(signOuts).toBe(0);
+
+    finishRenewal();
+    await settle();
+
+    expect(order).toEqual(["renewed", "disconnected"]);
+    expect(signOuts).toBe(1);
+    expect(container.textContent).toContain("Sign in with OpenKey");
+
+    await unmount(root);
+  });
+});
 
 describe("sign-in recovery UI", () => {
   test("labels only diagnosed stale sessions as reconnects", () => {
