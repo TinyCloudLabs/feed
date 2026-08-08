@@ -8,11 +8,12 @@ import {
   type AppAuthDependencies,
 } from "./App.tsx";
 import {
+  DELEGATION_RECONNECT_MESSAGE,
   FeedReconnectRequiredError,
   MISSING_PARENT_RECONNECT_MESSAGE,
 } from "./authPolicy.ts";
 import type { FeedHostDelegationPolicy, FeedHostSetupStatus } from "./delegation.ts";
-import type { FeedV1HostClient } from "./feedV1HostClient.ts";
+import { FeedV1HostError, type FeedV1HostClient } from "./feedV1HostClient.ts";
 
 const POLICY: FeedHostDelegationPolicy = {
   delegateDID: "did:key:zFeedHost",
@@ -317,6 +318,37 @@ describe("rolling delegation renewal", () => {
     const { container, root } = await renderApp(auth, client);
 
     expect(signOuts).toBe(1);
+    expect(container.textContent).toContain(DELEGATION_RECONNECT_MESSAGE);
+    expect(container.textContent).toContain("Sign in to reconnect");
+
+    await unmount(root);
+  });
+
+  test("an unrecoverable expired host delegation proactively opens reconnect UI", async () => {
+    let submissions = 0;
+    let signOuts = 0;
+    const auth = authDependencies({
+      submitFeedHostDelegations: async () => {
+        submissions += 1;
+        throw new FeedReconnectRequiredError(new Error("SessionExpiredError"));
+      },
+      signOut: async () => { signOuts += 1; },
+    });
+    const client = hostClient({
+      listFeed: async () => {
+        throw new FeedV1HostError(
+          "Feed Host request failed: 409",
+          409,
+          JSON.stringify({ error: { code: "delegation_stale", message: "accepted delegation has expired" } }),
+        );
+      },
+    });
+
+    const { container, root } = await renderApp(auth, client);
+
+    expect(submissions).toBe(1);
+    expect(signOuts).toBe(1);
+    expect(container.textContent).toContain(DELEGATION_RECONNECT_MESSAGE);
     expect(container.textContent).toContain("Sign in to reconnect");
 
     await unmount(root);

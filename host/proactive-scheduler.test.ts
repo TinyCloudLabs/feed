@@ -5,10 +5,12 @@ import { feedV1MigrationApplyPlans } from "../../artifactory/skills/_shared/lib/
 import { withFeedHostMigrations } from "./feed-schema.ts";
 import {
   ensureProactiveGenerationRequest,
+  PROACTIVE_EXPIRED_RETRY_MS,
   proactiveDedupeKey,
   ProactiveDailyScheduler,
   PROACTIVE_PROMPT,
 } from "./proactive-scheduler.ts";
+import { FeedDelegationError } from "./delegation.ts";
 import { FeedHostStorage, type FeedHostActorStorage } from "./storage.ts";
 
 const ACTOR_ID = "did:pkh:eip155:1:0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
@@ -206,6 +208,7 @@ test("disabled scheduler performs no writes", async () => {
       actorHash: null,
       lastEnsuredSlot: null,
       lastResult: null,
+      pausedForExpiry: false,
     });
     expect(calls).toBe(0);
     expect(requestCount(queue.db)).toBe(0);
@@ -216,4 +219,53 @@ test("disabled scheduler performs no writes", async () => {
     daily.stop();
     queue.close();
   }
+});
+
+test("expired delegation pauses minute retries, backs off hourly, and logs a distinct event", async () => {
+  let now = new Date("2026-07-21T08:00:00.000Z");
+  let calls = 0;
+  const logs: Array<Record<string, unknown>> = [];
+  const daily = new ProactiveDailyScheduler({
+    actorId: ACTOR_ID,
+    now: () => now,
+    ensureRequest: async () => {
+      calls += 1;
+      throw new FeedDelegationError("accepted delegation has expired", "expired");
+    },
+    log: (_level, event, fields) => logs.push({ event, ...fields }),
+  });
+
+  expect(await daily.ensureCurrentSlot()).toBe("paused_expired");
+  expect(daily.snapshot()).toMatchObject({ lastResult: "paused_expired", pausedForExpiry: true });
+  expect(calls).toBe(1);
+
+  now = new Date(now.getTime() + PROACTIVE_EXPIRED_RETRY_MS - 1);
+  expect(await daily.ensureCurrentSlot()).toBe("paused_expired");
+  expect(calls).toBe(1);
+
+  now = new Date(now.getTime() + 1);
+  expect(await daily.ensureCurrentSlot()).toBe("paused_expired");
+  expect(calls).toBe(2);
+  expect(logs).toHaveLength(2);
+  expect(logs.every((entry) => entry.event === "proactive_paused_expired")).toBe(true);
+  expect(JSON.stringify(logs)).not.toContain(ACTOR_ID);
+});
+
+test("accepted delegation clears the expiry pause and immediately retries the current slot", async () => {
+  const now = new Date("2026-07-21T08:00:00.000Z");
+  let calls = 0;
+  const daily = new ProactiveDailyScheduler({
+    actorId: ACTOR_ID,
+    now: () => now,
+    ensureRequest: async () => {
+      calls += 1;
+      if (calls === 1) throw new FeedDelegationError("accepted delegation has expired", "expired");
+      return {};
+    },
+  });
+
+  expect(await daily.ensureCurrentSlot()).toBe("paused_expired");
+  expect(await daily.resumeAfterDelegationAccept()).toBe("ok");
+  expect(calls).toBe(2);
+  expect(daily.snapshot()).toMatchObject({ lastResult: "ok", pausedForExpiry: false });
 });

@@ -156,7 +156,9 @@ describe("Feed Host server", () => {
         actorHash: string | null;
         lastEnsuredSlot: string | null;
         lastResult: string | null;
+        pausedForExpiry: boolean;
       };
+      alerts: { delegationExpiringSoon: boolean; delegationExpired: boolean };
       actors: Record<string, {
         queue: { counts: Record<string, number>; oldestAcceptedAgeSec: number };
         integrity: { healthy: number; missing: number; quarantined: number };
@@ -173,7 +175,13 @@ describe("Feed Host server", () => {
         }>;
         deadLetterCount: number;
         billingBlocked: boolean;
-        alerts: { quarantined: boolean; oldestAccepted: boolean; workerClaimStale: boolean };
+        alerts: {
+          quarantined: boolean;
+          oldestAccepted: boolean;
+          workerClaimStale: boolean;
+          delegationExpiringSoon: boolean;
+          delegationExpired: boolean;
+        };
       }>;
       recentEvents: Array<{ event: string; actorHash?: string }>;
     };
@@ -193,7 +201,13 @@ describe("Feed Host server", () => {
       }],
       deadLetterCount: 2,
       billingBlocked: true,
-      alerts: { quarantined: true, oldestAccepted: true, workerClaimStale: true },
+      alerts: {
+        quarantined: true,
+        oldestAccepted: true,
+        workerClaimStale: true,
+        delegationExpiringSoon: true,
+        delegationExpired: false,
+      },
     });
     expect(body.delegationStore.actors).toBe(1);
     expect(body.delegationStore.resources).toBeGreaterThan(0);
@@ -203,7 +217,9 @@ describe("Feed Host server", () => {
       actorHash,
       lastEnsuredSlot: FAKE_NOW.slice(0, 10),
       lastResult: "ok",
+      pausedForExpiry: false,
     });
+    expect(body.alerts).toEqual({ delegationExpiringSoon: true, delegationExpired: false });
     expect(body.buildSha).toBe("dev");
     expect(typeof body.nodeVersion).toBe("string");
     expect(Array.isArray(body.recentEvents)).toBe(true);
@@ -283,6 +299,7 @@ describe("Feed Host server", () => {
     expect(response.status).toBe(200);
     const body = await response.json() as {
       detail: string;
+      alerts: { delegationExpiringSoon: boolean; delegationExpired: boolean };
       actors: Record<string, { alerts?: Record<string, boolean>; recentRequests?: unknown[] }>;
     };
     const aggregate = body.actors[telemetryIdHash(ACTOR_ID)];
@@ -290,10 +307,54 @@ describe("Feed Host server", () => {
     expect(aggregate.alerts).toEqual({
       quarantined: true,
       workerClaimStale: true,
+      delegationExpiringSoon: true,
+      delegationExpired: false,
     });
+    expect(body.alerts).toEqual({ delegationExpiringSoon: true, delegationExpired: false });
     expect(aggregate.recentRequests).toBeUndefined();
     expect(storage.queueCalls).toBe(0);
     expect(storage.generationCalls).toBe(0);
+  });
+
+  test("alerts-only diagnostics surface an expiry-paused scheduler without raw actor ids", async () => {
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      delegationStore: fakeDelegationStore(),
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation, -1),
+      proactiveActorId: ACTOR_ID,
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const accepted = await postJson(
+      `${runtime.url}/api/delegations`,
+      {
+        actorId: ACTOR_ID,
+        serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+      },
+      { "content-type": "application/json" },
+    );
+    expect(accepted.ok).toBe(true);
+    for (let attempt = 0; attempt < 100 && !runtime.proactiveState().pausedForExpiry; attempt += 1) {
+      await Bun.sleep(5);
+    }
+    expect(runtime.proactiveState().pausedForExpiry).toBe(true);
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics?detail=alerts`, {
+      headers: { authorization: "Bearer diagnostics-test-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      alerts: { delegationExpiringSoon: boolean; delegationExpired: boolean };
+      actors: Record<string, { alerts?: Record<string, boolean> }>;
+    };
+    const actorHash = telemetryIdHash(ACTOR_ID);
+    expect(body.alerts).toEqual({ delegationExpiringSoon: false, delegationExpired: true });
+    expect(body.actors[actorHash]?.alerts).toMatchObject({
+      delegationExpiringSoon: false,
+      delegationExpired: true,
+    });
+    expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
   });
 
   test("timed-out diagnostics are bounded and concurrent probes share one build", async () => {
