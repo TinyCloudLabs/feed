@@ -321,6 +321,42 @@ describe("rolling delegation renewal", () => {
 
     await unmount(root);
   });
+
+  test("sign-out waits for renewal before removing the host delegation", async () => {
+    let finishRenewal!: () => void;
+    const renewal = new Promise<void>((resolve) => { finishRenewal = resolve; });
+    const order: string[] = [];
+    let signOuts = 0;
+    const auth = authDependencies({
+      renewFeedHostDelegation: async () => {
+        await renewal;
+        order.push("renewed");
+        return "renewed" as const;
+      },
+      signOut: async () => { signOuts += 1; },
+    });
+    const client = hostClient({
+      disconnectFeed: async () => { order.push("disconnected"); },
+      getFeedEvents: async () => ({ text: "" }),
+      listFeed: async () => ({ items: [] }),
+    });
+
+    const { container, root } = await renderApp(auth, client);
+    await clickButton(container, "Menu");
+    await clickButton(container, "Sign out");
+
+    expect(order).toEqual([]);
+    expect(signOuts).toBe(0);
+
+    finishRenewal();
+    await settle();
+
+    expect(order).toEqual(["renewed", "disconnected"]);
+    expect(signOuts).toBe(1);
+    expect(container.textContent).toContain("Sign in with OpenKey");
+
+    await unmount(root);
+  });
 });
 
 describe("sign-in recovery UI", () => {

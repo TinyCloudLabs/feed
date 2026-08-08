@@ -193,6 +193,7 @@ export function App({
   const [pageRequestArtifactId, setPageRequestArtifactId] = useState<string | null>(null);
   const [pageRetry, setPageRetry] = useState(0);
   const feedLoadInFlight = useRef(false);
+  const delegationRenewalInFlight = useRef<Promise<void> | null>(null);
   const setupInFlight = useRef<number | null>(null);
   const lastRecoveryAt = useRef(0);
   const loginTrace = useRef<FeedLoginTrace | null>(null);
@@ -490,25 +491,33 @@ export function App({
   // for this user would stop. Renewal is silent, best effort, and runs behind
   // the rendered feed; only a session-scope failure is user-visible, through
   // the same reconnect path as sign-in.
-  const renewRestoredDelegation = useCallback(async (expectedGeneration: number) => {
-    if (!session || !policy) return;
-    try {
-      await auth.renewFeedHostDelegation({
-        client,
-        policy,
-        actorId: session.readerDid,
-        trace: loginTrace.current ?? undefined,
-      });
-    } catch (error) {
-      if (sessionGeneration.current !== expectedGeneration) return;
-      if (isFeedReconnectRequiredError(error)) {
-        await requireReconnect(error, expectedGeneration);
-        return;
+  const renewRestoredDelegation = useCallback((expectedGeneration: number): Promise<void> => {
+    const renewal = (async () => {
+      if (!session || !policy) return;
+      try {
+        await auth.renewFeedHostDelegation({
+          client,
+          policy,
+          actorId: session.readerDid,
+          trace: loginTrace.current ?? undefined,
+        });
+      } catch (error) {
+        if (sessionGeneration.current !== expectedGeneration) return;
+        if (isFeedReconnectRequiredError(error)) {
+          await requireReconnect(error, expectedGeneration);
+          return;
+        }
+        if (isMissingParentDelegationError(error)) {
+          await requireMissingParentReconnect(error, expectedGeneration);
+        }
       }
-      if (isMissingParentDelegationError(error)) {
-        await requireMissingParentReconnect(error, expectedGeneration);
-      }
-    }
+    })();
+    delegationRenewalInFlight.current = renewal;
+    const clear = () => {
+      if (delegationRenewalInFlight.current === renewal) delegationRenewalInFlight.current = null;
+    };
+    void renewal.then(clear, clear);
+    return renewal;
   }, [auth, client, policy, requireMissingParentReconnect, requireReconnect, session]);
 
   const startFeed = useCallback(
@@ -731,6 +740,11 @@ export function App({
     const disconnectGeneration = sessionGeneration.current + 1;
     sessionGeneration.current = disconnectGeneration;
     try {
+      // Renewal starts only after the feed is interactive. If sign-out wins
+      // the host disconnect race and renewal submits afterward, it would
+      // silently recreate the authority the user just removed. Drain it
+      // first, then make disconnectFeed the final host-side operation.
+      await delegationRenewalInFlight.current?.catch(() => undefined);
       await client.disconnectFeed();
     } catch {
       // Local sign-out still completes if the Host is already unavailable or disconnected.

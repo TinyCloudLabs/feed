@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { FeedReconnectRequiredError } from "./authPolicy.ts";
-import type { FeedHostDelegationReceipt } from "./delegation.ts";
+import type { TinyCloudWeb } from "@tinycloud/web-sdk";
+import {
+  overrideFeedAuthForTest,
+  renewFeedHostDelegation,
+} from "./auth.ts";
+import type {
+  FeedHostDelegationPolicy,
+  FeedHostDelegationReceipt,
+} from "./delegation.ts";
 import type { FeedV1HostClient } from "./feedV1HostClient.ts";
 import {
   DELEGATION_RENEWAL_MIN_INTERVAL_MS,
@@ -12,6 +20,10 @@ import {
 } from "./delegationRenewal.ts";
 
 const ACTOR = "did:key:zReader";
+const POLICY: FeedHostDelegationPolicy = {
+  delegateDID: "did:key:zFeedHost",
+  resources: [],
+};
 
 function receipt(): FeedHostDelegationReceipt {
   return {
@@ -65,6 +77,49 @@ afterEach(() => {
 });
 
 describe("rolling delegation renewal", () => {
+  test("the auth path silently materializes and submits through the mock client", async () => {
+    let materializations = 0;
+    const submissions: Array<{ actorId: string; serializedDelegation: string }> = [];
+    const sdk = {
+      did: ACTOR,
+      materializeDelegation: async (delegateDid: string) => {
+        materializations += 1;
+        expect(delegateDid).toBe(POLICY.delegateDID);
+        return {
+          prompted: false,
+          delegation: {
+            cid: "bafy-renewed",
+            expiry: new Date("2026-09-07T00:00:00.000Z"),
+          },
+        };
+      },
+    } as unknown as TinyCloudWeb;
+    const client = {
+      submitDelegation: async (submission: { actorId: string; serializedDelegation: string }) => {
+        submissions.push(submission);
+        return receipt();
+      },
+    } as unknown as FeedV1HostClient;
+    const restoreAuth = overrideFeedAuthForTest({
+      instance: sdk,
+      activeSessionMode: "restored",
+    });
+
+    try {
+      expect(await renewFeedHostDelegation({ client, policy: POLICY, actorId: ACTOR })).toBe("renewed");
+    } finally {
+      restoreAuth();
+    }
+
+    expect(materializations).toBe(1);
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.actorId).toBe(ACTOR);
+    expect(JSON.parse(submissions[0]!.serializedDelegation)).toMatchObject({
+      cid: "bafy-renewed",
+      expiry: "2026-09-07T00:00:00.000Z",
+    });
+  });
+
   test("re-mints and resubmits for a restored session", async () => {
     const { submissions, submit } = mockClient();
 
