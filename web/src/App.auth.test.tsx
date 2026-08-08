@@ -324,7 +324,10 @@ describe("rolling delegation renewal", () => {
     await unmount(root);
   });
 
-  test("an unrecoverable expired host delegation proactively opens reconnect UI", async () => {
+  test.each([
+    [409, "delegation_stale", "accepted delegation has expired"],
+    [403, "denied", "delegated access is insufficient"],
+  ] as const)("an unrecoverable host delegation error (%s %s) proactively opens reconnect UI", async (status, code, message) => {
     let submissions = 0;
     let signOuts = 0;
     const auth = authDependencies({
@@ -337,9 +340,9 @@ describe("rolling delegation renewal", () => {
     const client = hostClient({
       listFeed: async () => {
         throw new FeedV1HostError(
-          "Feed Host request failed: 409",
-          409,
-          JSON.stringify({ error: { code: "delegation_stale", message: "accepted delegation has expired" } }),
+          `Feed Host request failed: ${status}`,
+          status,
+          JSON.stringify({ error: { code, message } }),
         );
       },
     });

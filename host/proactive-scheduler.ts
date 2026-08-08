@@ -87,6 +87,13 @@ export class ProactiveDailyScheduler {
     if (this.expiryRetryAtMs !== null && now.getTime() < this.expiryRetryAtMs) {
       return Promise.resolve("paused_expired");
     }
+    // Once expiry has paused the scheduler, every automatic probe stays on
+    // the hourly ceiling until a successful ensure or delegation acceptance
+    // explicitly clears it. A transient failure during an hourly probe must
+    // not accidentally restore the normal one-minute retry cadence.
+    if (this.state.pausedForExpiry) {
+      this.expiryRetryAtMs = now.getTime() + PROACTIVE_EXPIRED_RETRY_MS;
+    }
     const attempt = this.ensure(this.actorId, now);
     const tracked = attempt.finally(() => {
       if (this.inFlight === tracked) this.inFlight = null;
