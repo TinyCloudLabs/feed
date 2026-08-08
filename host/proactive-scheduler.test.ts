@@ -251,6 +251,30 @@ test("expired delegation pauses minute retries, backs off hourly, and logs a dis
   expect(JSON.stringify(logs)).not.toContain(ACTOR_ID);
 });
 
+test("an hourly expiry probe cannot fall back to minute retries after a transient failure", async () => {
+  let now = new Date("2026-07-21T08:00:00.000Z");
+  let calls = 0;
+  const daily = new ProactiveDailyScheduler({
+    actorId: ACTOR_ID,
+    now: () => now,
+    ensureRequest: async () => {
+      calls += 1;
+      if (calls === 1) throw new FeedDelegationError("accepted delegation has expired", "expired");
+      throw new Error("storage temporarily unavailable");
+    },
+  });
+
+  expect(await daily.ensureCurrentSlot()).toBe("paused_expired");
+  now = new Date(now.getTime() + PROACTIVE_EXPIRED_RETRY_MS);
+  expect(await daily.ensureCurrentSlot()).toBe("error");
+  expect(calls).toBe(2);
+
+  now = new Date(now.getTime() + 60_000);
+  expect(await daily.ensureCurrentSlot()).toBe("paused_expired");
+  expect(calls).toBe(2);
+  expect(daily.snapshot().pausedForExpiry).toBe(true);
+});
+
 test("accepted delegation clears the expiry pause and immediately retries the current slot", async () => {
   const now = new Date("2026-07-21T08:00:00.000Z");
   let calls = 0;
