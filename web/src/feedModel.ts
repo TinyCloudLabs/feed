@@ -148,12 +148,16 @@ export function bodyPreview(artifact: FeedArtifact | null): string {
   return JSON.stringify(artifact.body, null, 2);
 }
 
+// Match the host's ordering contract (storage.ts listFeed): recency first,
+// rank only as a tiebreaker, stable id tiebreak last. Rank scores recompute
+// whenever feedback/preferences reconcile, so sorting by rank first made the
+// feed visibly reshuffle between loads — cards must keep their place.
 export function sortedFeed(items: readonly FeedItem[]): FeedItem[] {
   return [...items].sort((a, b) => {
-    const rank = b.projection.rankScore - a.projection.rankScore;
-    if (rank !== 0) return rank;
     const published = b.projection.publishedAt.localeCompare(a.projection.publishedAt);
-    return published !== 0 ? published : a.projection.feedItemId.localeCompare(b.projection.feedItemId);
+    if (published !== 0) return published;
+    const rank = b.projection.rankScore - a.projection.rankScore;
+    return rank !== 0 ? rank : a.projection.feedItemId.localeCompare(b.projection.feedItemId);
   });
 }
 
