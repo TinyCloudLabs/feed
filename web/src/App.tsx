@@ -10,6 +10,7 @@ import { ArtifactPage, type ArtifactPageState } from "./ArtifactPage.tsx";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
   attachReceivedInputAuthority,
+  renewFeedHostDelegation,
   restoreSession,
   signIn,
   signOut,
@@ -138,6 +139,7 @@ function newNonce(): string {
 
 export type AppAuthDependencies = {
   attachReceivedInputAuthority: typeof attachReceivedInputAuthority;
+  renewFeedHostDelegation: typeof renewFeedHostDelegation;
   restoreSession: typeof restoreSession;
   signIn: typeof signIn;
   signOut: typeof signOut;
@@ -146,6 +148,7 @@ export type AppAuthDependencies = {
 
 const DEFAULT_AUTH: AppAuthDependencies = {
   attachReceivedInputAuthority,
+  renewFeedHostDelegation,
   restoreSession,
   signIn,
   signOut,
@@ -482,6 +485,32 @@ export function App({
     setSetupError("Feed’s backend could not finish preparing your Feed.");
   }, [session?.readerDid]);
 
+  // A restored session skips the delegation submission below, so without this
+  // the Feed Host's copy would just age out and every background generation
+  // for this user would stop. Renewal is silent, best effort, and runs behind
+  // the rendered feed; only a session-scope failure is user-visible, through
+  // the same reconnect path as sign-in.
+  const renewRestoredDelegation = useCallback(async (expectedGeneration: number) => {
+    if (!session || !policy) return;
+    try {
+      await auth.renewFeedHostDelegation({
+        client,
+        policy,
+        actorId: session.readerDid,
+        trace: loginTrace.current ?? undefined,
+      });
+    } catch (error) {
+      if (sessionGeneration.current !== expectedGeneration) return;
+      if (isFeedReconnectRequiredError(error)) {
+        await requireReconnect(error, expectedGeneration);
+        return;
+      }
+      if (isMissingParentDelegationError(error)) {
+        await requireMissingParentReconnect(error, expectedGeneration);
+      }
+    }
+  }, [auth, client, policy, requireMissingParentReconnect, requireReconnect, session]);
+
   const startFeed = useCallback(
     async () => {
       if (!session || !policy) return;
@@ -504,6 +533,7 @@ export function App({
           });
           if (restoredFeed) {
             setFeedState("running");
+            void renewRestoredDelegation(setupGeneration);
             return;
           }
           restoredHostSession.current = false;
@@ -563,7 +593,7 @@ export function App({
         if (setupInFlight.current === setupGeneration) setupInFlight.current = null;
       }
     },
-    [auth, client, loadFeed, policy, recordSetupFailure, requireMissingParentReconnect, requireReconnect, session, waitForHostSetup],
+    [auth, client, loadFeed, policy, recordSetupFailure, renewRestoredDelegation, requireMissingParentReconnect, requireReconnect, session, waitForHostSetup],
   );
 
   const retryFeedSetup = useCallback(async () => {
