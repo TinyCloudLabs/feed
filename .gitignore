@@ -7,5 +7,3 @@ transcripts/
 .env
 .DS_Store
 test-results/
-.smithers/
-smithers.db*

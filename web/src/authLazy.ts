@@ -40,12 +40,6 @@ export async function submitFeedHostDelegations(
   return (await auth()).submitFeedHostDelegations(...args);
 }
 
-export async function renewFeedHostDelegation(
-  ...args: Parameters<AuthModule["renewFeedHostDelegation"]>
-): ReturnType<AuthModule["renewFeedHostDelegation"]> {
-  return (await auth()).renewFeedHostDelegation(...args);
-}
-
 export async function attachReceivedInputAuthority(
   ...args: Parameters<AuthModule["attachReceivedInputAuthority"]>
 ): ReturnType<AuthModule["attachReceivedInputAuthority"]> {
