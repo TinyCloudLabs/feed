@@ -92,7 +92,7 @@ log("delegation_minted", {
 const serialized = serializeDelegation(result.delegation);
 const submit = await fetch(new URL("/api/delegations", FEED_HOST_URL), {
   method: "POST",
-  headers: { "content-type": "application/json", origin: FEED_WEB_ORIGIN },
+  headers: { "content-type": "application/json", origin: FEED_WEB_ORIGIN, "x-forwarded-proto": "https" },
   body: JSON.stringify({ serializedDelegation: serialized }),
 });
 const body = (await submit.json()) as { resources?: string[]; status?: string; error?: { code: string; message: string } };
@@ -102,6 +102,29 @@ if (!submit.ok) {
 }
 log("submission_accepted", { status: body.status, resources: body.resources?.length, paths: body.resources });
 
+const setCookie = submit.headers.get("set-cookie") ?? "";
+const sessionCookie = setCookie.split(";", 1)[0];
+if (body.status === "preparing") {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const statusResponse = await fetch(new URL("/api/delegations/status", FEED_HOST_URL), {
+      headers: { cookie: sessionCookie, origin: FEED_WEB_ORIGIN },
+    });
+    const statusBody = (await statusResponse.json()) as {
+      setup?: { state?: string; phase?: string; error?: { message?: string } };
+    };
+    if (statusBody.setup?.state === "ready") {
+      body.status = "active";
+      log("preparation_completed", { attempts: attempt + 1 });
+      break;
+    }
+    if (!statusResponse.ok || statusBody.setup?.state === "failed") {
+      log("smoke_failed", { status: statusResponse.status, setup: statusBody.setup });
+      process.exit(1);
+    }
+    await Bun.sleep(1000);
+  }
+}
+
 const expected = new Set(policy.resources.map((resource) => resource.path));
 const granted = new Set(body.resources ?? []);
 const missing = [...expected].filter((path) => !granted.has(path));
@@ -110,7 +133,6 @@ if (missing.length > 0 || body.status !== "active") {
   process.exit(1);
 }
 
-const setCookie = submit.headers.get("set-cookie") ?? "";
 const cookieAttributes = setCookie.toLowerCase();
 const secureCookie =
   setCookie.startsWith("__Host-feed_session=") &&
@@ -118,7 +140,6 @@ const secureCookie =
   cookieAttributes.includes("httponly") &&
   cookieAttributes.includes("secure") &&
   /samesite=(strict|none)/.test(cookieAttributes);
-const sessionCookie = setCookie.split(";", 1)[0];
 const feed = await fetch(new URL("/feed?limit=1", FEED_HOST_URL), {
   headers: { cookie: sessionCookie, origin: FEED_WEB_ORIGIN },
 });
