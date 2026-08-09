@@ -14,7 +14,7 @@ import { serializeDelegation, TinyCloudNode, type Manifest } from "@tinycloud/no
 import { isRetryableDelegationConflict } from "../web/src/delegationRetry.ts";
 
 const FEED_HOST_URL = process.env.FEED_HOST_URL || "http://127.0.0.1:8787";
-const FEED_WEB_ORIGIN = process.env.FEED_WEB_ORIGIN || "https://feed.tinycloud.xyz";
+const FEED_WEB_ORIGIN = process.env.FEED_WEB_ORIGIN;
 const TINYCLOUD_HOST = process.env.TINYCLOUD_HOST || process.env.VITE_TINYCLOUD_HOST || undefined;
 
 type PolicyResource = { service: string; path: string; actions: string[] };
@@ -92,7 +92,11 @@ log("delegation_minted", {
 const serialized = serializeDelegation(result.delegation);
 const submit = await fetch(new URL("/api/delegations", FEED_HOST_URL), {
   method: "POST",
-  headers: { "content-type": "application/json", origin: FEED_WEB_ORIGIN, "x-forwarded-proto": "https" },
+  headers: {
+    "content-type": "application/json",
+    "x-forwarded-proto": "https",
+    ...(FEED_WEB_ORIGIN ? { origin: FEED_WEB_ORIGIN } : {}),
+  },
   body: JSON.stringify({ serializedDelegation: serialized }),
 });
 const body = (await submit.json()) as { resources?: string[]; status?: string; error?: { code: string; message: string } };
@@ -107,7 +111,7 @@ const sessionCookie = setCookie.split(";", 1)[0];
 if (body.status === "preparing") {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const statusResponse = await fetch(new URL("/api/delegations/status", FEED_HOST_URL), {
-      headers: { cookie: sessionCookie, origin: FEED_WEB_ORIGIN },
+      headers: { cookie: sessionCookie, ...(FEED_WEB_ORIGIN ? { origin: FEED_WEB_ORIGIN } : {}) },
     });
     const statusBody = (await statusResponse.json()) as {
       setup?: { state?: string; phase?: string; error?: { message?: string } };
@@ -141,27 +145,32 @@ const secureCookie =
   cookieAttributes.includes("secure") &&
   /samesite=(strict|none)/.test(cookieAttributes);
 const feed = await fetch(new URL("/feed?limit=1", FEED_HOST_URL), {
-  headers: { cookie: sessionCookie, origin: FEED_WEB_ORIGIN },
+  headers: { cookie: sessionCookie, ...(FEED_WEB_ORIGIN ? { origin: FEED_WEB_ORIGIN } : {}) },
 });
 const headerOnly = await fetch(new URL("/feed?limit=1", FEED_HOST_URL), {
   headers: { "x-feed-actor-id": node.did },
 });
+const corsBoundary = FEED_WEB_ORIGIN
+  ? feed.headers.get("access-control-allow-origin") === FEED_WEB_ORIGIN &&
+    feed.headers.get("access-control-allow-credentials") === "true"
+  : feed.headers.get("access-control-allow-origin") === null &&
+    feed.headers.get("access-control-allow-credentials") === null;
 const browserBoundary =
   secureCookie &&
   feed.ok &&
   feed.headers.get("cache-control") === "private, no-store" &&
-  feed.headers.get("access-control-allow-origin") === FEED_WEB_ORIGIN &&
-  feed.headers.get("access-control-allow-credentials") === "true" &&
+  corsBoundary &&
   headerOnly.status === 401;
 log("browser_boundary_checked", {
   secureCookie,
+  corsBoundary,
   feedStatus: feed.status,
   headerOnlyStatus: headerOnly.status,
 });
 
 const cleanup = await fetch(new URL("/api/delegations", FEED_HOST_URL), {
   method: "DELETE",
-  headers: { cookie: sessionCookie, origin: FEED_WEB_ORIGIN },
+  headers: { cookie: sessionCookie, ...(FEED_WEB_ORIGIN ? { origin: FEED_WEB_ORIGIN } : {}) },
 });
 log("delegation_cleaned", { status: cleanup.status });
 
