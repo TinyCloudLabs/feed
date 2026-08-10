@@ -664,9 +664,21 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         accessActivatedAtMs: nowMs(),
         accessNow: nowMs,
       };
-      const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
-        ? existing
-        : state;
+      const reusePreparedActor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready;
+      const actor = reusePreparedActor ? existing : state;
+      if (reusePreparedActor) {
+        // Rolling renewal must replace the live authority clock and activated
+        // access as well as the persisted copy. Keep the prepared ActorState
+        // (and its self-healing storage wrappers), but point those wrappers at
+        // the newly activated delegation. Otherwise the host keeps enforcing
+        // the old expiry and rejects the feed when the original grant lapses.
+        actor.acceptedAt = activated.acceptedAt;
+        actor.expiresAt = activated.expiresAt;
+        actor.resources = resources;
+        actor.accessByResource.clear();
+        for (const [path, access] of accessByResource) actor.accessByResource.set(path, access);
+        actor.accessActivatedAtMs = nowMs();
+      }
       actor.heal = () => reactivateActorAccess(
         { delegationStore, activateDelegation, delegateDID: policy.delegateDID, policyHash, nowMs },
         actor,
@@ -1885,7 +1897,11 @@ async function restoreActorFromStore(
   const live = liveDelegationResources(stored);
   if (live.length === 0) {
     await store.remove(actorKey);
-    return null;
+    // Preserve the distinction between an actor that was never delegated and
+    // one whose persisted authority elapsed while the host was offline. The
+    // proactive scheduler uses this classification to enter its expiry pause
+    // instead of restarting the one-minute generic error loop after reboot.
+    throw new FeedDelegationError("stored delegations are expired", "expired");
   }
   if (live.length !== stored.resources.length) {
     await store.save({ ...stored, resources: live, policyHash: stored.policyHash ?? context.policyHash });

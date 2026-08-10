@@ -677,6 +677,39 @@ describe("Feed Host server", () => {
     expect(renewed.status).toBe(200);
   });
 
+  test("rolling renewal extends a still-live prepared actor", async () => {
+    let expiresInMs = 5_000;
+    let acceptedExpiry = "";
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      requireActorSession: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => {
+        const activated = fakeActivatedDelegation(serializedDelegation, expiresInMs);
+        acceptedExpiry = activated.expiresAt;
+        return activated;
+      },
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+    expiresInMs = 60_000;
+    const renewedCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const renewed = await fetch(`${runtime.url}/feed`, { headers: { cookie: renewedCookie } });
+    expect(renewed.status).toBe(200);
+    const status = await getJson<{
+      state: string;
+      complete: boolean;
+      resources: Array<{ expiresAt: string }>;
+    }>(`${runtime.url}/api/delegations/status`, {
+      cookie: renewedCookie,
+    });
+    expect(status).toMatchObject({ state: "active", complete: true });
+    expect(status.resources.every((resource) => resource.expiresAt === acceptedExpiry)).toBe(true);
+  });
+
   test("retries transient TinyCloud serialization conflicts during actor setup", async () => {
     const storage = new TransientBootstrapStorage();
     runtime = startFeedHost({
@@ -2129,6 +2162,7 @@ describe("Feed Host server", () => {
       port: 0,
       hostname: "127.0.0.1",
       seedOnStart: true,
+      proactiveActorId: ACTOR_ID,
       storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
       hostNode: fakeHostNode(HOST_DID),
       delegationStore: store,
@@ -2147,6 +2181,8 @@ describe("Feed Host server", () => {
       })),
     });
 
+    expect(await runtime.ensureProactiveNow()).toBe("paused_expired");
+    expect(runtime.proactiveState().pausedForExpiry).toBe(true);
     const blocked = await fetch(`${runtime.url}/feed?limit=10`, { headers: { "x-feed-actor-id": ACTOR_ID } });
     expect(blocked.status).toBe(403);
     expect(await store.load(ACTOR_ID)).toBeNull();

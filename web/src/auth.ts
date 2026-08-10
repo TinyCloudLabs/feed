@@ -233,6 +233,7 @@ export async function renewFeedHostDelegation(input: {
       policy: input.policy,
       actorId: input.actorId,
       recoverMissingParent: false,
+      reportAttemptFailures: false,
     }),
   });
 }
@@ -243,6 +244,7 @@ export async function submitFeedHostDelegations(input: {
   actorId: string;
   trace?: FeedLoginTrace;
   recoverMissingParent?: boolean;
+  reportAttemptFailures?: boolean;
 }): Promise<FeedHostDelegationReceipt[]> {
   let recoveryStage: DelegationFailureStage = "mint";
   const sessionMode = activeSessionMode ?? input.trace?.sessionMode ?? "restored";
@@ -267,10 +269,12 @@ export async function submitFeedHostDelegations(input: {
       serializedDelegation = serializeDelegation(result.delegation);
     } catch (error) {
       recoveryStage = isMissingParentDelegationError(error) ? "activate" : "mint";
-      reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
-        stage: recoveryStage,
-        session_mode: sessionMode,
-      });
+      if (input.reportAttemptFailures !== false) {
+        reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
+          stage: recoveryStage,
+          session_mode: sessionMode,
+        });
+      }
       if (isSessionScopeError(error)) throw reconnectRequiredError(error);
       throw error;
     }
@@ -280,10 +284,12 @@ export async function submitFeedHostDelegations(input: {
       receipt = await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation });
     } catch (error) {
       recoveryStage = delegationSubmissionFailureStage(error);
-      reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
-        stage: recoveryStage,
-        session_mode: sessionMode,
-      });
+      if (input.reportAttemptFailures !== false) {
+        reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
+          stage: recoveryStage,
+          session_mode: sessionMode,
+        });
+      }
       throw error;
     }
     // Any accepted submission (sign-in, setup, recovery) starts the rolling

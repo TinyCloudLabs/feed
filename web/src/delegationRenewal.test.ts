@@ -190,6 +190,28 @@ describe("rolling delegation renewal", () => {
     expect(isDelegationRenewalDue(ACTOR)).toBe(true);
   });
 
+  test("the auth renewal path reports only a warning when minting fails", async () => {
+    const sdk = {
+      did: ACTOR,
+      materializeDelegation: async () => { throw new Error("renewal mint failed"); },
+    } as unknown as TinyCloudWeb;
+    const { client } = mockClient();
+    const restoreAuth = overrideFeedAuthForTest({
+      instance: sdk,
+      activeSessionMode: "restored",
+    });
+
+    try {
+      expect(await renewFeedHostDelegation({ client, policy: POLICY, actorId: ACTOR })).toBe("failed");
+    } finally {
+      restoreAuth();
+    }
+
+    expect(events.filter((event) => event.level === "error")).toHaveLength(0);
+    expect(events.filter((event) => event.event === "delegation_renewal_failed")).toHaveLength(1);
+    expect(events.find((event) => event.event === "delegation_renewal_failed")).toMatchObject({ level: "warn" });
+  });
+
   test("a session-scope renewal failure is warned and remains non-fatal", async () => {
     const { submit } = mockClient(async () => {
       throw new FeedReconnectRequiredError(new Error("SessionExpiredError"));
