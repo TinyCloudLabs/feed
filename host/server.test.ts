@@ -2187,6 +2187,37 @@ describe("Feed Host server", () => {
     expect(blocked.status).toBe(403);
     expect(await store.load(ACTOR_ID)).toBeNull();
   });
+
+  test("pauses proactive scheduling when a persisted delegation set is partially expired", async () => {
+    const store = fakeDelegationStore();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      proactiveActorId: ACTOR_ID,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      hostNode: fakeHostNode(HOST_DID),
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const past = new Date(Date.now() - 60_000).toISOString();
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await store.save({
+      actorId: ACTOR_ID,
+      delegateDID: policy.delegateDID,
+      resources: policy.resources.map((resource, index) => ({
+        path: resource.path,
+        serializedDelegation: resource.path,
+        acceptedAt: past,
+        expiresAt: index === 0 ? future : past,
+      })),
+    });
+
+    expect(await runtime.ensureProactiveNow()).toBe("paused_expired");
+    expect(runtime.proactiveState().pausedForExpiry).toBe(true);
+    expect((await store.load(ACTOR_ID))?.resources).toHaveLength(1);
+  });
 });
 
 describe("Feed Host skill credential settings", () => {

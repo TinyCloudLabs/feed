@@ -1905,6 +1905,7 @@ async function restoreActorFromStore(
   }
   if (live.length !== stored.resources.length) {
     await store.save({ ...stored, resources: live, policyHash: stored.policyHash ?? context.policyHash });
+    throw new FeedDelegationError("stored delegation set is partially expired", "expired");
   }
   try {
     const accessByResource = new Map<string, DelegatedAccess>();
