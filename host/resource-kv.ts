@@ -66,7 +66,7 @@ export type ResourceKv = {
   readonly resourcePath: string;
   get<T = unknown>(relativeKey: string, options?: Omit<KVGetOptions, "prefix">): Promise<Result<KVResponse<T>>>;
   put(relativeKey: string, value: unknown, options?: Omit<KVPutOptions, "prefix">): Promise<Result<KVResponse<void>>>;
-  delete(relativeKey: string, options?: Omit<KVDeleteOptions, "prefix">): Promise<Result<void>>;
+  delete(relativeKey: string, options?: Omit<KVDeleteOptions, "prefix">): Promise<Result<KVResponse<void>>>;
   list(options?: Omit<KVListOptions, "prefix" | "path" | "removePrefix">): Promise<Result<KVListResponse>>;
 };
 
