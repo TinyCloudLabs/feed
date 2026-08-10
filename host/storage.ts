@@ -1362,7 +1362,7 @@ export class FeedHostStorage {
         `UPDATE generation_request
             SET status = 'pending', run_id = request_id,
                 workflow_id = COALESCE(workflow_id, ?),
-                max_attempts = CASE WHEN workflow_id IS NULL THEN ? ELSE max_attempts END,
+                max_attempts = CASE WHEN attempt_count = 0 THEN ? ELSE max_attempts END,
                 claim_owner = ?, lease_expires_at = ?,
                 fencing_token = fencing_token + 1, attempt_count = attempt_count + 1,
                 next_retry_at = NULL,

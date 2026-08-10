@@ -76,8 +76,8 @@ describe("generation worker storage", () => {
     )).toMatchObject({ requestId: "request-unscoped", workflowId: "workflow-a" });
     expect(await queue.storage.claimGenerationRequest(
       queue.actor,
-      claim("workflow-b", "worker-b", T_HALF, T1),
-    )).toMatchObject({ requestId: "request-pinned", workflowId: "workflow-b" });
+      claim("workflow-b", "worker-b", T_HALF, T1, 7),
+    )).toMatchObject({ requestId: "request-pinned", workflowId: "workflow-b", maxAttempts: 7 });
     queue.close();
   });
 
