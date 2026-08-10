@@ -2519,6 +2519,17 @@ export class FeedHostStorage {
         { pendingCount, limit: this.maxPendingGenerationRequests },
       );
     }
+    const admittedPackage = scope.packageId
+      ? await queryRows<{ package_id: string }>(
+          this.db(actor, "artifacts_index"),
+          `SELECT package_id
+             FROM workflow_package_state
+            WHERE package_id = ?
+              AND admission_state IN ('enabled_local', 'reviewed_first_party')
+            LIMIT 1`,
+          [scope.packageId],
+        )
+      : [];
     const expiresAt = new Date(Date.parse(input.createdAt) + 24 * 60 * 60 * 1000).toISOString();
     return {
       requestId: input.eventId,
@@ -2530,7 +2541,7 @@ export class FeedHostStorage {
       dedupeKey,
       prompt,
       runId: null,
-      workflowId: null,
+      workflowId: admittedPackage[0]?.package_id ?? null,
       maxAttempts: 3,
       claimOwner: null,
       leaseExpiresAt: null,

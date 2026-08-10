@@ -65,6 +65,22 @@ describe("generation worker storage", () => {
     queue.close();
   });
 
+  test("claims skip requests pinned to another workflow while still binding unscoped requests", async () => {
+    const queue = makeQueue();
+    queue.insert("request-pinned", T0, "workflow-b");
+    queue.insert("request-unscoped", T_HALF);
+
+    expect(await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow-a", "worker-a", T_HALF, T1),
+    )).toMatchObject({ requestId: "request-unscoped", workflowId: "workflow-a" });
+    expect(await queue.storage.claimGenerationRequest(
+      queue.actor,
+      claim("workflow-b", "worker-b", T_HALF, T1),
+    )).toMatchObject({ requestId: "request-pinned", workflowId: "workflow-b" });
+    queue.close();
+  });
+
   test("a stored publication manifest resumes after restart and rejects the zombie fence", async () => {
     const queue = makeQueue();
     queue.insert("request-reclaim");
@@ -236,6 +252,35 @@ describe("generation worker storage", () => {
     queue.close();
     retryQueue.close();
     permanentQueue.close();
+  });
+
+  test("source cursor inheritance stays isolated per pinned workflow", async () => {
+    const queue = makeQueue();
+    queue.insert("request-a-first", T0, "workflow-a");
+    queue.insert("request-b-first", T0, "workflow-b");
+    const firstA = await queue.storage.claimGenerationRequest(queue.actor, claim("workflow-a", "worker-a", T0, T1));
+    const firstB = await queue.storage.claimGenerationRequest(queue.actor, claim("workflow-b", "worker-b", T0, T1));
+
+    for (const [request, cursor, publicationKey] of [
+      [firstA!, { offset: 11 }, "publication-a"],
+      [firstB!, { offset: 22 }, "publication-b"],
+    ] as const) {
+      await queue.storage.publishGenerationArtifacts(queue.actor, {
+        ...identity(request), now: T_HALF, publicationKey, artifacts: [],
+      });
+      await queue.storage.reconcileGenerationRequest(queue.actor, { ...identity(request), now: T_HALF });
+      await queue.storage.completeGenerationRequest(queue.actor, {
+        ...identity(request), now: T_HALF, outcome: "zero_artifacts", cursor, artifactIds: [],
+      });
+    }
+
+    queue.insert("request-a-second", T1, "workflow-a");
+    queue.insert("request-b-second", T1, "workflow-b");
+    expect(await queue.storage.claimGenerationRequest(queue.actor, claim("workflow-a", "worker-a", T1, T2)))
+      .toMatchObject({ requestId: "request-a-second", sourceCursorBefore: { offset: 11 } });
+    expect(await queue.storage.claimGenerationRequest(queue.actor, claim("workflow-b", "worker-b", T1, T2)))
+      .toMatchObject({ requestId: "request-b-second", sourceCursorBefore: { offset: 22 } });
+    queue.close();
   });
 
   test("phase and reconcile metadata persist a distinguishable terminal outcome for old-worker completion", async () => {
@@ -481,7 +526,8 @@ function makeQueue(options: FeedHostStorageOptions = {}): {
   actor: FeedHostActorStorage;
   documents: Map<string, unknown>;
   queryLog: string[];
-  insert: (requestId: string, createdAt?: string) => void;
+  insert: (requestId: string, createdAt?: string, workflowId?: string | null) => void;
+  admit: (packageId: string, admissionState?: "enabled_local" | "reviewed_first_party") => void;
   close: () => void;
 } {
   const database = new Database(":memory:");
@@ -492,6 +538,9 @@ function makeQueue(options: FeedHostStorageOptions = {}): {
   )`);
   for (const sql of FEED_GENERATION_WORKER_MIGRATION.sql) database.exec(sql);
   for (const sql of FEED_GENERATION_OBSERVABILITY_MIGRATION.sql) database.exec(sql);
+  database.exec(`CREATE TABLE workflow_package_state (
+    package_id TEXT PRIMARY KEY, admission_state TEXT NOT NULL
+  )`);
   database.exec(`CREATE TABLE artifact_index (
     artifact_id TEXT PRIMARY KEY, artifact_type TEXT NOT NULL, package_id TEXT NOT NULL,
     package_version TEXT NOT NULL, package_digest TEXT NOT NULL, run_id TEXT NOT NULL,
@@ -552,16 +601,60 @@ function makeQueue(options: FeedHostStorageOptions = {}): {
   const actor = { actorId: ACTOR_ID, feed: access, artifacts: access, settings: access, documents: access } as unknown as FeedHostActorStorage;
   return {
     storage: new FeedHostStorage(options), actor, documents, queryLog,
-    insert: (requestId, createdAt = T0) => {
+    insert: (requestId, createdAt = T0, workflowId = null) => {
       database.query(`INSERT INTO generation_request (
-        request_id, reader_nonce, actor_id, status, scope_json, prompt,
+        request_id, reader_nonce, actor_id, status, scope_json, prompt, workflow_id,
         expires_at, created_at, updated_at
-      ) VALUES (?, ?, ?, 'accepted', '{}', ?, '2026-07-21T00:00:00.000Z', ?, ?)`)
-        .run(requestId, `nonce-${requestId}`, ACTOR_ID, `prompt-${requestId}`, createdAt, createdAt);
+      ) VALUES (?, ?, ?, 'accepted', '{}', ?, ?, '2026-07-21T00:00:00.000Z', ?, ?)`)
+        .run(requestId, `nonce-${requestId}`, ACTOR_ID, `prompt-${requestId}`, workflowId, createdAt, createdAt);
+    },
+    admit: (packageId, admissionState = "reviewed_first_party") => {
+      database.query("INSERT INTO workflow_package_state (package_id, admission_state) VALUES (?, ?)")
+        .run(packageId, admissionState);
     },
     close: () => database.close(),
   };
 }
+
+test("intake pins admitted package scopes and leaves unscoped or unknown requests unbound", async () => {
+  const queue = makeQueue();
+  queue.admit("workflow-admitted");
+  const createdAt = new Date().toISOString();
+  const scoped = await queue.storage.recordControlIntent(queue.actor, {
+    actorId: queue.actor.actorId,
+    eventId: "event-scoped",
+    readerNonce: "nonce-scoped",
+    intentKind: "generate_new_request",
+    targetRef: "feed",
+    payload: { prompt: "run admitted", scope: { packageId: "workflow-admitted" } },
+    createdAt,
+  });
+  const unscoped = await queue.storage.recordControlIntent(queue.actor, {
+    actorId: queue.actor.actorId,
+    eventId: "event-unscoped",
+    readerNonce: "nonce-unscoped",
+    intentKind: "generate_new_request",
+    targetRef: "feed",
+    payload: { prompt: "run default" },
+    createdAt,
+  });
+  const unknown = await queue.storage.recordControlIntent(queue.actor, {
+    actorId: queue.actor.actorId,
+    eventId: "event-unknown",
+    readerNonce: "nonce-unknown",
+    intentKind: "generate_new_request",
+    targetRef: "feed",
+    payload: { prompt: "run unknown", scope: { packageId: "workflow-unknown" } },
+    createdAt,
+  });
+
+  const requests = await queue.storage.listGenerationRequests(queue.actor, 10);
+  const byId = new Map(requests.map((row) => [row.request_id, row]));
+  expect(byId.get(scoped.requestId!)?.workflow_id).toBe("workflow-admitted");
+  expect(byId.get(unscoped.requestId!)?.workflow_id).toBeNull();
+  expect(byId.get(unknown.requestId!)?.workflow_id).toBeNull();
+  queue.close();
+});
 
 test("ask dedupe coalesces only onto live requests; nonce replays stay idempotent", async () => {
   const { storage, actor, close } = makeQueue();
