@@ -232,6 +232,7 @@ export async function renewFeedHostDelegation(input: {
       client: input.client,
       policy: input.policy,
       actorId: input.actorId,
+      recoverMissingParent: false,
     }),
   });
 }
@@ -241,6 +242,7 @@ export async function submitFeedHostDelegations(input: {
   policy: FeedHostDelegationPolicy;
   actorId: string;
   trace?: FeedLoginTrace;
+  recoverMissingParent?: boolean;
 }): Promise<FeedHostDelegationReceipt[]> {
   let recoveryStage: DelegationFailureStage = "mint";
   const sessionMode = activeSessionMode ?? input.trace?.sessionMode ?? "restored";
@@ -301,7 +303,7 @@ export async function submitFeedHostDelegations(input: {
   try {
     return await attempt();
   } catch (error) {
-    if (!isMissingParentDelegationError(error)) throw error;
+    if (!isMissingParentDelegationError(error) || input.recoverMissingParent === false) throw error;
     recoveryStage = "activate";
     return recoverMissingParentOperation({
       initialError: error,

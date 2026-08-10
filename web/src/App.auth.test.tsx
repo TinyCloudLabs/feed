@@ -302,7 +302,7 @@ describe("rolling delegation renewal", () => {
     await unmount(root);
   });
 
-  test("a session-scope renewal failure falls back to the reconnect path", async () => {
+  test("renewal failure never blocks a feed the host still serves", async () => {
     let signOuts = 0;
     const auth = authDependencies({
       renewFeedHostDelegation: async () => {
@@ -317,9 +317,9 @@ describe("rolling delegation renewal", () => {
 
     const { container, root } = await renderApp(auth, client);
 
-    expect(signOuts).toBe(1);
-    expect(container.textContent).toContain(DELEGATION_RECONNECT_MESSAGE);
-    expect(container.textContent).toContain("Sign in to reconnect");
+    expect(signOuts).toBe(0);
+    expect(container.textContent).toContain("Menu");
+    expect(container.textContent).not.toContain("Sign in to reconnect");
 
     await unmount(root);
   });
@@ -426,7 +426,16 @@ describe("sign-in recovery UI", () => {
         throw secondMissingParent;
       },
     });
-    const { container, root } = await renderApp(auth, hostClient());
+    const client = hostClient({
+      listFeed: async () => {
+        throw new FeedV1HostError(
+          "Feed Host request failed: 409",
+          409,
+          JSON.stringify({ error: { code: "delegation_stale", message: "accepted delegation has expired" } }),
+        );
+      },
+    });
+    const { container, root } = await renderApp(auth, client);
 
     expect(submissions).toBe(1);
     expect(signOuts).toBe(1);
@@ -469,7 +478,13 @@ describe("sign-in recovery UI", () => {
       }),
       listFeed: async () => {
         feedLoads += 1;
-        if (feedLoads === 1) throw new Error("restored host session is gone");
+        if (feedLoads === 1) {
+          throw new FeedV1HostError(
+            "Feed Host request failed: 409",
+            409,
+            JSON.stringify({ error: { code: "delegation_stale", message: "accepted delegation has expired" } }),
+          );
+        }
         return { items: [] };
       },
     });
@@ -531,7 +546,13 @@ describe("sign-in recovery UI", () => {
       },
       getFeedEvents: async () => ({ text: "" }),
       listFeed: async () => {
-        if (statusCalls === 0) throw new Error("restored host session is gone");
+        if (statusCalls === 0) {
+          throw new FeedV1HostError(
+            "Feed Host request failed: 409",
+            409,
+            JSON.stringify({ error: { code: "delegation_stale", message: "accepted delegation has expired" } }),
+          );
+        }
         return { items: [] };
       },
     });

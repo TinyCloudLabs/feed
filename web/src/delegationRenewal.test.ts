@@ -190,13 +190,13 @@ describe("rolling delegation renewal", () => {
     expect(isDelegationRenewalDue(ACTOR)).toBe(true);
   });
 
-  test("a session-scope failure surfaces for the existing reconnect handling", async () => {
+  test("a session-scope renewal failure is warned and remains non-fatal", async () => {
     const { submit } = mockClient(async () => {
       throw new FeedReconnectRequiredError(new Error("SessionExpiredError"));
     });
 
-    await expect(renewDelegation({ actorId: ACTOR, submit })).rejects.toBeInstanceOf(FeedReconnectRequiredError);
-    expect(events.find((event) => event.event === "delegation_renewal_failed")).toBeDefined();
+    expect(await renewDelegation({ actorId: ACTOR, submit })).toBe("failed");
+    expect(events.find((event) => event.event === "delegation_renewal_failed")).toMatchObject({ level: "warn" });
   });
 
   test("telemetry carries no delegation material", async () => {

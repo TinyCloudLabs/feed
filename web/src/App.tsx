@@ -339,6 +339,7 @@ export function App({
     recoverDelegation?: boolean;
     surfaceError?: boolean;
     reason?: string;
+    onError?: (error: unknown) => void;
   } = {}): Promise<boolean> => {
     if (!session || feedLoadInFlight.current) return false;
     const recoverLostDelegation = options.recoverDelegation !== false;
@@ -367,6 +368,7 @@ export function App({
       }
       return true;
     } catch (error) {
+      options.onError?.(error);
       if (recoverLostDelegation && isDelegationLostError(error)) {
         feedLoadInFlight.current = false;
         if (await recoverDelegation()) return false;
@@ -489,9 +491,9 @@ export function App({
   // A restored session skips the delegation submission below, so without this
   // the Feed Host's copy would just age out and every background generation
   // for this user would stop. Renewal is silent, best effort, and runs behind
-  // the rendered feed; only a session-scope failure is user-visible, through
-  // the same reconnect path as sign-in.
-  const renewRestoredDelegation = useCallback((expectedGeneration: number): Promise<void> => {
+  // the rendered feed. Renewal failure is never a reconnect signal: only a
+  // delegation-lost/expired response from the host can open that path.
+  const renewRestoredDelegation = useCallback((): Promise<void> => {
     const renewal = (async () => {
       if (!session || !policy) return;
       try {
@@ -502,14 +504,11 @@ export function App({
           trace: loginTrace.current ?? undefined,
         });
       } catch (error) {
-        if (sessionGeneration.current !== expectedGeneration) return;
-        if (isFeedReconnectRequiredError(error)) {
-          await requireReconnect(error, expectedGeneration);
-          return;
-        }
-        if (isMissingParentDelegationError(error)) {
-          await requireMissingParentReconnect(error, expectedGeneration);
-        }
+        // The auth implementation reports renewal failures as warnings and
+        // resolves, but keep injected/test implementations non-fatal too.
+        reportClientEvent("warn", "delegation_renewal_failed", errorDetail(error), session.readerDid, {
+          session_mode: loginTrace.current?.sessionMode ?? "restored",
+        });
       }
     })();
     delegationRenewalInFlight.current = renewal;
@@ -518,7 +517,7 @@ export function App({
     };
     void renewal.then(clear, clear);
     return renewal;
-  }, [auth, client, policy, requireMissingParentReconnect, requireReconnect, session]);
+  }, [auth, client, policy, session]);
 
   const startFeed = useCallback(
     async () => {
@@ -535,14 +534,25 @@ export function App({
         // Read first so existing content never waits for delegation refresh or
         // schema preparation.
         if (restoredHostSession.current) {
+          let hostRejectedDelegation = false;
           const restoredFeed = await loadFeed({
             recoverDelegation: false,
-            surfaceError: false,
+            surfaceError: true,
             reason: "restored_host_session",
+            onError: (error) => {
+              hostRejectedDelegation = isDelegationLostError(error);
+            },
           });
           if (restoredFeed) {
             setFeedState("running");
-            void renewRestoredDelegation(setupGeneration);
+            void renewRestoredDelegation();
+            return;
+          }
+          if (!hostRejectedDelegation) {
+            // A network/server failure is not evidence that delegation was
+            // lost. Keep the session and render the retryable feed error.
+            setFeedState("running");
+            void renewRestoredDelegation();
             return;
           }
           restoredHostSession.current = false;

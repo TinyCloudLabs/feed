@@ -16,7 +16,6 @@ import {
   reportClientTiming,
   type ClientSessionMode,
 } from "./clientLog.ts";
-import { isFeedReconnectRequiredError } from "./authPolicy.ts";
 
 // A renewal costs one silent mint plus one host round-trip. Once per app open
 // is the intent; this floor keeps a long-lived tab (or a delegation-recovery
@@ -67,10 +66,9 @@ export function isDelegationRenewalDue(actorId: string, now: number = Date.now()
 /**
  * Idempotent: concurrent callers share one submission, and a renewal that
  * already happened for this actor within the interval is skipped. Ordinary
- * failures are reported and swallowed — the existing delegation is still
- * valid, so a failed renewal must never disturb a running feed. Session-scope
- * failures surface as FeedReconnectRequiredError for the caller's existing
- * reconnect handling.
+ * failures are reported and swallowed — the host may still be serving the
+ * existing delegation, so a failed renewal must never disturb a running feed.
+ * Reconnect is driven only by a delegation rejection from a host read.
  */
 export async function renewDelegation(input: {
   actorId: string;
@@ -101,7 +99,6 @@ export async function renewDelegation(input: {
       reportClientEvent("warn", "delegation_renewal_failed", errorDetail(error), input.actorId, {
         session_mode: sessionMode,
       });
-      if (isFeedReconnectRequiredError(error)) throw error;
       return "failed";
     } finally {
       if (inFlight?.actorId === input.actorId) inFlight = null;
