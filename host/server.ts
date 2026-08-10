@@ -664,9 +664,21 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
         accessActivatedAtMs: nowMs(),
         accessNow: nowMs,
       };
-      const actor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready
-        ? existing
-        : state;
+      const reusePreparedActor = currentProofComplete && hasCompleteFeedHostDelegation(existing) && existing?.ready;
+      const actor = reusePreparedActor ? existing : state;
+      if (reusePreparedActor) {
+        // Rolling renewal must replace the live authority clock and activated
+        // access as well as the persisted copy. Keep the prepared ActorState
+        // (and its self-healing storage wrappers), but point those wrappers at
+        // the newly activated delegation. Otherwise the host keeps enforcing
+        // the old expiry and rejects the feed when the original grant lapses.
+        actor.acceptedAt = activated.acceptedAt;
+        actor.expiresAt = activated.expiresAt;
+        actor.resources = resources;
+        actor.accessByResource.clear();
+        for (const [path, access] of accessByResource) actor.accessByResource.set(path, access);
+        actor.accessActivatedAtMs = nowMs();
+      }
       actor.heal = () => reactivateActorAccess(
         { delegationStore, activateDelegation, delegateDID: policy.delegateDID, policyHash, nowMs },
         actor,
@@ -711,7 +723,7 @@ async function route(request: Request, context: FeedHostContext): Promise<Respon
       void ensureActorReady(storage, actor, seedOnStart)
         .then(() => {
           if (context.proactiveScheduler.targetsActor(actor.actorId)) {
-            return context.proactiveScheduler.ensureCurrentSlot();
+            return context.proactiveScheduler.resumeAfterDelegationAccept();
           }
           return undefined;
         })
@@ -1338,6 +1350,7 @@ async function buildDiagnostics(
   detail: DiagnosticsDetail = "full",
 ): Promise<Record<string, unknown>> {
   const now = new Date();
+  const proactiveScheduler = context.proactiveScheduler.snapshot();
   const actorAggregates: Record<string, unknown> = {};
   for (const [actorKey, actor] of context.actors) {
     if (isDelegationExpired(actor) || !hasCompleteFeedHostDelegation(actor)) continue;
@@ -1361,6 +1374,8 @@ async function buildDiagnostics(
         alerts: {
           quarantined: integrity.quarantined > 0,
           workerClaimStale: claimAgeMs > 30 * 60 * 1000,
+          delegationExpiringSoon: delegationExpiresSoon(actor, now),
+          delegationExpired: proactiveScheduler.pausedForExpiry && proactiveScheduler.actorHash === actorHash,
         },
       };
       continue;
@@ -1413,6 +1428,8 @@ async function buildDiagnostics(
           quarantined: integrity.quarantined > 0,
           oldestAccepted: queue.oldestAcceptedAgeSec > 3600,
           workerClaimStale: queueNonEmpty && claimAgeMs > 30 * 60 * 1000,
+          delegationExpiringSoon: delegationExpiresSoon(actor, now),
+          delegationExpired: proactiveScheduler.pausedForExpiry && proactiveScheduler.actorHash === actorHash,
         },
       };
     } catch (error) {
@@ -1431,6 +1448,17 @@ async function buildDiagnostics(
     resources: 0,
     expiringSoon: 0,
   };
+  if (detail === "alerts" && proactiveScheduler.pausedForExpiry && proactiveScheduler.actorHash) {
+    const aggregate = actorAggregates[proactiveScheduler.actorHash] as { alerts?: Record<string, boolean> } | undefined;
+    actorAggregates[proactiveScheduler.actorHash] = {
+      ...aggregate,
+      alerts: {
+        ...(aggregate?.alerts ?? {}),
+        delegationExpiringSoon: false,
+        delegationExpired: true,
+      },
+    };
+  }
   return {
     detail,
     buildSha: context.buildSha,
@@ -1443,10 +1471,19 @@ async function buildDiagnostics(
       resources: delegationStats.resources,
       expiringSoonCount: delegationStats.expiringSoon,
     },
-    proactiveScheduler: context.proactiveScheduler.snapshot(),
+    proactiveScheduler,
+    alerts: {
+      delegationExpiringSoon: delegationStats.expiringSoon > 0,
+      delegationExpired: proactiveScheduler.pausedForExpiry,
+    },
     actors: actorAggregates,
     recentEvents: recentHostEvents(),
   };
+}
+
+function delegationExpiresSoon(actor: Pick<ActorState, "expiresAt">, now: Date): boolean {
+  const expiry = Date.parse(actor.expiresAt);
+  return Number.isFinite(expiry) && expiry > now.getTime() && expiry <= now.getTime() + 24 * 60 * 60 * 1000;
 }
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -1860,10 +1897,15 @@ async function restoreActorFromStore(
   const live = liveDelegationResources(stored);
   if (live.length === 0) {
     await store.remove(actorKey);
-    return null;
+    // Preserve the distinction between an actor that was never delegated and
+    // one whose persisted authority elapsed while the host was offline. The
+    // proactive scheduler uses this classification to enter its expiry pause
+    // instead of restarting the one-minute generic error loop after reboot.
+    throw new FeedDelegationError("stored delegations are expired", "expired");
   }
   if (live.length !== stored.resources.length) {
     await store.save({ ...stored, resources: live, policyHash: stored.policyHash ?? context.policyHash });
+    throw new FeedDelegationError("stored delegation set is partially expired", "expired");
   }
   try {
     const accessByResource = new Map<string, DelegatedAccess>();

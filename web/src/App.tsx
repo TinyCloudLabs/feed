@@ -10,6 +10,7 @@ import { ArtifactPage, type ArtifactPageState } from "./ArtifactPage.tsx";
 import { FEED_HOST_TOKEN, FEED_HOST_URL } from "./config.ts";
 import {
   attachReceivedInputAuthority,
+  renewFeedHostDelegation,
   restoreSession,
   signIn,
   signOut,
@@ -138,6 +139,7 @@ function newNonce(): string {
 
 export type AppAuthDependencies = {
   attachReceivedInputAuthority: typeof attachReceivedInputAuthority;
+  renewFeedHostDelegation: typeof renewFeedHostDelegation;
   restoreSession: typeof restoreSession;
   signIn: typeof signIn;
   signOut: typeof signOut;
@@ -146,6 +148,7 @@ export type AppAuthDependencies = {
 
 const DEFAULT_AUTH: AppAuthDependencies = {
   attachReceivedInputAuthority,
+  renewFeedHostDelegation,
   restoreSession,
   signIn,
   signOut,
@@ -190,6 +193,7 @@ export function App({
   const [pageRequestArtifactId, setPageRequestArtifactId] = useState<string | null>(null);
   const [pageRetry, setPageRetry] = useState(0);
   const feedLoadInFlight = useRef(false);
+  const delegationRenewalInFlight = useRef<Promise<void> | null>(null);
   const setupInFlight = useRef<number | null>(null);
   const lastRecoveryAt = useRef(0);
   const loginTrace = useRef<FeedLoginTrace | null>(null);
@@ -335,6 +339,7 @@ export function App({
     recoverDelegation?: boolean;
     surfaceError?: boolean;
     reason?: string;
+    onError?: (error: unknown) => void;
   } = {}): Promise<boolean> => {
     if (!session || feedLoadInFlight.current) return false;
     const recoverLostDelegation = options.recoverDelegation !== false;
@@ -363,6 +368,7 @@ export function App({
       }
       return true;
     } catch (error) {
+      options.onError?.(error);
       if (recoverLostDelegation && isDelegationLostError(error)) {
         feedLoadInFlight.current = false;
         if (await recoverDelegation()) return false;
@@ -482,6 +488,37 @@ export function App({
     setSetupError("Feed’s backend could not finish preparing your Feed.");
   }, [session?.readerDid]);
 
+  // A restored session skips the delegation submission below, so without this
+  // the Feed Host's copy would just age out and every background generation
+  // for this user would stop. Renewal is silent, best effort, and runs behind
+  // the rendered feed. Renewal failure is never a reconnect signal: only a
+  // delegation-lost/expired response from the host can open that path.
+  const renewRestoredDelegation = useCallback((): Promise<void> => {
+    const renewal = (async () => {
+      if (!session || !policy) return;
+      try {
+        await auth.renewFeedHostDelegation({
+          client,
+          policy,
+          actorId: session.readerDid,
+          trace: loginTrace.current ?? undefined,
+        });
+      } catch (error) {
+        // The auth implementation reports renewal failures as warnings and
+        // resolves, but keep injected/test implementations non-fatal too.
+        reportClientEvent("warn", "delegation_renewal_failed", errorDetail(error), session.readerDid, {
+          session_mode: loginTrace.current?.sessionMode ?? "restored",
+        });
+      }
+    })();
+    delegationRenewalInFlight.current = renewal;
+    const clear = () => {
+      if (delegationRenewalInFlight.current === renewal) delegationRenewalInFlight.current = null;
+    };
+    void renewal.then(clear, clear);
+    return renewal;
+  }, [auth, client, policy, session]);
+
   const startFeed = useCallback(
     async () => {
       if (!session || !policy) return;
@@ -497,13 +534,25 @@ export function App({
         // Read first so existing content never waits for delegation refresh or
         // schema preparation.
         if (restoredHostSession.current) {
+          let hostRejectedDelegation = false;
           const restoredFeed = await loadFeed({
             recoverDelegation: false,
-            surfaceError: false,
+            surfaceError: true,
             reason: "restored_host_session",
+            onError: (error) => {
+              hostRejectedDelegation = isDelegationLostError(error);
+            },
           });
           if (restoredFeed) {
             setFeedState("running");
+            void renewRestoredDelegation();
+            return;
+          }
+          if (!hostRejectedDelegation) {
+            // A network/server failure is not evidence that delegation was
+            // lost. Keep the session and render the retryable feed error.
+            setFeedState("running");
+            void renewRestoredDelegation();
             return;
           }
           restoredHostSession.current = false;
@@ -563,7 +612,7 @@ export function App({
         if (setupInFlight.current === setupGeneration) setupInFlight.current = null;
       }
     },
-    [auth, client, loadFeed, policy, recordSetupFailure, requireMissingParentReconnect, requireReconnect, session, waitForHostSetup],
+    [auth, client, loadFeed, policy, recordSetupFailure, renewRestoredDelegation, requireMissingParentReconnect, requireReconnect, session, waitForHostSetup],
   );
 
   const retryFeedSetup = useCallback(async () => {
@@ -701,6 +750,11 @@ export function App({
     const disconnectGeneration = sessionGeneration.current + 1;
     sessionGeneration.current = disconnectGeneration;
     try {
+      // Renewal starts only after the feed is interactive. If sign-out wins
+      // the host disconnect race and renewal submits afterward, it would
+      // silently recreate the authority the user just removed. Drain it
+      // first, then make disconnectFeed the final host-side operation.
+      await delegationRenewalInFlight.current?.catch(() => undefined);
       await client.disconnectFeed();
     } catch {
       // Local sign-out still completes if the Host is already unavailable or disconnected.

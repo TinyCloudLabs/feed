@@ -31,8 +31,18 @@ import {
   isMissingParentDelegationError,
   recoverMissingParentDelegation,
 } from "./missingParentDelegation.ts";
+import {
+  noteDelegationSubmitted,
+  noteSessionRestored,
+  renewDelegation,
+  type DelegationRenewalOutcome,
+} from "./delegationRenewal.ts";
 
-const SESSION_EXPIRATION_MS = 7 * 24 * 60 * 60 * 1000;
+// The client picks how long a session (and therefore the Feed Host delegation
+// minted from it) stays valid. Background generation dies with the delegation,
+// so the window is wide and every app open rolls it forward — see
+// delegationRenewal.ts.
+const SESSION_EXPIRATION_MS = 30 * 24 * 60 * 60 * 1000;
 const DELEGATION_RETRY_DELAYS_MS = [1000, 3000, 7000, 12000];
 const SPACE_CREATION_RETRY_DELAYS_MS = [1000, 3000];
 const LAST_ADDRESS_KEY = "feed:v1:lastAddress";
@@ -189,7 +199,43 @@ export async function restoreSession(policy?: FeedHostDelegationPolicy): Promise
   instance = tc;
   activeWallet = null;
   activeSessionMode = "restored";
+  // This app open owes the Feed Host a fresh delegation; startFeed asks for it
+  // once the restored session has proven itself readable.
+  noteSessionRestored();
   return { address, readerDid: tc.did };
+}
+
+/**
+ * Silently re-mint and resubmit the Feed Host delegation for an already
+ * restored session, so its expiry rolls forward from this app open. Reuses the
+ * sign-in submission path (same retry ladders, same error classification), and
+ * never prompts the wallet: materializeDelegation signs with the session key.
+ */
+export async function renewFeedHostDelegation(input: {
+  client: FeedV1HostClient;
+  policy: FeedHostDelegationPolicy;
+  actorId: string;
+  trace?: FeedLoginTrace;
+}): Promise<DelegationRenewalOutcome> {
+  return renewDelegation({
+    actorId: input.actorId,
+    trace: input.trace
+      ? {
+          traceId: input.trace.traceId,
+          loginStartedAt: input.trace.loginStartedAt,
+          sessionMode: input.trace.sessionMode,
+        }
+      : undefined,
+    // No trace is threaded into the submission itself: its login_* timings
+    // describe first paint, and a renewal is not a login.
+    submit: () => submitFeedHostDelegations({
+      client: input.client,
+      policy: input.policy,
+      actorId: input.actorId,
+      recoverMissingParent: false,
+      reportAttemptFailures: false,
+    }),
+  });
 }
 
 export async function submitFeedHostDelegations(input: {
@@ -197,6 +243,8 @@ export async function submitFeedHostDelegations(input: {
   policy: FeedHostDelegationPolicy;
   actorId: string;
   trace?: FeedLoginTrace;
+  recoverMissingParent?: boolean;
+  reportAttemptFailures?: boolean;
 }): Promise<FeedHostDelegationReceipt[]> {
   let recoveryStage: DelegationFailureStage = "mint";
   const sessionMode = activeSessionMode ?? input.trace?.sessionMode ?? "restored";
@@ -221,10 +269,12 @@ export async function submitFeedHostDelegations(input: {
       serializedDelegation = serializeDelegation(result.delegation);
     } catch (error) {
       recoveryStage = isMissingParentDelegationError(error) ? "activate" : "mint";
-      reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
-        stage: recoveryStage,
-        session_mode: sessionMode,
-      });
+      if (input.reportAttemptFailures !== false) {
+        reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
+          stage: recoveryStage,
+          session_mode: sessionMode,
+        });
+      }
       if (isSessionScopeError(error)) throw reconnectRequiredError(error);
       throw error;
     }
@@ -234,12 +284,17 @@ export async function submitFeedHostDelegations(input: {
       receipt = await input.client.submitDelegation({ actorId: input.actorId, serializedDelegation });
     } catch (error) {
       recoveryStage = delegationSubmissionFailureStage(error);
-      reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
-        stage: recoveryStage,
-        session_mode: sessionMode,
-      });
+      if (input.reportAttemptFailures !== false) {
+        reportClientEvent("error", "delegation_mint_failed", errorDetail(error), input.actorId, {
+          stage: recoveryStage,
+          session_mode: sessionMode,
+        });
+      }
       throw error;
     }
+    // Any accepted submission (sign-in, setup, recovery) starts the rolling
+    // window, so a renewal right behind it is a no-op.
+    noteDelegationSubmitted(input.actorId);
     if (input.trace) {
       reportClientTiming("login_delegation_accepted", {
         ...input.trace,
@@ -254,7 +309,7 @@ export async function submitFeedHostDelegations(input: {
   try {
     return await attempt();
   } catch (error) {
-    if (!isMissingParentDelegationError(error)) throw error;
+    if (!isMissingParentDelegationError(error) || input.recoverMissingParent === false) throw error;
     recoveryStage = "activate";
     return recoverMissingParentOperation({
       initialError: error,

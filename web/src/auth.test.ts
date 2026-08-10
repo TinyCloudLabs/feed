@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DELEGATION_RECONNECT_MESSAGE,
   FEED_MANIFEST,
   FeedReconnectRequiredError,
   MISSING_PARENT_RECONNECT_MESSAGE,
@@ -28,7 +29,7 @@ describe("Feed sign-in policy", () => {
   test("uses a typed, user-readable reconnect error without authority details", () => {
     const error = new FeedReconnectRequiredError(new Error("tinycloud.kv/put denied"));
     expect(isFeedReconnectRequiredError(error)).toBe(true);
-    expect(error.message).toBe("Your saved Feed access needs to be refreshed. Sign in again to continue.");
+    expect(error.message).toBe(DELEGATION_RECONNECT_MESSAGE);
     expect(error.message).not.toContain("tinycloud");
   });
 

@@ -156,7 +156,9 @@ describe("Feed Host server", () => {
         actorHash: string | null;
         lastEnsuredSlot: string | null;
         lastResult: string | null;
+        pausedForExpiry: boolean;
       };
+      alerts: { delegationExpiringSoon: boolean; delegationExpired: boolean };
       actors: Record<string, {
         queue: { counts: Record<string, number>; oldestAcceptedAgeSec: number };
         integrity: { healthy: number; missing: number; quarantined: number };
@@ -173,7 +175,13 @@ describe("Feed Host server", () => {
         }>;
         deadLetterCount: number;
         billingBlocked: boolean;
-        alerts: { quarantined: boolean; oldestAccepted: boolean; workerClaimStale: boolean };
+        alerts: {
+          quarantined: boolean;
+          oldestAccepted: boolean;
+          workerClaimStale: boolean;
+          delegationExpiringSoon: boolean;
+          delegationExpired: boolean;
+        };
       }>;
       recentEvents: Array<{ event: string; actorHash?: string }>;
     };
@@ -193,7 +201,13 @@ describe("Feed Host server", () => {
       }],
       deadLetterCount: 2,
       billingBlocked: true,
-      alerts: { quarantined: true, oldestAccepted: true, workerClaimStale: true },
+      alerts: {
+        quarantined: true,
+        oldestAccepted: true,
+        workerClaimStale: true,
+        delegationExpiringSoon: true,
+        delegationExpired: false,
+      },
     });
     expect(body.delegationStore.actors).toBe(1);
     expect(body.delegationStore.resources).toBeGreaterThan(0);
@@ -203,7 +217,9 @@ describe("Feed Host server", () => {
       actorHash,
       lastEnsuredSlot: FAKE_NOW.slice(0, 10),
       lastResult: "ok",
+      pausedForExpiry: false,
     });
+    expect(body.alerts).toEqual({ delegationExpiringSoon: true, delegationExpired: false });
     expect(body.buildSha).toBe("dev");
     expect(typeof body.nodeVersion).toBe("string");
     expect(Array.isArray(body.recentEvents)).toBe(true);
@@ -283,6 +299,7 @@ describe("Feed Host server", () => {
     expect(response.status).toBe(200);
     const body = await response.json() as {
       detail: string;
+      alerts: { delegationExpiringSoon: boolean; delegationExpired: boolean };
       actors: Record<string, { alerts?: Record<string, boolean>; recentRequests?: unknown[] }>;
     };
     const aggregate = body.actors[telemetryIdHash(ACTOR_ID)];
@@ -290,10 +307,54 @@ describe("Feed Host server", () => {
     expect(aggregate.alerts).toEqual({
       quarantined: true,
       workerClaimStale: true,
+      delegationExpiringSoon: true,
+      delegationExpired: false,
     });
+    expect(body.alerts).toEqual({ delegationExpiringSoon: true, delegationExpired: false });
     expect(aggregate.recentRequests).toBeUndefined();
     expect(storage.queueCalls).toBe(0);
     expect(storage.generationCalls).toBe(0);
+  });
+
+  test("alerts-only diagnostics surface an expiry-paused scheduler without raw actor ids", async () => {
+    runtime = startDiagnosticsHost("diagnostics-test-token", {
+      port: 0,
+      hostname: "127.0.0.1",
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      delegationStore: fakeDelegationStore(),
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation, -1),
+      proactiveActorId: ACTOR_ID,
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const accepted = await postJson(
+      `${runtime.url}/api/delegations`,
+      {
+        actorId: ACTOR_ID,
+        serializedDelegation: policy.resources.map((resource) => resource.path).join("|"),
+      },
+      { "content-type": "application/json" },
+    );
+    expect(accepted.ok).toBe(true);
+    for (let attempt = 0; attempt < 100 && !runtime.proactiveState().pausedForExpiry; attempt += 1) {
+      await Bun.sleep(5);
+    }
+    expect(runtime.proactiveState().pausedForExpiry).toBe(true);
+
+    const response = await fetch(`${runtime.url}/admin/diagnostics?detail=alerts`, {
+      headers: { authorization: "Bearer diagnostics-test-token" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as {
+      alerts: { delegationExpiringSoon: boolean; delegationExpired: boolean };
+      actors: Record<string, { alerts?: Record<string, boolean> }>;
+    };
+    const actorHash = telemetryIdHash(ACTOR_ID);
+    expect(body.alerts).toEqual({ delegationExpiringSoon: false, delegationExpired: true });
+    expect(body.actors[actorHash]?.alerts).toMatchObject({
+      delegationExpiringSoon: false,
+      delegationExpired: true,
+    });
+    expect(JSON.stringify(body)).not.toContain(ACTOR_ID);
   });
 
   test("timed-out diagnostics are bounded and concurrent probes share one build", async () => {
@@ -614,6 +675,39 @@ describe("Feed Host server", () => {
     const renewedCookie = await grantAllDelegations(runtime, ACTOR_ID);
     const renewed = await fetch(`${runtime.url}/feed`, { headers: { cookie: renewedCookie } });
     expect(renewed.status).toBe(200);
+  });
+
+  test("rolling renewal extends a still-live prepared actor", async () => {
+    let expiresInMs = 5_000;
+    let acceptedExpiry = "";
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: true,
+      requireActorSession: true,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      activateDelegation: async ({ serializedDelegation }) => {
+        const activated = fakeActivatedDelegation(serializedDelegation, expiresInMs);
+        acceptedExpiry = activated.expiresAt;
+        return activated;
+      },
+    });
+
+    await grantAllDelegations(runtime, ACTOR_ID);
+    expiresInMs = 60_000;
+    const renewedCookie = await grantAllDelegations(runtime, ACTOR_ID);
+
+    const renewed = await fetch(`${runtime.url}/feed`, { headers: { cookie: renewedCookie } });
+    expect(renewed.status).toBe(200);
+    const status = await getJson<{
+      state: string;
+      complete: boolean;
+      resources: Array<{ expiresAt: string }>;
+    }>(`${runtime.url}/api/delegations/status`, {
+      cookie: renewedCookie,
+    });
+    expect(status).toMatchObject({ state: "active", complete: true });
+    expect(status.resources.every((resource) => resource.expiresAt === acceptedExpiry)).toBe(true);
   });
 
   test("retries transient TinyCloud serialization conflicts during actor setup", async () => {
@@ -2068,6 +2162,7 @@ describe("Feed Host server", () => {
       port: 0,
       hostname: "127.0.0.1",
       seedOnStart: true,
+      proactiveActorId: ACTOR_ID,
       storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
       hostNode: fakeHostNode(HOST_DID),
       delegationStore: store,
@@ -2086,9 +2181,42 @@ describe("Feed Host server", () => {
       })),
     });
 
+    expect(await runtime.ensureProactiveNow()).toBe("paused_expired");
+    expect(runtime.proactiveState().pausedForExpiry).toBe(true);
     const blocked = await fetch(`${runtime.url}/feed?limit=10`, { headers: { "x-feed-actor-id": ACTOR_ID } });
     expect(blocked.status).toBe(403);
     expect(await store.load(ACTOR_ID)).toBeNull();
+  });
+
+  test("pauses proactive scheduling when a persisted delegation set is partially expired", async () => {
+    const store = fakeDelegationStore();
+    runtime = startFeedHost({
+      port: 0,
+      hostname: "127.0.0.1",
+      seedOnStart: false,
+      proactiveActorId: ACTOR_ID,
+      storage: new FakeFeedHostStorage() as unknown as FeedHostStorage,
+      hostNode: fakeHostNode(HOST_DID),
+      delegationStore: store,
+      activateDelegation: async ({ serializedDelegation }) => fakeActivatedDelegation(serializedDelegation),
+    });
+    const policy = await getJson<FeedHostDelegationPolicy>(`${runtime.url}/delegation-policy`);
+    const past = new Date(Date.now() - 60_000).toISOString();
+    const future = new Date(Date.now() + 60_000).toISOString();
+    await store.save({
+      actorId: ACTOR_ID,
+      delegateDID: policy.delegateDID,
+      resources: policy.resources.map((resource, index) => ({
+        path: resource.path,
+        serializedDelegation: resource.path,
+        acceptedAt: past,
+        expiresAt: index === 0 ? future : past,
+      })),
+    });
+
+    expect(await runtime.ensureProactiveNow()).toBe("paused_expired");
+    expect(runtime.proactiveState().pausedForExpiry).toBe(true);
+    expect((await store.load(ACTOR_ID))?.resources).toHaveLength(1);
   });
 });
 
